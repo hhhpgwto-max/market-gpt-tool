@@ -1,4 +1,4 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
-efinance==0.5.5
+efinance==0.5.8
 pandas==2.3.1
