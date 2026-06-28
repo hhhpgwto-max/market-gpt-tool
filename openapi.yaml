@@ -4,7 +4,7 @@ info:
   version: 0.1.0
   description: Query A-share market data for a Custom GPT.
 servers:
-  - url: https://YOUR-RENDER-URL.onrender.com
+  - url: https://market-gpt-tool.onrender.com
 security:
   - ApiKeyAuth: []
 components:
@@ -24,14 +24,14 @@ paths:
   /search:
     get:
       operationId: searchStock
-      summary: Search A-share stock codes by code or Chinese name.
+      summary: Search A-share stock codes by code or stock name.
       parameters:
         - name: keyword
           in: query
           required: true
           schema:
             type: string
-          description: Stock code or Chinese stock name keyword, such as 600519 or 茅台.
+          description: Stock code or stock name keyword, such as 600519 or Maotai.
         - name: limit
           in: query
           required: false
