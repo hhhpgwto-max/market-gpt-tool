@@ -45,6 +45,20 @@ QUOTE_COLUMNS = {
     "流通市值": "circulating_market_value",
 }
 
+KLINE_COLUMNS = {
+    "日期": "date",
+    "开盘": "open",
+    "收盘": "close",
+    "最高": "high",
+    "最低": "low",
+    "成交量": "volume",
+    "成交额": "turnover",
+    "振幅": "amplitude",
+    "涨跌幅": "change_pct",
+    "涨跌额": "change",
+    "换手率": "turnover_rate",
+}
+
 KLINE_PERIODS = {
     "daily": 101,
     "weekly": 102,
@@ -124,7 +138,7 @@ def search_stock(
 
     mask = (
         data[code_col].astype(str).str.contains(keyword, case=False, na=False)
-        | data[name_col].astype(str).str.contains(keyword, case=False, na=False)
+        | data[name_col].astype(str).contains(keyword, case=False, na=False)
     )
     rows = data[mask].head(limit)
 
@@ -195,25 +209,7 @@ def get_kline(
     if data is None or data.empty:
         raise HTTPException(status_code=404, detail=f"Kline data not found: {symbol}")
 
-    rows = data.tail(limit)
-    items = []
-    for _, row in rows.iterrows():
-        items.append(
-            {
-                "date": clean_value(row.get("日期")),
-                "open": clean_value(row.get("开盘")),
-                "close": clean_value(row.get("收盘")),
-                "high": clean_value(row.get("最高")),
-                "low": clean_value(row.get("最低")),
-                "volume": clean_value(row.get("成交量")),
-                "turnover": clean_value(row.get("成交额")),
-                "amplitude": clean_value(row.get("振幅")),
-                "change_pct": clean_value(row.get("涨跌幅")),
-                "change": clean_value(row.get("涨跌额")),
-                "turnover_rate": clean_value(row.get("换手率")),
-            }
-        )
-
+    items = [row_to_dict(row, KLINE_COLUMNS) for _, row in data.tail(limit).iterrows()]
     return {
         "symbol": symbol,
         "period": period,
