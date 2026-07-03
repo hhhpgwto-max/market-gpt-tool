@@ -131,6 +131,101 @@ def eastmoney_secid(symbol: str) -> str:
     return f"{market}.{symbol}"
 
 
+def market_symbol(symbol: str) -> str:
+    prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+    return f"{prefix}{symbol}"
+
+
+def to_number(value: Any) -> float | None:
+    if value in (None, "-", ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_market_text(url: str, referer: str) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": referer,
+        },
+    )
+    with urlopen(request, timeout=15) as response:
+        return response.read().decode("gbk", errors="replace")
+
+
+def get_tencent_quote(symbol: str) -> dict[str, Any]:
+    url = f"http://qt.gtimg.cn/q={market_symbol(symbol)}"
+    try:
+        text = read_market_text(url, "https://stockapp.finance.qq.com/")
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Tencent quote: {exc}") from exc
+
+    if '"' not in text:
+        raise HTTPException(status_code=502, detail="Unexpected Tencent quote format.")
+    parts = text.split('"', 2)[1].split("~")
+    if len(parts) < 46 or not parts[1]:
+        raise HTTPException(status_code=404, detail=f"Stock not found from Tencent: {symbol}")
+
+    return {
+        "symbol": clean_value(parts[2]),
+        "name": clean_value(parts[1]),
+        "price": to_number(parts[3]),
+        "change_pct": to_number(parts[32]),
+        "change": to_number(parts[31]),
+        "volume": to_number(parts[36]),
+        "turnover": to_number(parts[37]),
+        "amplitude": to_number(parts[43]),
+        "high": to_number(parts[33]),
+        "low": to_number(parts[34]),
+        "open": to_number(parts[5]),
+        "previous_close": to_number(parts[4]),
+        "turnover_rate": to_number(parts[38]),
+        "pe_dynamic": to_number(parts[39]),
+        "pb": to_number(parts[46]),
+        "total_market_value": to_number(parts[44]),
+        "circulating_market_value": to_number(parts[45]),
+    }
+
+
+def get_sina_quote(symbol: str) -> dict[str, Any]:
+    url = f"http://hq.sinajs.cn/list={market_symbol(symbol)}"
+    try:
+        text = read_market_text(url, "https://finance.sina.com.cn/")
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina quote: {exc}") from exc
+
+    if '"' not in text:
+        raise HTTPException(status_code=502, detail="Unexpected Sina quote format.")
+    parts = text.split('"', 2)[1].split(",")
+    if len(parts) < 32 or not parts[0]:
+        raise HTTPException(status_code=404, detail=f"Stock not found from Sina: {symbol}")
+
+    price = to_number(parts[3])
+    previous_close = to_number(parts[2])
+    change = None if price is None or previous_close is None else price - previous_close
+    change_pct = None
+    if change is not None and previous_close not in (None, 0):
+        change_pct = change / previous_close * 100
+
+    return {
+        "symbol": symbol,
+        "name": clean_value(parts[0]),
+        "price": price,
+        "change_pct": change_pct,
+        "change": change,
+        "volume": to_number(parts[8]),
+        "turnover": to_number(parts[9]),
+        "high": to_number(parts[4]),
+        "low": to_number(parts[5]),
+        "open": to_number(parts[1]),
+        "previous_close": previous_close,
+    }
+
+
 def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
     url = (
         "https://push2.eastmoney.com/api/qt/stock/get"
@@ -172,6 +267,20 @@ def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
         "total_market_value": clean_value(data.get("f116")),
         "circulating_market_value": clean_value(data.get("f117")),
     }
+
+
+def get_fallback_quote(symbol: str) -> tuple[dict[str, Any], str]:
+    errors = []
+    for source, getter in (
+        ("tencent", get_tencent_quote),
+        ("sina", get_sina_quote),
+        ("eastmoney", get_eastmoney_quote),
+    ):
+        try:
+            return getter(symbol), source
+        except HTTPException as exc:
+            errors.append(f"{source}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
 def get_all_realtime_quotes() -> pd.DataFrame:
@@ -261,8 +370,7 @@ def get_quote(
         quote = row_to_dict(rows.iloc[0], QUOTE_COLUMNS)
         source = "efinance"
     except HTTPException:
-        quote = get_eastmoney_quote(symbol)
-        source = "eastmoney"
+        quote, source = get_fallback_quote(symbol)
 
     return {
         "quote": quote,
