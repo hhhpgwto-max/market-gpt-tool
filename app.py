@@ -138,7 +138,7 @@ def search_stock(
 
     mask = (
         data[code_col].astype(str).str.contains(keyword, case=False, na=False)
-        | data[name_col].astype(str).contains(keyword, case=False, na=False)
+        | data[name_col].astype(str).str.contains(keyword, case=False, na=False)
     )
     rows = data[mask].head(limit)
 
