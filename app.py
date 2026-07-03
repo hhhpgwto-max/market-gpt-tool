@@ -1,6 +1,9 @@
 import os
+import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import efinance as ef
 import pandas as pd
@@ -70,6 +73,27 @@ KLINE_PERIODS = {
     "60m": 60,
 }
 
+EASTMONEY_FIELDS = ",".join(
+    [
+        "f57",
+        "f58",
+        "f43",
+        "f169",
+        "f170",
+        "f46",
+        "f44",
+        "f45",
+        "f47",
+        "f48",
+        "f60",
+        "f168",
+        "f162",
+        "f167",
+        "f116",
+        "f117",
+    ]
+)
+
 
 def require_token(x_api_key: str | None) -> None:
     if API_TOKEN and x_api_key != API_TOKEN:
@@ -93,6 +117,60 @@ def row_to_dict(row: pd.Series, columns: dict[str, str]) -> dict[str, Any]:
         output_key: clean_value(row.get(input_key))
         for input_key, output_key in columns.items()
         if input_key in row.index
+    }
+
+
+def scaled(value: Any, divisor: float = 100) -> Any:
+    if value in (None, "-", ""):
+        return None
+    return clean_value(value / divisor)
+
+
+def eastmoney_secid(symbol: str) -> str:
+    market = "1" if symbol.startswith(("6", "9")) else "0"
+    return f"{market}.{symbol}"
+
+
+def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get"
+        f"?secid={eastmoney_secid(symbol)}&fields={EASTMONEY_FIELDS}"
+    )
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://quote.eastmoney.com/",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Eastmoney quote: {exc}") from exc
+
+    data = payload.get("data")
+    if not data:
+        raise HTTPException(status_code=404, detail=f"Stock not found from Eastmoney: {symbol}")
+
+    return {
+        "symbol": clean_value(data.get("f57")),
+        "name": clean_value(data.get("f58")),
+        "price": scaled(data.get("f43")),
+        "change_pct": scaled(data.get("f170")),
+        "change": scaled(data.get("f169")),
+        "volume": clean_value(data.get("f47")),
+        "turnover": clean_value(data.get("f48")),
+        "high": scaled(data.get("f44")),
+        "low": scaled(data.get("f45")),
+        "open": scaled(data.get("f46")),
+        "previous_close": scaled(data.get("f60")),
+        "turnover_rate": scaled(data.get("f168")),
+        "pe_dynamic": scaled(data.get("f162")),
+        "pb": scaled(data.get("f167")),
+        "total_market_value": clean_value(data.get("f116")),
+        "circulating_market_value": clean_value(data.get("f117")),
     }
 
 
@@ -171,18 +249,24 @@ def get_quote(
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required.")
 
-    data = get_all_realtime_quotes()
-    if "股票代码" not in data.columns:
-        raise HTTPException(status_code=502, detail="Unexpected market data format.")
+    try:
+        data = get_all_realtime_quotes()
+        if "股票代码" not in data.columns:
+            raise HTTPException(status_code=502, detail="Unexpected market data format.")
 
-    rows = data[data["股票代码"].astype(str) == symbol]
-    if rows.empty:
-        raise HTTPException(status_code=404, detail=f"Stock not found: {symbol}")
+        rows = data[data["股票代码"].astype(str) == symbol]
+        if rows.empty:
+            raise HTTPException(status_code=404, detail=f"Stock not found: {symbol}")
 
-    quote = row_to_dict(rows.iloc[0], QUOTE_COLUMNS)
+        quote = row_to_dict(rows.iloc[0], QUOTE_COLUMNS)
+        source = "efinance"
+    except HTTPException:
+        quote = get_eastmoney_quote(symbol)
+        source = "eastmoney"
+
     return {
         "quote": quote,
-        "source": "efinance",
+        "source": source,
         "time": now_iso(),
         "note": "For information only. Not investment advice.",
     }
