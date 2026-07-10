@@ -31,7 +31,7 @@ def rpc_request(request_id: int, method: str, params: dict | None = None) -> dic
     }
 
 
-def fake_get_quote(symbol: str, x_api_key: str | None = None) -> dict:
+def fake_get_quote_data(symbol: str) -> dict:
     return {
         "quote": {
             "symbol": symbol,
@@ -55,7 +55,7 @@ def fake_get_quote(symbol: str, x_api_key: str | None = None) -> dict:
 
 
 def main() -> None:
-    market_app.get_quote = fake_get_quote
+    market_app.get_quote_data = fake_get_quote_data
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -64,6 +64,14 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
+
+        for legacy_path in (
+            "/search?keyword=600000",
+            "/quote?symbol=600000",
+            "/kline?symbol=600000&period=daily",
+        ):
+            legacy = client.get(legacy_path)
+            assert legacy.status_code == 404, legacy.text
 
         initialize = client.post(
             "/mcp",
