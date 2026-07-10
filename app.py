@@ -1,5 +1,7 @@
 import os
 import json
+import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from urllib.error import URLError
@@ -9,22 +11,54 @@ import efinance as ef
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
 API_TOKEN = os.getenv("MARKET_TOOL_TOKEN", "").strip()
 
+MCP_INSTRUCTIONS = (
+    "Use these read-only tools for current A-share market data. "
+    "Use search_a_share when the stock code is unclear. "
+    "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
+    "All data is informational only and is not investment advice."
+)
+
+READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+mcp = FastMCP(
+    "Market Sentinel",
+    instructions=MCP_INSTRUCTIONS,
+    stateless_http=True,
+    json_response=True,
+)
+mcp_http_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.1.0",
-    description="A small market data API for a Custom GPT Action.",
+    version="0.2.0",
+    description="A small market data API for a ChatGPT MCP app and Custom GPT Action.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Mcp-Session-Id", "Last-Event-ID", "Authorization"],
 )
 
 
@@ -94,10 +128,47 @@ EASTMONEY_FIELDS = ",".join(
     ]
 )
 
+QUOTE_RESPONSE_FIELDS = (
+    "symbol",
+    "name",
+    "price",
+    "change",
+    "change_pct",
+    "open",
+    "high",
+    "low",
+    "previous_close",
+    "volume",
+    "turnover",
+)
+
+KLINE_RESPONSE_FIELDS = (
+    "date",
+    "open",
+    "close",
+    "high",
+    "low",
+    "volume",
+    "turnover",
+    "change_pct",
+)
+
+SYMBOL_PATTERN = re.compile(r"^\d{6}$")
+
 
 def require_token(x_api_key: str | None) -> None:
     if API_TOKEN and x_api_key != API_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing x-api-key.")
+
+
+def normalize_symbol(symbol: str) -> str:
+    normalized = symbol.strip()
+    if not SYMBOL_PATTERN.fullmatch(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol must be a six-digit A-share stock code.",
+        )
+    return normalized
 
 
 def now_iso() -> str:
@@ -153,7 +224,8 @@ def read_market_text(url: str, referer: str) -> str:
             "Referer": referer,
         },
     )
-    with urlopen(request, timeout=15) as response:
+    # Callers construct URLs from a fixed quote-provider host list.
+    with urlopen(request, timeout=15) as response:  # nosec B310
         return response.read().decode("gbk", errors="replace")
 
 
@@ -240,7 +312,8 @@ def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
     )
 
     try:
-        with urlopen(request, timeout=15) as response:
+        # This Request always targets Eastmoney's fixed API host.
+        with urlopen(request, timeout=15) as response:  # nosec B310
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, URLError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch Eastmoney quote: {exc}") from exc
@@ -354,9 +427,7 @@ def get_quote(
     x_api_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_token(x_api_key)
-    symbol = symbol.strip()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol is required.")
+    symbol = normalize_symbol(symbol)
 
     try:
         data = get_all_realtime_quotes()
@@ -388,7 +459,7 @@ def get_kline(
     x_api_key: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_token(x_api_key)
-    symbol = symbol.strip()
+    symbol = normalize_symbol(symbol)
     klt = KLINE_PERIODS.get(period)
     if klt is None:
         raise HTTPException(status_code=400, detail=f"Unsupported period: {period}")
@@ -411,3 +482,126 @@ def get_kline(
         "time": now_iso(),
         "note": "For information only. Not investment advice.",
     }
+
+
+def mcp_error(symbol: str | None, exc: HTTPException) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "error": str(exc.detail),
+        "time": now_iso(),
+    }
+    if symbol:
+        result["symbol"] = symbol
+    return result
+
+
+@mcp.tool(
+    name="search_a_share",
+    title="Search A-share stocks",
+    description="Search A-share stocks by a stock code or company name before querying a quote.",
+    annotations=READ_ONLY_TOOL,
+)
+def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
+    keyword = keyword.strip()
+    if not keyword:
+        return {
+            "ok": False,
+            "error": "keyword is required.",
+            "time": now_iso(),
+        }
+
+    try:
+        payload = search_stock(
+            keyword=keyword,
+            limit=max(1, min(limit, 5)),
+            x_api_key=API_TOKEN or None,
+        )
+    except HTTPException as exc:
+        return mcp_error(None, exc)
+
+    return {
+        "ok": True,
+        "keyword": payload["keyword"],
+        "count": payload["count"],
+        "results": payload["results"],
+        "source": payload["source"],
+        "time": payload["time"],
+    }
+
+
+@mcp.tool(
+    name="get_a_share_quote",
+    title="Get an A-share quote",
+    description="Get the latest available price, daily change, trading range, volume, and turnover for one A-share stock code.",
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_quote(symbol: str) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return {
+            "ok": False,
+            "error": "symbol is required.",
+            "time": now_iso(),
+        }
+
+    try:
+        payload = get_quote(symbol=symbol, x_api_key=API_TOKEN or None)
+    except HTTPException as exc:
+        return mcp_error(symbol, exc)
+
+    quote = payload["quote"]
+    return {
+        "ok": True,
+        **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
+        "source": payload["source"],
+        "time": payload["time"],
+        "note": payload["note"],
+    }
+
+
+@mcp.tool(
+    name="get_a_share_kline",
+    title="Get A-share price history",
+    description="Get up to 30 recent A-share price records for a daily, weekly, monthly, or intraday period.",
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_kline(
+    symbol: str,
+    period: str = "daily",
+    limit: int = 30,
+) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return {
+            "ok": False,
+            "error": "symbol is required.",
+            "time": now_iso(),
+        }
+
+    try:
+        payload = get_kline(
+            symbol=symbol,
+            period=period,
+            limit=max(1, min(limit, 30)),
+            x_api_key=API_TOKEN or None,
+        )
+    except HTTPException as exc:
+        return mcp_error(symbol, exc)
+
+    return {
+        "ok": True,
+        "symbol": payload["symbol"],
+        "period": payload["period"],
+        "count": payload["count"],
+        "items": [
+            {field: clean_value(item.get(field)) for field in KLINE_RESPONSE_FIELDS}
+            for item in payload["items"]
+        ],
+        "source": payload["source"],
+        "time": payload["time"],
+        "note": payload["note"],
+    }
+
+
+# Mount last so the legacy HTTP endpoints keep their existing paths.
+app.mount("/", mcp_http_app)
