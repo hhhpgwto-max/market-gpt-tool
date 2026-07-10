@@ -92,3 +92,16 @@ Upgrade
 当前第一版使用 `efinance` 查询数据，适合个人测试和学习。
 
 数据只供参考，不构成投资建议。
+
+## ChatGPT MCP
+
+This service also exposes a read-only MCP endpoint for a private ChatGPT app:
+
+```text
+https://market-gpt-tool.onrender.com/mcp
+```
+
+After Render deploys the MCP version, create a custom app in the ChatGPT Business
+workspace and use this URL. Select no authentication for the first private,
+read-only version. The server has three tools: stock search, latest quote, and
+recent price history. It does not create, update, or delete any data.
