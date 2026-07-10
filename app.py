@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 
 import efinance as ef
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -17,7 +17,6 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-API_TOKEN = os.getenv("MARKET_TOOL_TOKEN", "").strip()
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share market data. "
@@ -57,7 +56,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Market GPT Tool",
     version="0.2.0",
-    description="A small market data API for a ChatGPT MCP app and Custom GPT Action.",
+    description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
 
@@ -161,11 +160,6 @@ KLINE_RESPONSE_FIELDS = (
 )
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
-
-
-def require_token(x_api_key: str | None) -> None:
-    if API_TOKEN and x_api_key != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key.")
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -386,13 +380,7 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/search")
-def search_stock(
-    keyword: str = Query(..., description="Stock code or Chinese stock name keyword."),
-    limit: int = Query(10, ge=1, le=20),
-    x_api_key: str | None = Header(default=None),
-) -> dict[str, Any]:
-    require_token(x_api_key)
+def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
     keyword = keyword.strip()
     if not keyword:
         raise HTTPException(status_code=400, detail="keyword is required.")
@@ -428,12 +416,7 @@ def search_stock(
     }
 
 
-@app.get("/quote")
-def get_quote(
-    symbol: str = Query(..., description="A-share stock code, such as 600519 or 000001."),
-    x_api_key: str | None = Header(default=None),
-) -> dict[str, Any]:
-    require_token(x_api_key)
+def get_quote_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
 
     try:
@@ -458,14 +441,7 @@ def get_quote(
     }
 
 
-@app.get("/kline")
-def get_kline(
-    symbol: str = Query(..., description="A-share stock code, such as 600519 or 000001."),
-    period: str = Query("daily", description="daily, weekly, monthly, 1m, 5m, 15m, 30m, 60m."),
-    limit: int = Query(120, ge=1, le=500),
-    x_api_key: str | None = Header(default=None),
-) -> dict[str, Any]:
-    require_token(x_api_key)
+def get_kline_data(symbol: str, period: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     klt = KLINE_PERIODS.get(period)
     if klt is None:
@@ -518,10 +494,9 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
         }
 
     try:
-        payload = search_stock(
+        payload = search_stock_data(
             keyword=keyword,
             limit=max(1, min(limit, 5)),
-            x_api_key=API_TOKEN or None,
         )
     except HTTPException as exc:
         return mcp_error(None, exc)
@@ -552,7 +527,7 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
         }
 
     try:
-        payload = get_quote(symbol=symbol, x_api_key=API_TOKEN or None)
+        payload = get_quote_data(symbol=symbol)
     except HTTPException as exc:
         return mcp_error(symbol, exc)
 
@@ -586,11 +561,10 @@ def get_a_share_kline(
         }
 
     try:
-        payload = get_kline(
+        payload = get_kline_data(
             symbol=symbol,
             period=period,
             limit=max(1, min(limit, 30)),
-            x_api_key=API_TOKEN or None,
         )
     except HTTPException as exc:
         return mcp_error(symbol, exc)
@@ -610,5 +584,5 @@ def get_a_share_kline(
     }
 
 
-# Mount last so the legacy HTTP endpoints keep their existing paths.
+# Mount last so the health endpoint keeps its direct HTTP path.
 app.mount("/", mcp_http_app)
