@@ -1,37 +1,38 @@
-# Market GPT Tool 行情小工具
+# Market GPT Tool MCP
 
-这是给你的自定义 GPT 用的“行情查询小工具”。
-
-你不用直接操作它。以后它会放到云端，GPT 会自动调用它。
-
-## 它能干什么
+这是给普通 ChatGPT 对话使用的只读 A 股行情 MCP 服务。
 
 ```text
-你问 GPT 股票问题
-GPT 调用这个小工具
-小工具查询行情数据
-GPT 把结果解释给你
+普通 ChatGPT 对话
+调用盘中哨兵 MCP 应用
+MCP 从行情数据源查询数据
+ChatGPT 整理并解释结果
 ```
 
-## 当前已有接口
+## 线上地址
 
 ```text
-GET /health
-检查小工具是否正常运行
-
-GET /search?keyword=茅台
-按股票名称或代码搜索股票
-
-GET /quote?symbol=600519
-查询某只股票的实时行情
-
-GET /kline?symbol=600519&period=daily
-查询某只股票的 K 线数据
+MCP：https://market-gpt-tool.onrender.com/mcp
+健康检查：https://market-gpt-tool.onrender.com/health
 ```
 
-## 本地运行方式
+ChatGPT Business 自定义应用填写方式：
 
-这些命令主要是我用的，你不用背。
+```text
+名称：盘中哨兵
+服务器 URL：https://market-gpt-tool.onrender.com/mcp
+身份验证：无身份验证
+```
+
+## MCP 工具
+
+- `search_a_share`：按股票代码或名称搜索 A 股。
+- `get_a_share_quote`：查询一只 A 股的最新行情。
+- `get_a_share_kline`：查询最多 30 条近期 K 线数据。
+
+三个工具都标记为只读，不创建、修改或删除任何数据。
+
+## 本地运行
 
 ```powershell
 python -m venv .venv
@@ -39,69 +40,28 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app:app --reload
 ```
 
-打开这个地址可以检查是否启动成功：
+本地测试：
 
-```text
-http://127.0.0.1:8000/health
+```powershell
+.\.venv\Scripts\python.exe tests\test_mcp.py
 ```
 
-## 密码设置
+## Render 部署
 
-云端需要设置一个小工具密码：
+仓库推送到 GitHub 后，Render 免费 Web Service 自动部署：
 
 ```text
-MARKET_TOOL_TOKEN=你自己设置的一串密码
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
+只保留一个普通环境变量：
+
+```text
 MARKET_TOOL_NAME=market-gpt-tool
-```
-
-以后 GPT 调用小工具时，也要带同一个密码：
-
-```text
-x-api-key: 你设置的那串密码
-```
-
-这个密码不是你的 GitHub 密码，也不是邮箱密码，只是保护这个小工具的访问密码。
-
-## Render 免费部署注意
-
-我们只用免费版。
-
-看到这些字样就先停：
-
-```text
-Starter
-Pro
-Scale
-Billing
-Credit card
-Upgrade
-```
-
-不要点付费，不要填信用卡。
-
-## 给 GPT 的说明草稿
-
-以后可以把这段放进你的自定义 GPT Instructions：
-
-```text
-当用户询问股票、A 股、行情、涨跌幅、成交量、成交额、K 线或实时市场数据时，必须先调用 Market GPT Tool。不要凭记忆回答实时行情。回答中必须说明数据来源和接口返回时间。不要给出确定性买卖建议，只能做信息整理和风险提示。
 ```
 
 ## 数据说明
 
-当前第一版使用 `efinance` 查询数据，适合个人测试和学习。
+当前使用 `efinance`，并以腾讯、新浪和东方财富公开行情接口作为备用来源。
 
-数据只供参考，不构成投资建议。
-
-## ChatGPT MCP
-
-This service also exposes a read-only MCP endpoint for a private ChatGPT app:
-
-```text
-https://market-gpt-tool.onrender.com/mcp
-```
-
-After Render deploys the MCP version, create a custom app in the ChatGPT Business
-workspace and use this URL. Select no authentication for the first private,
-read-only version. The server has three tools: stock search, latest quote, and
-recent price history. It does not create, update, or delete any data.
+东方财富 Choice SDK 暂未接入线上服务。数据仅供信息参考，不构成投资建议。
