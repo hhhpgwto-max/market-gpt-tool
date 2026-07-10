@@ -12,6 +12,7 @@ import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 
@@ -37,6 +38,12 @@ mcp = FastMCP(
     instructions=MCP_INSTRUCTIONS,
     stateless_http=True,
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=[
+            "market-gpt-tool.onrender.com",
+            "127.0.0.1:8000",
+        ],
+    ),
 )
 mcp_http_app = mcp.streamable_http_app()
 
