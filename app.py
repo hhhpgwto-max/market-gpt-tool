@@ -137,6 +137,9 @@ EASTMONEY_FIELDS = ",".join(
     ]
 )
 
+# Public identifier used by Eastmoney's search page; it is not an account credential.
+EASTMONEY_SEARCH_TOKEN = "D43BF722C8E33CBDCCBC1D1A8E68D7AA"  # nosec B105
+
 QUOTE_RESPONSE_FIELDS = (
     "symbol",
     "name",
@@ -148,7 +151,9 @@ QUOTE_RESPONSE_FIELDS = (
     "low",
     "previous_close",
     "volume",
+    "volume_unit",
     "turnover",
+    "turnover_unit",
 )
 
 KLINE_RESPONSE_FIELDS = (
@@ -448,6 +453,22 @@ def get_fallback_quote(symbol: str) -> tuple[dict[str, Any], str]:
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
+def normalize_quote_units(quote: dict[str, Any], source: str) -> dict[str, Any]:
+    volume = to_number(quote.get("volume"))
+    turnover = to_number(quote.get("turnover"))
+
+    if volume is not None and source in {"efinance", "eastmoney", "tencent"}:
+        volume *= 100
+    if turnover is not None and source == "tencent":
+        turnover *= 10_000
+
+    quote["volume"] = volume
+    quote["volume_unit"] = "share"
+    quote["turnover"] = turnover
+    quote["turnover_unit"] = "CNY"
+    return quote
+
+
 def get_all_realtime_quotes() -> pd.DataFrame:
     try:
         data = ef.stock.get_realtime_quotes()
@@ -476,33 +497,37 @@ def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
     if not keyword:
         raise HTTPException(status_code=400, detail="keyword is required.")
 
-    data = get_all_realtime_quotes()
-    code_col = "股票代码"
-    name_col = "股票名称"
-    if code_col not in data.columns or name_col not in data.columns:
-        raise HTTPException(status_code=502, detail="Unexpected market data format.")
-
-    mask = (
-        data[code_col].astype(str).str.contains(keyword, case=False, na=False)
-        | data[name_col].astype(str).str.contains(keyword, case=False, na=False)
-    )
-    rows = data[mask].head(limit)
-
-    results = [
+    url = "https://searchapi.eastmoney.com/api/suggest/get?" + urlencode(
         {
-            "symbol": str(row.get(code_col)),
-            "name": clean_value(row.get(name_col)),
-            "price": clean_value(row.get("最新价")),
-            "change_pct": clean_value(row.get("涨跌幅")),
+            "input": keyword,
+            "type": 14,
+            "token": EASTMONEY_SEARCH_TOKEN,
+            "count": max(limit * 3, 10),
         }
-        for _, row in rows.iterrows()
-    ]
+    )
+    payload = read_public_json(url, "https://so.eastmoney.com/")
+    rows = payload.get("QuotationCodeTable", {}).get("Data") or []
+
+    results = []
+    for row in rows:
+        symbol = str(row.get("Code", ""))
+        if row.get("Classify") != "AStock" or not SYMBOL_PATTERN.fullmatch(symbol):
+            continue
+        results.append(
+            {
+                "symbol": symbol,
+                "name": clean_value(row.get("Name")),
+                "market": clean_value(row.get("SecurityTypeName")),
+            }
+        )
+        if len(results) >= limit:
+            break
 
     return {
         "keyword": keyword,
         "count": len(results),
         "results": results,
-        "source": "efinance",
+        "source": "eastmoney_search",
         "queried_at": now_iso(),
     }
 
@@ -537,6 +562,8 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
         source = "efinance"
     except HTTPException:
         quote, source = get_fallback_quote(symbol)
+
+    quote = normalize_quote_units(quote, source)
 
     return {
         "quote": quote,
@@ -975,8 +1002,12 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
             keyword=keyword,
             limit=max(1, min(limit, 5)),
         )
-    except HTTPException as exc:
-        return mcp_error(None, exc)
+    except HTTPException:
+        return {
+            "ok": False,
+            "error": "Stock search is temporarily unavailable. Try a six-digit stock code.",
+            "queried_at": now_iso(),
+        }
 
     return {
         "ok": True,

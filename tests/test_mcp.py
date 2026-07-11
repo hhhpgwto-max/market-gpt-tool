@@ -44,7 +44,9 @@ def fake_get_quote_data(symbol: str) -> dict:
             "low": 121.5,
             "previous_close": 122.22,
             "volume": 1000000,
+            "volume_unit": "share",
             "turnover": 123456789,
+            "turnover_unit": "CNY",
             "pe_dynamic": 99.9,
             "total_market_value": 999999999,
             "market_time": "2026-07-10T15:01:46+08:00",
@@ -52,6 +54,16 @@ def fake_get_quote_data(symbol: str) -> dict:
         "source": "test",
         "queried_at": "2026-07-10T00:05:00+00:00",
         "note": "For information only. Not investment advice.",
+    }
+
+
+def fake_search_stock_data(keyword: str, limit: int) -> dict:
+    return {
+        "keyword": keyword,
+        "count": 1,
+        "results": [{"symbol": "603993", "name": "洛阳钼业", "market": "沪A"}],
+        "source": "eastmoney_search",
+        "queried_at": "2026-07-10T00:05:00+00:00",
     }
 
 
@@ -165,8 +177,50 @@ def test_kline_source_parsers() -> None:
         market_app.get_tencent_kline = original_tencent
 
 
+def test_search_source_parser() -> None:
+    original_reader = market_app.read_public_json
+    try:
+        market_app.read_public_json = lambda *_: {
+            "QuotationCodeTable": {
+                "Data": [
+                    {
+                        "Code": "603993",
+                        "Name": "洛阳钼业",
+                        "Classify": "AStock",
+                        "SecurityTypeName": "沪A",
+                    },
+                    {
+                        "Code": "03993",
+                        "Name": "洛阳钼业",
+                        "Classify": "HK",
+                        "SecurityTypeName": "港股",
+                    },
+                ]
+            }
+        }
+        result = market_app.search_stock_data("洛阳钼业", 5)
+        assert result["source"] == "eastmoney_search"
+        assert result["count"] == 1
+        assert result["results"][0]["symbol"] == "603993"
+    finally:
+        market_app.read_public_json = original_reader
+
+
+def test_quote_unit_normalization() -> None:
+    result = market_app.normalize_quote_units(
+        {"volume": 2603164, "turnover": 458798}, "tencent"
+    )
+    assert result["volume"] == 260316400
+    assert result["volume_unit"] == "share"
+    assert result["turnover"] == 4587980000
+    assert result["turnover_unit"] == "CNY"
+
+
 def main() -> None:
     test_kline_source_parsers()
+    test_search_source_parser()
+    test_quote_unit_normalization()
+    market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
     market_app.get_kline_data = fake_get_kline_data
     market_app.get_intraday_data = fake_get_intraday_data
@@ -229,11 +283,25 @@ def main() -> None:
         }
         assert all(tool["annotations"]["readOnlyHint"] is True for tool in registered_tools)
 
-        quote = client.post(
+        search = client.post(
             "/mcp",
             headers=headers,
             json=rpc_request(
                 3,
+                "tools/call",
+                {"name": "search_a_share", "arguments": {"keyword": "洛阳钼业"}},
+            ),
+        )
+        assert search.status_code == 200, search.text
+        search_result = search.json()["result"]["structuredContent"]
+        assert search_result["ok"] is True
+        assert search_result["results"][0]["symbol"] == "603993"
+
+        quote = client.post(
+            "/mcp",
+            headers=headers,
+            json=rpc_request(
+                4,
                 "tools/call",
                 {"name": "get_a_share_quote", "arguments": {"symbol": "600519"}},
             ),
@@ -245,16 +313,18 @@ def main() -> None:
         assert "time" not in result
         assert result["market_time"] == "2026-07-10T15:01:46+08:00"
         assert result["queried_at"] == "2026-07-10T00:05:00+00:00"
+        assert result["volume_unit"] == "share"
+        assert result["turnover_unit"] == "CNY"
         assert "pe_dynamic" not in result
         assert "total_market_value" not in result
 
         for request_id, tool_name, arguments in (
-            (4, "get_a_share_kline", {"symbol": "600519"}),
-            (5, "get_a_share_intraday", {"symbol": "600519"}),
-            (6, "get_a_share_fund_flow", {"symbol": "600519"}),
-            (7, "get_a_share_financials", {"symbol": "600519"}),
-            (8, "get_a_share_news", {"symbol": "600519"}),
-            (9, "get_a_share_market_overview", {}),
+            (5, "get_a_share_kline", {"symbol": "600519"}),
+            (6, "get_a_share_intraday", {"symbol": "600519"}),
+            (7, "get_a_share_fund_flow", {"symbol": "600519"}),
+            (8, "get_a_share_financials", {"symbol": "600519"}),
+            (9, "get_a_share_news", {"symbol": "600519"}),
+            (10, "get_a_share_market_overview", {}),
         ):
             response = client.post(
                 "/mcp",
