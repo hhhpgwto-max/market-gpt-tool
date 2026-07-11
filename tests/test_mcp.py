@@ -189,6 +189,16 @@ def test_search_source_parser() -> None:
         assert result["count"] == 1
         assert result["results"][0]["symbol"] == "603993"
         assert result["results"][0]["name"] == "洛阳钼业"
+
+        market_app.read_market_text = lambda url, *_: (
+            'var suggestdata="洛阳钼业,11,603993,sh603993,洛阳钼业,,洛阳钼业,99,1,ESG,,";'
+            if "suggest3.sinajs.cn" in url
+            else 'v_hint="";'
+        )
+        sina_fallback = market_app.search_stock_data("洛阳钼业", 5)
+        assert sina_fallback["source"] == "sina_search"
+        assert sina_fallback["count"] == 1
+        assert sina_fallback["results"][0]["symbol"] == "603993"
     finally:
         market_app.read_market_text = original_text_reader
 
