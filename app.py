@@ -512,6 +512,39 @@ def search_tencent_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+def search_sina_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
+    url = "https://suggest3.sinajs.cn/suggest/" + urlencode(
+        {"type": "11,12,13,14,15", "key": keyword, "name": "suggestdata"}
+    )
+    try:
+        text = read_market_text(url, "https://finance.sina.com.cn/")
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail="Sina stock search is unavailable.") from exc
+
+    if '"' not in text:
+        raise HTTPException(status_code=502, detail="Unexpected Sina search format.")
+
+    market_names = {"sh": "沪A", "sz": "深A", "bj": "北交所"}
+    results = []
+    for candidate in text.split('"', 2)[1].split(";"):
+        parts = candidate.split(",")
+        if len(parts) < 4 or not SYMBOL_PATTERN.fullmatch(parts[2]):
+            continue
+        market_prefix = parts[3][:2].lower()
+        if market_prefix not in market_names:
+            continue
+        results.append(
+            {
+                "symbol": parts[2],
+                "name": parts[0],
+                "market": market_names[market_prefix],
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -527,12 +560,16 @@ def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="keyword is required.")
 
     results = search_tencent_stock(keyword, limit)
+    source = "tencent_search"
+    if not results:
+        results = search_sina_stock(keyword, limit)
+        source = "sina_search"
 
     return {
         "keyword": keyword,
         "count": len(results),
         "results": results,
-        "source": "tencent_search",
+        "source": source,
         "queried_at": now_iso(),
     }
 
