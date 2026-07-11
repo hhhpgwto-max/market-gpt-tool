@@ -62,7 +62,7 @@ def fake_search_stock_data(keyword: str, limit: int) -> dict:
         "keyword": keyword,
         "count": 1,
         "results": [{"symbol": "603993", "name": "洛阳钼业", "market": "沪A"}],
-        "source": "eastmoney_search",
+        "source": "tencent_search",
         "queried_at": "2026-07-10T00:05:00+00:00",
     }
 
@@ -178,32 +178,19 @@ def test_kline_source_parsers() -> None:
 
 
 def test_search_source_parser() -> None:
-    original_reader = market_app.read_public_json
+    original_text_reader = market_app.read_market_text
     try:
-        market_app.read_public_json = lambda *_: {
-            "QuotationCodeTable": {
-                "Data": [
-                    {
-                        "Code": "603993",
-                        "Name": "洛阳钼业",
-                        "Classify": "AStock",
-                        "SecurityTypeName": "沪A",
-                    },
-                    {
-                        "Code": "03993",
-                        "Name": "洛阳钼业",
-                        "Classify": "HK",
-                        "SecurityTypeName": "港股",
-                    },
-                ]
-            }
-        }
+        market_app.read_market_text = lambda *_: (
+            r'v_hint="sh~603993~\u6d1b\u9633\u94bc\u4e1a~lymy~GP-A'
+            r'^hk~03993~\u6d1b\u9633\u94bc\u4e1a~lymy~GP";'
+        )
         result = market_app.search_stock_data("洛阳钼业", 5)
-        assert result["source"] == "eastmoney_search"
+        assert result["source"] == "tencent_search"
         assert result["count"] == 1
         assert result["results"][0]["symbol"] == "603993"
+        assert result["results"][0]["name"] == "洛阳钼业"
     finally:
-        market_app.read_public_json = original_reader
+        market_app.read_market_text = original_text_reader
 
 
 def test_quote_unit_normalization() -> None:
