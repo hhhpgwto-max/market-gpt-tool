@@ -137,9 +137,6 @@ EASTMONEY_FIELDS = ",".join(
     ]
 )
 
-# Public identifier used by Eastmoney's search page; it is not an account credential.
-EASTMONEY_SEARCH_TOKEN = "D43BF722C8E33CBDCCBC1D1A8E68D7AA"  # nosec B105
-
 QUOTE_RESPONSE_FIELDS = (
     "symbol",
     "name",
@@ -483,6 +480,38 @@ def get_all_realtime_quotes() -> pd.DataFrame:
     return data
 
 
+def search_tencent_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
+    url = "https://smartbox.gtimg.cn/s3/?" + urlencode({"q": keyword, "t": "all"})
+    try:
+        text = read_market_text(url, "https://stockapp.finance.qq.com/")
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail="Tencent stock search is unavailable.") from exc
+
+    if '"' not in text:
+        raise HTTPException(status_code=502, detail="Unexpected Tencent search format.")
+
+    market_names = {"sh": "沪A", "sz": "深A", "bj": "北交所"}
+    results = []
+    for candidate in text.split('"', 2)[1].split("^"):
+        parts = candidate.split("~")
+        if len(parts) < 5 or parts[4] != "GP-A" or not SYMBOL_PATTERN.fullmatch(parts[1]):
+            continue
+        try:
+            name = json.loads(f'"{parts[2]}"')
+        except json.JSONDecodeError:
+            name = parts[2]
+        results.append(
+            {
+                "symbol": parts[1],
+                "name": name,
+                "market": market_names.get(parts[0], parts[0]),
+            }
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -497,37 +526,13 @@ def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
     if not keyword:
         raise HTTPException(status_code=400, detail="keyword is required.")
 
-    url = "https://searchapi.eastmoney.com/api/suggest/get?" + urlencode(
-        {
-            "input": keyword,
-            "type": 14,
-            "token": EASTMONEY_SEARCH_TOKEN,
-            "count": max(limit * 3, 10),
-        }
-    )
-    payload = read_public_json(url, "https://so.eastmoney.com/")
-    rows = payload.get("QuotationCodeTable", {}).get("Data") or []
-
-    results = []
-    for row in rows:
-        symbol = str(row.get("Code", ""))
-        if row.get("Classify") != "AStock" or not SYMBOL_PATTERN.fullmatch(symbol):
-            continue
-        results.append(
-            {
-                "symbol": symbol,
-                "name": clean_value(row.get("Name")),
-                "market": clean_value(row.get("SecurityTypeName")),
-            }
-        )
-        if len(results) >= limit:
-            break
+    results = search_tencent_stock(keyword, limit)
 
     return {
         "keyword": keyword,
         "count": len(results),
         "results": results,
-        "source": "eastmoney_search",
+        "source": "tencent_search",
         "queried_at": now_iso(),
     }
 
