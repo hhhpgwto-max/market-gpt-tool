@@ -40,6 +40,8 @@ ChatGPT Business 自定义应用填写方式：
 ## 时间与稳定性
 
 - 报价中的 `market_time` 是数据源给出的实际行情时间；`queried_at` 只是本服务向数据源发起查询的时间。周末或休市时，必须按 `market_time` 判断行情所属交易日。
+- 报价中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 已统一换算为人民币元，`turnover_unit` 固定为 `CNY`。
+- 股票名称搜索直连东方财富轻量搜索接口，只保留六位代码的 A 股结果，不再下载全市场实时行情表。
 - K 线中的 `latest_market_time` 是最后一根 K 线的真实数据时间；K 线优先直连东方财富公开接口，连接失败时自动改用腾讯公开接口，不再依赖 `efinance` 的 K 线通道。
 
 ## 本地运行
