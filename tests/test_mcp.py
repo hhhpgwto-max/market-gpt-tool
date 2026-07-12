@@ -236,11 +236,75 @@ def test_quote_timestamp_semantics() -> None:
     assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
 
 
+def test_intraday_and_index_fallback_parsers() -> None:
+    original_json = market_app.read_public_json
+    original_text = market_app.read_market_text
+    original_eastmoney_intraday = market_app.get_eastmoney_intraday
+    original_eastmoney_indices = market_app.get_eastmoney_indices
+    original_sina_quote = market_app.get_sina_quote
+    try:
+        market_app.get_eastmoney_intraday = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="blocked")
+        )
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "sh600519": {
+                    "data": {
+                        "date": "20260710",
+                        "data": ["0930 10.00 2 2000", "0931 10.10 5 5030"],
+                    },
+                    "qt": {"sh600519": ["1", "Test", "600519", "10.10", "9.90"]},
+                }
+            }
+        }
+        intraday = market_app.get_intraday_data("600519", 2)
+        assert intraday["source"] == "tencent"
+        assert intraday["items"][1]["volume"] == 300
+        assert intraday["items"][1]["turnover"] == 3030
+        assert intraday["items"][1]["volume_unit"] == "share"
+
+        market_app.get_eastmoney_indices = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="blocked")
+        )
+        fields = [""] * 33
+        fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
+        fields[30:33] = ["20260710150000", "1.0", "1.01"]
+        market_app.read_market_text = lambda *_: f'v_sh000001="{"~".join(fields)}";'
+        overview = market_app.get_market_overview_data(3)
+        assert overview["index_source"] == "tencent"
+        assert overview["indices"][0]["change"] == 1.0
+        assert overview["indices"][0]["change_pct"] == 1.01
+
+        market_app.read_public_json = lambda *_: {
+            "name": "Test",
+            "r0_in": "3000",
+            "r0_out": "1000",
+            "netamount": "1500",
+            "trade": "10.10",
+            "changeratio": "0.01",
+        }
+        market_app.get_sina_quote = lambda *_: {
+            "source_updated_at": "2026-07-10T15:00:00+08:00"
+        }
+        fund_flow = market_app.get_sina_fund_flow("600519", 5)
+        assert fund_flow["data_status"] == "partial_data"
+        assert fund_flow["count"] == 1
+        assert fund_flow["items"][0]["main_net_inflow"] == 2000
+        assert fund_flow["items"][0]["change_pct"] == 1.0
+    finally:
+        market_app.read_public_json = original_json
+        market_app.read_market_text = original_text
+        market_app.get_eastmoney_intraday = original_eastmoney_intraday
+        market_app.get_eastmoney_indices = original_eastmoney_indices
+        market_app.get_sina_quote = original_sina_quote
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
     test_quote_unit_normalization()
     test_quote_timestamp_semantics()
+    test_intraday_and_index_fallback_parsers()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
     market_app.get_kline_data = fake_get_kline_data

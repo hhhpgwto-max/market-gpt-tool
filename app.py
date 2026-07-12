@@ -794,7 +794,7 @@ def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[s
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
-def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
+def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     query = urlencode(
         {
@@ -845,7 +845,76 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
     }
 
 
-def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
+def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    code = market_symbol(symbol)
+    payload = read_public_json(
+        f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={code}",
+        "https://stockapp.finance.qq.com/",
+    )
+    stock = (payload.get("data") or {}).get(code) or {}
+    data = stock.get("data") or {}
+    rows = data.get("data") or []
+    trade_date = clean_value(data.get("date"))
+    if trade_date and re.fullmatch(r"\d{8}", str(trade_date)):
+        trade_date = datetime.strptime(str(trade_date), "%Y%m%d").date().isoformat()
+    if not rows or not trade_date:
+        raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
+
+    parsed = []
+    previous_volume = 0.0
+    previous_turnover = 0.0
+    for row in rows:
+        values = row.split()
+        if len(values) < 4:
+            continue
+        cumulative_volume = to_number(values[2])
+        cumulative_turnover = to_number(values[3])
+        if cumulative_volume is None or cumulative_turnover is None:
+            continue
+        parsed.append(
+            {
+                "time": f"{trade_date} {values[0][:2]}:{values[0][2:]}",
+                "price": to_number(values[1]),
+                "volume": max(0.0, cumulative_volume - previous_volume) * 100,
+                "turnover": max(0.0, cumulative_turnover - previous_turnover),
+                "volume_unit": "share",
+                "turnover_unit": "CNY",
+            }
+        )
+        previous_volume = cumulative_volume
+        previous_turnover = cumulative_turnover
+    items = parsed[-limit:]
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
+    quote = (stock.get("qt") or {}).get(code) or []
+    return {
+        "symbol": symbol,
+        "name": clean_value(quote[1]) if len(quote) > 1 else None,
+        "previous_close": to_number(quote[4]) if len(quote) > 4 else None,
+        "count": len(items),
+        "items": items,
+        "source": "tencent",
+        "latest_market_time": items[-1]["time"],
+        "queried_at": now_iso(),
+        "note": "For information only. Not investment advice.",
+    }
+
+
+def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
+    errors = []
+    for source, getter in (
+        ("eastmoney", get_eastmoney_intraday),
+        ("tencent", get_tencent_intraday),
+    ):
+        try:
+            return getter(symbol, limit)
+        except HTTPException as exc:
+            errors.append(f"{source}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     query = urlencode(
         {
@@ -894,6 +963,62 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
         "queried_at": now_iso(),
         "note": "Fund-flow figures are public-market estimates, for information only.",
     }
+
+
+def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    code = market_symbol(symbol)
+    payload = read_public_json(
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"MoneyFlow.ssi_ssfx_flzjtj?daima={code}",
+        "https://finance.sina.com.cn/",
+    )
+    quote = get_sina_quote(symbol)
+    trade_date = derive_quote_timestamps(quote.get("source_updated_at"))["trade_date"]
+    if not payload or not trade_date:
+        raise HTTPException(status_code=404, detail=f"Fund-flow data not found: {symbol}")
+    large_in = to_number(payload.get("r0_in"))
+    large_out = to_number(payload.get("r0_out"))
+    main_net = (
+        large_in - large_out if large_in is not None and large_out is not None else None
+    )
+    return {
+        "symbol": symbol,
+        "name": clean_value(payload.get("name")),
+        "count": 1,
+        "items": [
+            {
+                "date": trade_date,
+                "main_net_inflow": main_net,
+                "total_net_inflow": to_number(payload.get("netamount")),
+                "close": to_number(payload.get("trade")),
+                "change_pct": (
+                    to_number(payload.get("changeratio")) * 100
+                    if to_number(payload.get("changeratio")) is not None
+                    else None
+                ),
+                "currency_unit": "CNY",
+            }
+        ],
+        "source": "sina",
+        "data_status": "partial_data",
+        "latest_market_date": trade_date,
+        "queried_at": now_iso(),
+        "note": "Sina Level-1 fund-flow estimate; fallback provides current-day summary only.",
+    }
+
+
+def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
+    errors = []
+    for source, getter in (
+        ("eastmoney", get_eastmoney_fund_flow),
+        ("sina", get_sina_fund_flow),
+    ):
+        try:
+            return getter(symbol, limit)
+        except HTTPException as exc:
+            errors.append(f"{source}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
@@ -988,7 +1113,7 @@ def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
     }
 
 
-def get_market_overview_data(limit: int) -> dict[str, Any]:
+def get_eastmoney_indices() -> list[dict[str, Any]]:
     index_query = urlencode(
         {
             "fltt": 2,
@@ -1002,7 +1127,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "https://quote.eastmoney.com/",
     )
     index_rows = ((index_payload.get("data") or {}).get("diff")) or []
-    indices = [
+    return [
         {
             "symbol": clean_value(row.get("f12")),
             "name": clean_value(row.get("f14")),
@@ -1014,6 +1139,51 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         }
         for row in index_rows
     ]
+
+
+def get_tencent_indices() -> list[dict[str, Any]]:
+    try:
+        text = read_market_text(
+            "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006",
+            "https://stockapp.finance.qq.com/",
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Tencent indices: {exc}") from exc
+    indices = []
+    for match in re.finditer(r'v_\w+="([^"]*)"', text):
+        values = match.group(1).split("~")
+        if len(values) < 32:
+            continue
+        indices.append(
+            {
+                "symbol": clean_value(values[2]),
+                "name": clean_value(values[1]),
+                "price": to_number(values[3]),
+                "change_pct": to_number(values[32]),
+                "change": to_number(values[31]),
+                "open": to_number(values[5]),
+                "previous_close": to_number(values[4]),
+                "source_updated_at": format_market_time(values[30]),
+            }
+        )
+    if not indices:
+        raise HTTPException(status_code=502, detail="Unexpected Tencent index response.")
+    return indices
+
+
+def get_market_overview_data(limit: int) -> dict[str, Any]:
+    index_errors = []
+    indices = []
+    index_source = "unavailable"
+    for source, getter in (("eastmoney", get_eastmoney_indices), ("tencent", get_tencent_indices)):
+        try:
+            indices = getter()
+            index_source = source
+            break
+        except HTTPException as exc:
+            index_errors.append(f"{source}: {exc.detail}")
+    if not indices:
+        raise HTTPException(status_code=502, detail="; ".join(index_errors))
 
     boards: list[dict[str, Any]] = []
     board_source = "unavailable"
@@ -1041,11 +1211,12 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             boards.sort(key=lambda item: item["average_change_pct"], reverse=True)
             boards = boards[:limit]
             board_source = "efinance_calculated"
-    except HTTPException:
+    except (HTTPException, OSError, ValueError, TypeError):
         pass
 
     return {
         "indices": indices,
+        "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
         "queried_at": now_iso(),
