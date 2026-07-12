@@ -49,7 +49,9 @@ def fake_get_quote_data(symbol: str) -> dict:
             "turnover_unit": "CNY",
             "pe_dynamic": 99.9,
             "total_market_value": 999999999,
-            "market_time": "2026-07-10T15:01:46+08:00",
+            "trade_date": "2026-07-10",
+            "quote_time": "2026-07-10T15:00:00+08:00",
+            "source_updated_at": "2026-07-10T16:14:42+08:00",
         },
         "source": "test",
         "queried_at": "2026-07-10T00:05:00+00:00",
@@ -72,9 +74,18 @@ def fake_get_kline_data(symbol: str, period: str, limit: int) -> dict:
         "symbol": symbol,
         "period": period,
         "count": limit,
-        "items": [{"date": "2026-07-10", "close": 123.45}],
+        "items": [
+            {
+                "date": "2026-07-10",
+                "close": 123.45,
+                "volume": 100000,
+                "volume_unit": "share",
+                "turnover": None,
+                "turnover_unit": "CNY",
+            }
+        ],
         "source": "tencent",
-        "latest_market_time": "2026-07-10",
+        "latest_trade_date": "2026-07-10",
         "queried_at": "2026-07-10T00:05:00+00:00",
         "note": "For information only. Not investment advice.",
     }
@@ -150,8 +161,11 @@ def test_kline_source_parsers() -> None:
         }
         eastmoney = market_app.get_eastmoney_kline("600519", "daily", 101, 1)
         assert eastmoney["source"] == "eastmoney"
-        assert eastmoney["latest_market_time"] == "2026-07-10"
+        assert eastmoney["latest_trade_date"] == "2026-07-10"
         assert eastmoney["items"][0]["close"] == 123.45
+        assert eastmoney["items"][0]["volume"] == 100000
+        assert eastmoney["items"][0]["volume_unit"] == "share"
+        assert eastmoney["items"][0]["turnover_unit"] == "CNY"
 
         market_app.read_public_json = lambda *_: {
             "data": {
@@ -162,8 +176,10 @@ def test_kline_source_parsers() -> None:
         }
         tencent = market_app.get_tencent_kline("600519", "daily", 1)
         assert tencent["source"] == "tencent"
-        assert tencent["latest_market_time"] == "2026-07-10"
+        assert tencent["latest_trade_date"] == "2026-07-10"
         assert tencent["items"][0]["close"] == 123.45
+        assert tencent["items"][0]["volume"] == 100000
+        assert tencent["items"][0]["volume_unit"] == "share"
 
         market_app.get_eastmoney_kline = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="connection closed")
@@ -213,10 +229,18 @@ def test_quote_unit_normalization() -> None:
     assert result["turnover_unit"] == "CNY"
 
 
+def test_quote_timestamp_semantics() -> None:
+    result = market_app.derive_quote_timestamps("2026-07-10T16:14:42+08:00")
+    assert result["trade_date"] == "2026-07-10"
+    assert result["quote_time"] == "2026-07-10T15:00:00+08:00"
+    assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
     test_quote_unit_normalization()
+    test_quote_timestamp_semantics()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
     market_app.get_kline_data = fake_get_kline_data
@@ -308,7 +332,10 @@ def main() -> None:
         assert result["ok"] is True
         assert result["symbol"] == "600519"
         assert "time" not in result
-        assert result["market_time"] == "2026-07-10T15:01:46+08:00"
+        assert "market_time" not in result
+        assert result["trade_date"] == "2026-07-10"
+        assert result["quote_time"] == "2026-07-10T15:00:00+08:00"
+        assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
         assert result["queried_at"] == "2026-07-10T00:05:00+00:00"
         assert result["volume_unit"] == "share"
         assert result["turnover_unit"] == "CNY"

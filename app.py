@@ -160,7 +160,9 @@ KLINE_RESPONSE_FIELDS = (
     "high",
     "low",
     "volume",
+    "volume_unit",
     "turnover",
+    "turnover_unit",
     "change_pct",
 )
 
@@ -221,6 +223,37 @@ def format_unix_market_time(value: Any) -> str | None:
         return datetime.fromtimestamp(float(value), timezone.utc).astimezone(MARKET_TIMEZONE).isoformat()
     except (TypeError, ValueError, OSError):
         return None
+
+
+def derive_quote_timestamps(source_updated_at: str | None) -> dict[str, str | None]:
+    result = {
+        "trade_date": None,
+        "quote_time": None,
+        "source_updated_at": source_updated_at,
+    }
+    if not source_updated_at:
+        return result
+
+    try:
+        updated = datetime.fromisoformat(source_updated_at)
+    except ValueError:
+        return result
+
+    result["trade_date"] = updated.date().isoformat()
+    minutes = updated.hour * 60 + updated.minute
+    if 9 * 60 + 30 <= minutes <= 11 * 60 + 30:
+        quote_time = updated
+    elif 11 * 60 + 30 < minutes < 13 * 60:
+        quote_time = updated.replace(hour=11, minute=30, second=0, microsecond=0)
+    elif 13 * 60 <= minutes <= 15 * 60:
+        quote_time = updated
+    elif minutes > 15 * 60:
+        quote_time = updated.replace(hour=15, minute=0, second=0, microsecond=0)
+    else:
+        quote_time = None
+
+    result["quote_time"] = quote_time.isoformat() if quote_time else None
+    return result
 
 
 def clean_value(value: Any) -> Any:
@@ -349,7 +382,7 @@ def get_tencent_quote(symbol: str) -> dict[str, Any]:
         "pb": to_number(parts[46]),
         "total_market_value": to_number(parts[44]),
         "circulating_market_value": to_number(parts[45]),
-        "market_time": format_market_time(parts[30] if len(parts) > 30 else None),
+        "source_updated_at": format_market_time(parts[30] if len(parts) > 30 else None),
     }
 
 
@@ -385,7 +418,7 @@ def get_sina_quote(symbol: str) -> dict[str, Any]:
         "low": to_number(parts[5]),
         "open": to_number(parts[1]),
         "previous_close": previous_close,
-        "market_time": format_market_time(
+        "source_updated_at": format_market_time(
             f"{parts[30]} {parts[31]}" if len(parts) > 31 else None
         ),
     }
@@ -432,7 +465,7 @@ def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
         "pb": scaled(data.get("f167")),
         "total_market_value": clean_value(data.get("f116")),
         "circulating_market_value": clean_value(data.get("f117")),
-        "market_time": format_unix_market_time(data.get("f124")),
+        "source_updated_at": format_unix_market_time(data.get("f124")),
     }
 
 
@@ -588,7 +621,7 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
 
         row = rows.iloc[0]
         quote = row_to_dict(row, QUOTE_COLUMNS)
-        quote["market_time"] = next(
+        quote["source_updated_at"] = next(
             (
                 format_market_time(row.get(column))
                 for column in ("更新时间", "行情时间", "时间")
@@ -596,16 +629,17 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
             ),
             None,
         )
-        if not quote["market_time"]:
+        if not quote["source_updated_at"]:
             raise HTTPException(
                 status_code=502,
-                detail="Realtime quote source did not provide a market timestamp.",
+                detail="Realtime quote source did not provide an update timestamp.",
             )
         source = "efinance"
     except HTTPException:
         quote, source = get_fallback_quote(symbol)
 
     quote = normalize_quote_units(quote, source)
+    quote.update(derive_quote_timestamps(quote.get("source_updated_at")))
 
     return {
         "quote": quote,
@@ -650,6 +684,7 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
         values = kline.split(",")
         if len(values) < 11:
             continue
+        volume = to_number(values[5])
         items.append(
             {
                 "date": values[0],
@@ -657,8 +692,10 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
                 "close": to_number(values[2]),
                 "high": to_number(values[3]),
                 "low": to_number(values[4]),
-                "volume": to_number(values[5]),
+                "volume": None if volume is None else volume * 100,
+                "volume_unit": "share",
                 "turnover": to_number(values[6]),
+                "turnover_unit": "CNY",
                 "amplitude": to_number(values[7]),
                 "change_pct": to_number(values[8]),
                 "change": to_number(values[9]),
@@ -674,7 +711,7 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
         "count": len(items),
         "items": items,
         "source": "eastmoney",
-        "latest_market_time": items[-1]["date"],
+        "latest_trade_date": items[-1]["date"],
         "queried_at": now_iso(),
         "note": "For information only. Not investment advice.",
     }
@@ -710,6 +747,7 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
         if len(row) < 6:
             continue
         close = to_number(row[2])
+        volume = to_number(row[5])
         change_pct = None
         if close is not None and previous_close not in (None, 0):
             change_pct = round((close - previous_close) / previous_close * 100, 4)
@@ -720,8 +758,10 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
                 "close": close,
                 "high": to_number(row[3]),
                 "low": to_number(row[4]),
-                "volume": to_number(row[5]),
+                "volume": None if volume is None else volume * 100,
+                "volume_unit": "share",
                 "turnover": None,
+                "turnover_unit": "CNY",
                 "change_pct": change_pct,
             }
         )
@@ -735,7 +775,7 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
         "count": len(items),
         "items": items,
         "source": "tencent",
-        "latest_market_time": items[-1]["date"],
+        "latest_trade_date": items[-1]["date"],
         "queried_at": now_iso(),
         "note": "For information only. Not investment advice.",
     }
@@ -1086,7 +1126,9 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
         "ok": True,
         **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
         "source": payload["source"],
-        "market_time": quote.get("market_time"),
+        "trade_date": quote.get("trade_date"),
+        "quote_time": quote.get("quote_time"),
+        "source_updated_at": quote.get("source_updated_at"),
         "queried_at": payload["queried_at"],
         "note": payload["note"],
     }
@@ -1130,7 +1172,7 @@ def get_a_share_kline(
             for item in payload["items"]
         ],
         "source": payload["source"],
-        "latest_market_time": payload["latest_market_time"],
+        "latest_trade_date": payload["latest_trade_date"],
         "queried_at": payload["queried_at"],
         "note": payload["note"],
     }
