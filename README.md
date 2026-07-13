@@ -1,6 +1,6 @@
 # Market GPT Tool MCP
 
-这是给普通 ChatGPT 对话使用的只读 A 股行情 MCP 服务。
+这是给普通 ChatGPT 对话使用的只读 A 股及交易所基金行情 MCP 服务。
 
 ```text
 普通 ChatGPT 对话
@@ -26,10 +26,10 @@ ChatGPT Business 自定义应用填写方式：
 
 ## MCP 工具
 
-- `search_a_share`：按股票代码或名称搜索 A 股。
-- `get_a_share_quote`：查询一只 A 股的最新行情。
-- `get_a_share_kline`：查询最多 30 条近期 K 线数据。
-- `get_a_share_intraday`：查询最多 240 条当日一分钟分时数据。
+- `search_a_share`：按代码或名称搜索 A 股、ETF、LOF。
+- `get_a_share_quote`：查询一只 A 股、ETF 或 LOF 的最新行情。
+- `get_a_share_kline`：查询最多 30 条近期股票、ETF 或 LOF K 线数据。
+- `get_a_share_intraday`：查询最多 240 条当日一分钟股票、ETF 或 LOF 分时数据。
 - `get_a_share_fund_flow`：查询最多 10 个交易日的公开资金流估算。
 - `get_a_share_financials`：查询最多 4 期公开财务关键指标。
 - `get_a_share_news`：查询最多 10 条提及该股票代码的公开新闻。
@@ -41,7 +41,7 @@ ChatGPT Business 自定义应用填写方式：
 
 - 报价中的 `trade_date` 表示行情所属交易日，`quote_time` 表示该交易日内最后可能成交的时间，`source_updated_at` 表示数据源刷新快照的时间；收盘后的刷新时间不会再冒充成交时间。`queried_at` 仅表示本服务查询时间。
 - 报价中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 已统一换算为人民币元，`turnover_unit` 固定为 `CNY`。
-- 股票名称搜索优先使用腾讯轻量接口，结果为空时自动回退新浪；只保留六位代码的 A 股结果，不再下载全市场实时行情表。
+- 代码会先识别证券类别和交易所，再转换为各数据源需要的格式。例如上交所 ETF `512760` 会使用 `sh512760`（腾讯/新浪）和 `1.512760`（东方财富），不会误当成深市股票。股票、ETF 和 LOF 名称搜索优先使用腾讯轻量接口，结果为空时自动回退新浪。
 - K 线中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 使用人民币元，`turnover_unit` 固定为 `CNY`。`latest_trade_date` 是最后一根 K 线所属交易日。K 线优先直连东方财富，失败时自动回退腾讯。
 
 ## 本地运行
