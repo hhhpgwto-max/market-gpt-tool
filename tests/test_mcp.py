@@ -302,10 +302,10 @@ def test_quote_timestamp_semantics() -> None:
 def test_industry_board_parser() -> None:
     original_json = market_app.read_public_json
     try:
-        calls: list[str] = []
+        calls: list[tuple[str, tuple[object, ...]]] = []
 
         def read_with_host_fallback(url: str, *_: object) -> dict:
-            calls.append(url)
+            calls.append((url, _))
             if "push2.eastmoney.com" in url:
                 raise market_app.HTTPException(status_code=502, detail="blocked")
             return {
@@ -324,8 +324,10 @@ def test_industry_board_parser() -> None:
 
         market_app.read_public_json = read_with_host_fallback
         boards = market_app.get_eastmoney_industry_boards(5)
-        assert "push2.eastmoney.com" in calls[0]
-        assert "push2delay.eastmoney.com" in calls[1]
+        assert "push2.eastmoney.com" in calls[0][0]
+        assert "push2delay.eastmoney.com" in calls[1][0]
+        assert calls[0][1][-2:] == (5, 1)
+        assert calls[1][1][-2:] == (5, 1)
         assert boards == [
             {
                 "symbol": "BK0001",

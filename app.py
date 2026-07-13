@@ -379,7 +379,12 @@ def read_market_text(url: str, referer: str) -> str:
         return response.read().decode("gbk", errors="replace")
 
 
-def read_public_json(url: str, referer: str) -> dict[str, Any]:
+def read_public_json(
+    url: str,
+    referer: str,
+    timeout: int = 15,
+    attempts: int = 2,
+) -> dict[str, Any]:
     request = Request(
         url,
         headers={
@@ -389,9 +394,9 @@ def read_public_json(url: str, referer: str) -> dict[str, Any]:
         },
     )
     errors = []
-    for _ in range(2):
+    for _ in range(attempts):
         try:
-            with urlopen(request, timeout=15) as response:  # nosec B310
+            with urlopen(request, timeout=timeout) as response:  # nosec B310
                 return json.loads(response.read().decode("utf-8"))
         except (OSError, URLError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
@@ -1359,6 +1364,8 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
             payload = read_public_json(
                 f"https://{host}/api/qt/clist/get?{query}",
                 "https://quote.eastmoney.com/",
+                5,
+                1,
             )
             rows = ((payload.get("data") or {}).get("diff")) or []
             if not rows:
