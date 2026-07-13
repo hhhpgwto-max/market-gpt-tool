@@ -2894,7 +2894,118 @@ def get_overview_board_component(limit: int) -> dict[str, Any]:
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
+def get_eastmoney_market_aggregate() -> dict[str, Any]:
+    query = urlencode(
+        {
+            "fltt": 2,
+            "invt": 2,
+            "fields": "f6,f12,f13,f14,f104,f105,f106,f124",
+            "secids": "1.000002,0.399107,0.899050",
+        }
+    )
+    payload = read_public_json(
+        f"https://push2.eastmoney.com/api/qt/ulist.np/get?{query}",
+        "https://quote.eastmoney.com/",
+        timeout=2,
+        attempts=1,
+    )
+    rows = ((payload.get("data") or {}).get("diff")) or []
+    exchange_by_symbol = {"000002": "SSE", "399107": "SZSE", "899050": "BSE"}
+    parsed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        exchange = exchange_by_symbol.get(str(row.get("f12") or ""))
+        rise_count = _to_int(row.get("f104"))
+        fall_count = _to_int(row.get("f105"))
+        flat_count = _to_int(row.get("f106"))
+        turnover = to_number(row.get("f6"))
+        if not exchange or None in (rise_count, fall_count, flat_count, turnover):
+            continue
+        parsed[exchange] = {
+            "rise_count": rise_count,
+            "fall_count": fall_count,
+            "flat_count": flat_count,
+            "turnover": turnover,
+            "market_time": market_time_from_source_update(
+                format_unix_market_time(row.get("f124"))
+            ),
+        }
+    if set(parsed) != {"SSE", "SZSE", "BSE"}:
+        raise HTTPException(
+            status_code=502,
+            detail="Eastmoney market aggregate did not include SSE, SZSE, and BSE rows.",
+        )
+
+    unavailable_detail_fields = (
+        "rise_over_3_count",
+        "rise_over_5_count",
+        "rise_over_7_count",
+        "fall_over_3_count",
+        "fall_over_5_count",
+        "fall_over_7_count",
+        "limit_up_count",
+        "limit_down_count",
+        "open_board_count",
+        "consecutive_limit_up_count",
+        "st_limit_up_count",
+        "st_limit_down_count",
+    )
+
+    def aggregate_counts(exchange: str | None = None) -> dict[str, Any]:
+        selected = [parsed[exchange]] if exchange else list(parsed.values())
+        result = empty_breadth_counts()
+        for key in ("rise_count", "fall_count", "flat_count"):
+            result[key] = sum(item[key] for item in selected)
+        result["stock_count"] = sum(
+            item["rise_count"] + item["fall_count"] + item["flat_count"]
+            for item in selected
+        )
+        for key in unavailable_detail_fields:
+            result[key] = None
+        return result
+
+    market_times = [item["market_time"] for item in parsed.values() if item["market_time"]]
+    market_time = max(market_times) if market_times else None
+    by_exchange_turnover = {
+        exchange: parsed[exchange]["turnover"] for exchange in ("SSE", "SZSE", "BSE")
+    }
+    return {
+        "breadth": {
+            "scope": "Ordinary A-share exchange aggregates for SSE, SZSE, and BSE; detailed price-band and limit statistics require the slower security-level fallback.",
+            "all_market": aggregate_counts(),
+            "by_exchange": {
+                exchange: aggregate_counts(exchange) for exchange in ("SSE", "SZSE", "BSE")
+            },
+            "consecutive_limit_up_status": "unavailable_without_a_historical_limit-up_pool",
+        },
+        "turnover": {
+            "current": sum(by_exchange_turnover.values()),
+            "unit": "CNY",
+            "previous_trade_day_same_time": None,
+            "change": None,
+            "change_pct": None,
+            "comparison_status": "unavailable_without_a_reliable_prior-day_market-wide_intraday_series",
+            "estimated_full_day": None,
+            "estimated_full_day_status": "pending_market_time_adjustment",
+            "by_exchange": by_exchange_turnover,
+            "top_turnover_securities": [],
+            "scope": "Ordinary A-share exchange aggregates; security-level turnover ranking is unavailable on this fast path.",
+        },
+        "market_time": market_time,
+        "row_count": aggregate_counts()["stock_count"],
+        "coverage_status": "complete_exchange_aggregate",
+        "source": "eastmoney_a_share_exchange_aggregate",
+        "source_errors": [],
+    }
+
+
 def get_overview_breadth_component() -> dict[str, Any]:
+    aggregate_error: str | None = None
+    try:
+        return get_eastmoney_market_aggregate()
+    except (HTTPException, OSError, ValueError, TypeError) as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        aggregate_error = f"eastmoney_a_share_exchange_aggregate: {detail}"
+
     source_getters = (
         (
             "eastmoney_all_a_shares",
@@ -2909,7 +3020,7 @@ def get_overview_breadth_component() -> dict[str, Any]:
     executor = ThreadPoolExecutor(max_workers=len(source_getters))
     futures = {executor.submit(getter): source for source, getter in source_getters}
     pending = set(futures)
-    errors: list[str] = []
+    errors: list[str] = [aggregate_error] if aggregate_error else []
     deadline = perf_counter() + 5.5
     try:
         while pending:
@@ -3128,7 +3239,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             if breadth
             and turnover
             and boards
-            and breadth_component.get("coverage_status") == "complete"
+            and str(breadth_component.get("coverage_status") or "").startswith("complete")
             else "partial_data"
         ),
         "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a six-second budget.",
