@@ -299,6 +299,30 @@ def test_quote_timestamp_semantics() -> None:
     assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
 
 
+def test_industry_board_parser() -> None:
+    original_json = market_app.read_public_json
+    try:
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "diff": [
+                    {"f12": "BK0001", "f14": "Test Industry", "f2": 100.5, "f3": 2.3, "f4": 2.25}
+                ]
+            }
+        }
+        boards = market_app.get_eastmoney_industry_boards(5)
+        assert boards == [
+            {
+                "symbol": "BK0001",
+                "name": "Test Industry",
+                "price": 100.5,
+                "change_pct": 2.3,
+                "change": 2.25,
+            }
+        ]
+    finally:
+        market_app.read_public_json = original_json
+
+
 def test_intraday_and_index_fallback_parsers() -> None:
     original_json = market_app.read_public_json
     original_text = market_app.read_market_text
@@ -306,6 +330,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
     original_tencent_intraday = market_app.get_tencent_intraday
     original_eastmoney_indices = market_app.get_eastmoney_indices
     original_tencent_indices = market_app.get_tencent_indices
+    original_eastmoney_industry_boards = market_app.get_eastmoney_industry_boards
     original_eastmoney_fund_flow = market_app.get_eastmoney_fund_flow
     original_sina_fund_flow = market_app.get_sina_fund_flow
     original_sina_quote = market_app.get_sina_quote
@@ -354,6 +379,9 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_tencent_intraday = original_tencent_intraday
 
         market_app.get_eastmoney_indices = lambda: []
+        market_app.get_eastmoney_industry_boards = lambda _: [
+            {"symbol": "BK0001", "name": "Test Industry", "price": 100, "change_pct": 1.5, "change": 1.48}
+        ]
         market_app.get_all_realtime_quotes = lambda: market_app.pd.DataFrame()
         fields = [""] * 33
         fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
@@ -363,6 +391,8 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert overview["index_source"] == "tencent"
         assert overview["indices"][0]["change"] == 1.0
         assert overview["indices"][0]["change_pct"] == 1.01
+        assert overview["industry_board_source"] == "eastmoney_industry"
+        assert overview["industry_boards"][0]["name"] == "Test Industry"
 
         market_app.read_market_text = lambda *_: 'v_sh000001="' + "~".join([""] * 32) + '";'
         try:
@@ -416,6 +446,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_tencent_intraday = original_tencent_intraday
         market_app.get_eastmoney_indices = original_eastmoney_indices
         market_app.get_tencent_indices = original_tencent_indices
+        market_app.get_eastmoney_industry_boards = original_eastmoney_industry_boards
         market_app.get_eastmoney_fund_flow = original_eastmoney_fund_flow
         market_app.get_sina_fund_flow = original_sina_fund_flow
         market_app.get_sina_quote = original_sina_quote
@@ -428,6 +459,7 @@ def main() -> None:
     test_etf_market_routing_and_search()
     test_quote_unit_normalization()
     test_quote_timestamp_semantics()
+    test_industry_board_parser()
     test_intraday_and_index_fallback_parsers()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
