@@ -1344,24 +1344,40 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
             "fields": "f12,f14,f2,f3,f4",
         }
     )
-    payload = read_public_json(
-        f"https://push2.eastmoney.com/api/qt/clist/get?{query}",
-        "https://quote.eastmoney.com/",
-    )
-    rows = ((payload.get("data") or {}).get("diff")) or []
-    if not rows:
-        raise HTTPException(status_code=502, detail="Eastmoney returned no industry-board rows.")
-    return [
-        {
-            "symbol": clean_value(row.get("f12")),
-            "name": clean_value(row.get("f14")),
-            "price": to_number(row.get("f2")),
-            "change_pct": to_number(row.get("f3")),
-            "change": to_number(row.get("f4")),
-        }
-        for row in rows[:limit]
-        if row.get("f14")
-    ]
+    errors = []
+    for host in (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
+    ):
+        try:
+            payload = read_public_json(
+                f"https://{host}/api/qt/clist/get?{query}",
+                "https://quote.eastmoney.com/",
+            )
+            rows = ((payload.get("data") or {}).get("diff")) or []
+            if not rows:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{host} returned no industry-board rows.",
+                )
+            boards = [
+                {
+                    "symbol": clean_value(row.get("f12")),
+                    "name": clean_value(row.get("f14")),
+                    "price": to_number(row.get("f2")),
+                    "change_pct": to_number(row.get("f3")),
+                    "change": to_number(row.get("f4")),
+                }
+                for row in rows[:limit]
+                if row.get("f14")
+            ]
+            if boards:
+                return boards
+            errors.append(f"{host}: no usable industry-board rows")
+        except HTTPException as exc:
+            errors.append(f"{host}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
 def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
