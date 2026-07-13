@@ -1382,7 +1382,7 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
                     "change_pct": to_number(row.get("f3")),
                     "change": to_number(row.get("f4")),
                 }
-                for row in rows[:limit]
+                for row in rows
                 if row.get("f14")
             ]
             if boards:
