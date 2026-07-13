@@ -1,8 +1,13 @@
 import os
 import json
 import re
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from math import ceil
+from threading import Lock
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlencode
 from urllib.error import URLError
@@ -21,7 +26,8 @@ APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
-    "fund flows, financial metrics, and market overview. "
+    "fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical sector rankings, and "
+    "operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
     "All data is informational only and is not investment advice."
@@ -57,7 +63,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.3.0",
+    version="0.6.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -182,7 +188,40 @@ FINANCIAL_RESPONSE_FIELDS = {
     "MGJYXJJE": "operating_cash_flow_per_share",
 }
 
-INDEX_SECIDS = "1.000001,0.399001,0.399006"
+INDEX_SECIDS = ",".join(
+    (
+        "1.000001",  # 上证指数
+        "0.399001",  # 深证成指
+        "0.399006",  # 创业板指
+        "1.000688",  # 科创 50
+        "1.000300",  # 沪深 300
+        "1.000905",  # 中证 500
+        "0.399852",  # 中证 1000
+        "2.932000",  # 中证 2000
+        "1.000016",  # 上证 50
+        "1.000922",  # 中证红利
+    )
+)
+PRIMARY_INDEX_SYMBOLS = {"000001", "399001", "399006"}
+MARKET_QUOTE_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+MARKET_QUOTE_FIELDS = "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18,f20,f124"
+BATCH_QUOTE_FIELDS = "f12,f14,f2,f3,f4,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21,f124"
+INDEX_SECID_BY_SYMBOL = {
+    "000001": "1.000001",
+    "399001": "0.399001",
+    "399006": "0.399006",
+    "000688": "1.000688",
+    "000300": "1.000300",
+    "000905": "1.000905",
+    "399852": "0.399852",
+    "932000": "2.932000",
+    "000016": "1.000016",
+    "000922": "1.000922",
+}
+SECTOR_TYPE_CONFIG = {
+    "industry": "m:90+t:2",
+    "concept": "m:90+t:3",
+}
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
@@ -209,6 +248,11 @@ ETF_PREFIXES = (
     "159",
 )
 LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169")
+
+TOOL_CACHE: dict[str, dict[str, Any]] = {}
+TOOL_CACHE_LOCK = Lock()
+SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
+SOURCE_HEALTH_LOCK = Lock()
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -266,8 +310,232 @@ def security_metadata(symbol: str) -> dict[str, str]:
     }
 
 
+def batch_security_metadata(identifier: Any) -> dict[str, str]:
+    """Classify a batch item, allowing an explicit index: prefix for ambiguous codes."""
+    raw_identifier = str(identifier).strip()
+    if raw_identifier.lower().startswith("index:"):
+        symbol = normalize_symbol(raw_identifier.split(":", 1)[1])
+        secid = INDEX_SECID_BY_SYMBOL.get(symbol)
+        if secid is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unsupported index code. Use index: with one of the public indices returned by "
+                    "get_a_share_market_overview."
+                ),
+            )
+        exchange = "SZSE" if secid.startswith("0.") else "SSE"
+        return {
+            "identifier": raw_identifier,
+            "symbol": symbol,
+            "security_type": "index",
+            "exchange": exchange,
+            "exchange_name": "Index quote",
+            "eastmoney_secid": secid,
+        }
+
+    security = security_metadata(raw_identifier)
+    return {"identifier": raw_identifier, **security, "eastmoney_secid": eastmoney_secid(raw_identifier)}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def cache_key(tool_name: str, parameters: Any) -> str:
+    return f"{tool_name}:{json.dumps(parameters, ensure_ascii=False, sort_keys=True, default=str)}"
+
+
+def get_cached_tool_data(
+    key: str, ttl_seconds: int, loader: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    with TOOL_CACHE_LOCK:
+        cached = TOOL_CACHE.get(key)
+        if cached is not None:
+            age_seconds = (now - cached["created_at"]).total_seconds()
+            if age_seconds <= ttl_seconds:
+                return (
+                    deepcopy(cached["data"]),
+                    {
+                        "cache_hit": True,
+                        "cache_created_at": cached["created_at"].isoformat(),
+                        "cache_age_seconds": round(age_seconds, 3),
+                    },
+                )
+
+    data = loader()
+    created_at = datetime.now(timezone.utc)
+    with TOOL_CACHE_LOCK:
+        TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
+    return (
+        data,
+        {
+            "cache_hit": False,
+            "cache_created_at": created_at.isoformat(),
+            "cache_age_seconds": 0.0,
+        },
+    )
+
+
+def source_name_from_url(url: str) -> str:
+    text = url.lower()
+    if "eastmoney" in text:
+        return "eastmoney"
+    if "gtimg" in text or "qq.com" in text:
+        return "tencent"
+    if "sina" in text:
+        return "sina"
+    return "public_market_source"
+
+
+def record_source_health(source: str, success: bool, latency_ms: int, error: str | None = None) -> None:
+    now = now_iso()
+    with SOURCE_HEALTH_LOCK:
+        state = SOURCE_HEALTH.setdefault(
+            source,
+            {
+                "attempt_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "average_latency_ms": 0.0,
+                "last_success_at": None,
+                "last_error_at": None,
+                "last_error": None,
+            },
+        )
+        state["attempt_count"] += 1
+        previous_average = state["average_latency_ms"]
+        state["average_latency_ms"] = round(
+            (previous_average * (state["attempt_count"] - 1) + latency_ms)
+            / state["attempt_count"],
+            2,
+        )
+        if success:
+            state["success_count"] += 1
+            state["last_success_at"] = now
+        else:
+            state["failure_count"] += 1
+            state["last_error_at"] = now
+            state["last_error"] = error
+
+
+def classify_error_type(message: Any, status_code: int | None = None) -> str:
+    text = str(message).lower()
+    if status_code == 404 or "not found" in text or "not_found" in text:
+        return "not_found"
+    if status_code == 400 or "must be" in text or "invalid" in text or "required" in text:
+        return "invalid_symbol"
+    if "timeout" in text or "timed out" in text or "exceeded" in text:
+        return "timeout"
+    if "429" in text or "rate limit" in text or "rate_limited" in text:
+        return "rate_limited"
+    if "json" in text or "unexpected" in text or "format" in text or "parse" in text:
+        return "parse_error"
+    if "502" in text or "503" in text or "504" in text or "upstream" in text:
+        return "upstream_5xx"
+    return "network_error"
+
+
+def normalize_sources(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def normalize_source_errors(value: Any) -> list[dict[str, str]]:
+    if not value:
+        return []
+    raw_errors = value if isinstance(value, list) else [value]
+    normalized = []
+    for item in raw_errors:
+        if isinstance(item, dict):
+            message = str(item.get("message") or item.get("error") or item)
+            normalized.append(
+                {
+                    "source": str(item.get("source") or "public_market_source"),
+                    "error_type": str(item.get("error_type") or classify_error_type(message)),
+                    "message": message,
+                }
+            )
+            continue
+        message = str(item)
+        source = message.split(":", 1)[0] if ":" in message else "public_market_source"
+        normalized.append(
+            {
+                "source": source,
+                "error_type": classify_error_type(message),
+                "message": message,
+            }
+        )
+    return normalized
+
+
+def infer_trade_date(data: dict[str, Any], market_time: str | None) -> str | None:
+    trade_date = data.get("trade_date") or data.get("latest_trade_date")
+    if trade_date:
+        return str(trade_date)[:10]
+    return market_time[:10] if market_time and len(market_time) >= 10 else None
+
+
+def standardize_tool_success(
+    data: dict[str, Any], started_at: float, cache: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    queried_at = now_iso()
+    content = deepcopy(data)
+    content["queried_at"] = queried_at
+    market_time = (
+        content.get("market_time")
+        or content.get("quote_time")
+        or content.get("latest_market_time")
+    )
+    trade_date = infer_trade_date(content, market_time)
+    market_status = market_status_at()
+    source_time = parse_market_datetime(market_time)
+    source_age_seconds = (
+        max(0.0, (datetime.now(MARKET_TIMEZONE) - source_time).total_seconds())
+        if source_time is not None
+        else None
+    )
+    is_stale = False
+    stale_reason = None
+    if market_time:
+        is_stale = is_market_time_stale(market_time)
+        if is_stale:
+            stale_reason = "market_time_lags_current_trading_session"
+    elif trade_date and market_status == "open" and trade_date < datetime.now(MARKET_TIMEZONE).date().isoformat():
+        is_stale = True
+        stale_reason = "previous_trade_day_data_during_open_market"
+
+    cache = cache or {
+        "cache_hit": False,
+        "cache_created_at": queried_at,
+        "cache_age_seconds": 0.0,
+    }
+    result = {"ok": True, **content}
+    result.update(
+        {
+            "market_status": market_status,
+            "trade_date": trade_date,
+            "market_time": market_time,
+            "queried_at": queried_at,
+            "source": normalize_sources(content.get("source")),
+            "source_errors": normalize_source_errors(content.get("source_errors")),
+            "is_stale": is_stale,
+            "stale_reason": stale_reason,
+            "data_age_seconds": round(source_age_seconds, 3)
+            if source_age_seconds is not None
+            else cache["cache_age_seconds"],
+            "latency_ms": int((perf_counter() - started_at) * 1000),
+            **cache,
+            "data": content,
+        }
+    )
+    return result
 
 
 def format_market_time(value: Any) -> str | None:
@@ -366,7 +634,7 @@ def to_number(value: Any) -> float | None:
         return None
 
 
-def read_market_text(url: str, referer: str) -> str:
+def read_market_text(url: str, referer: str, timeout: int = 3) -> str:
     request = Request(
         url,
         headers={
@@ -374,16 +642,24 @@ def read_market_text(url: str, referer: str) -> str:
             "Referer": referer,
         },
     )
-    # Callers construct URLs from a fixed quote-provider host list.
-    with urlopen(request, timeout=15) as response:  # nosec B310
-        return response.read().decode("gbk", errors="replace")
+    started_at = perf_counter()
+    source = source_name_from_url(url)
+    try:
+        # Callers construct URLs from a fixed quote-provider host list.
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
+            text = response.read().decode("gbk", errors="replace")
+        record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+        return text
+    except OSError as exc:
+        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
+        raise
 
 
 def read_public_json(
     url: str,
     referer: str,
-    timeout: int = 15,
-    attempts: int = 2,
+    timeout: int = 3,
+    attempts: int = 1,
 ) -> dict[str, Any]:
     request = Request(
         url,
@@ -394,12 +670,17 @@ def read_public_json(
         },
     )
     errors = []
+    source = source_name_from_url(url)
     for _ in range(attempts):
+        started_at = perf_counter()
         try:
             with urlopen(request, timeout=timeout) as response:  # nosec B310
-                return json.loads(response.read().decode("utf-8"))
+                payload = json.loads(response.read().decode("utf-8"))
+            record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+            return payload
         except (OSError, URLError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
+            record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
     raise HTTPException(status_code=502, detail=f"Failed to fetch public market data: {'; '.join(errors)}")
 
 
@@ -412,15 +693,20 @@ def read_public_jsonp(url: str, referer: str) -> dict[str, Any]:
             "Accept": "*/*",
         },
     )
+    started_at = perf_counter()
+    source = source_name_from_url(url)
     try:
-        with urlopen(request, timeout=15) as response:  # nosec B310
+        with urlopen(request, timeout=3) as response:  # nosec B310
             text = response.read().decode("utf-8")
         start = text.find("(")
         end = text.rfind(")")
         if start < 0 or end <= start:
             raise ValueError("Unexpected JSONP response.")
-        return json.loads(text[start + 1 : end])
+        payload = json.loads(text[start + 1 : end])
+        record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+        return payload
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
         raise HTTPException(status_code=502, detail=f"Failed to fetch public market news: {exc}") from exc
 
 
@@ -516,20 +802,7 @@ def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
         "https://push2.eastmoney.com/api/qt/stock/get"
         f"?secid={eastmoney_secid(symbol)}&fields={EASTMONEY_FIELDS}"
     )
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/",
-        },
-    )
-
-    try:
-        # This Request always targets Eastmoney's fixed API host.
-        with urlopen(request, timeout=15) as response:  # nosec B310
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, URLError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Eastmoney quote: {exc}") from exc
+    payload = read_public_json(url, "https://quote.eastmoney.com/")
 
     data = payload.get("data")
     if not data:
@@ -681,6 +954,7 @@ def health() -> dict[str, Any]:
         "ok": True,
         "name": APP_NAME,
         "time": now_iso(),
+        "data_health": get_market_data_health_data(),
     }
 
 
@@ -707,34 +981,7 @@ def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
 def get_quote_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     security = security_metadata(symbol)
-
-    try:
-        data = get_all_realtime_quotes()
-        if "股票代码" not in data.columns:
-            raise HTTPException(status_code=502, detail="Unexpected market data format.")
-
-        rows = data[data["股票代码"].astype(str) == symbol]
-        if rows.empty:
-            raise HTTPException(status_code=404, detail=f"Stock not found: {symbol}")
-
-        row = rows.iloc[0]
-        quote = row_to_dict(row, QUOTE_COLUMNS)
-        quote["source_updated_at"] = next(
-            (
-                format_market_time(row.get(column))
-                for column in ("更新时间", "行情时间", "时间")
-                if column in row.index and format_market_time(row.get(column))
-            ),
-            None,
-        )
-        if not quote["source_updated_at"]:
-            raise HTTPException(
-                status_code=502,
-                detail="Realtime quote source did not provide an update timestamp.",
-            )
-        source = "efinance"
-    except HTTPException:
-        quote, source = get_fallback_quote(symbol)
+    quote, source, source_errors = get_fastest_public_quote(symbol)
 
     quote = normalize_quote_units(quote, source)
     quote.update(derive_quote_timestamps(quote.get("source_updated_at")))
@@ -748,8 +995,203 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
     return {
         "quote": quote,
         "source": source,
+        "source_errors": source_errors,
         "queried_at": now_iso(),
         "note": "For information only. Not investment advice.",
+    }
+
+
+def normalize_batch_symbols(symbols: Any) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    if not isinstance(symbols, list):
+        raise HTTPException(status_code=400, detail="symbols must be a JSON array of up to 20 codes.")
+    if not symbols:
+        raise HTTPException(status_code=400, detail="symbols must contain at least one code.")
+    if len(symbols) > 20:
+        raise HTTPException(status_code=400, detail="symbols supports at most 20 codes per request.")
+
+    securities: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
+    seen_identifiers = set()
+    for item in symbols:
+        if not isinstance(item, str):
+            errors.append(
+                {
+                    "identifier": item,
+                    "code": "invalid_symbol",
+                    "error": "Each symbol must be a string.",
+                }
+            )
+            continue
+        identifier = item.strip()
+        if identifier in seen_identifiers:
+            continue
+        seen_identifiers.add(identifier)
+        try:
+            securities.append(batch_security_metadata(identifier))
+        except HTTPException as exc:
+            errors.append(
+                {
+                    "identifier": identifier,
+                    "code": "invalid_symbol",
+                    "error": str(exc.detail),
+                }
+            )
+    return securities, errors
+
+
+def get_eastmoney_batch_quote_rows(securities: list[dict[str, str]]) -> tuple[list[dict[str, Any]], str]:
+    query = urlencode(
+        {
+            "fltt": 2,
+            "invt": 2,
+            "fields": BATCH_QUOTE_FIELDS,
+            "secids": ",".join(security["eastmoney_secid"] for security in securities),
+        }
+    )
+    errors = []
+    for host in (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
+    ):
+        try:
+            payload = read_public_json(
+                f"https://{host}/api/qt/ulist.np/get?{query}",
+                "https://quote.eastmoney.com/",
+                3,
+                1,
+            )
+            rows = ((payload.get("data") or {}).get("diff")) or []
+            if rows:
+                return rows, host
+            errors.append(f"{host}: no quote rows")
+        except HTTPException as exc:
+            errors.append(f"{host}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str]]:
+    """Race independent public quote sources and retain failures for partial diagnostics."""
+    source_getters = (
+        ("eastmoney", get_eastmoney_quote),
+        ("tencent", get_tencent_quote),
+        ("sina", get_sina_quote),
+    )
+    errors: list[str] = []
+    executor = ThreadPoolExecutor(max_workers=len(source_getters))
+    futures = {executor.submit(getter, symbol): source for source, getter in source_getters}
+    pending = set(futures)
+    try:
+        deadline = perf_counter() + 6
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                source = futures[future]
+                try:
+                    return future.result(), source, errors
+                except HTTPException as exc:
+                    errors.append(f"{source}: {exc.detail}")
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
+        for future in pending:
+            future.cancel()
+            errors.append(f"{futures[future]}: request timeout after 6 seconds")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    raise HTTPException(
+        status_code=502,
+        detail="; ".join(errors) or "All public quote sources are unavailable.",
+    )
+
+
+def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]) -> dict[str, Any]:
+    volume = to_number(row.get("f5"))
+    market_time = format_unix_market_time(row.get("f124"))
+    return {
+        "symbol": security["symbol"],
+        "name": clean_value(row.get("f14")),
+        "security_type": security["security_type"],
+        "exchange": security["exchange"],
+        "price": to_number(row.get("f2")),
+        "change": to_number(row.get("f4")),
+        "change_pct": to_number(row.get("f3")),
+        "open": to_number(row.get("f17")),
+        "high": to_number(row.get("f15")),
+        "low": to_number(row.get("f16")),
+        "previous_close": to_number(row.get("f18")),
+        "volume": None if volume is None else volume * 100,
+        "volume_unit": "share",
+        "turnover": to_number(row.get("f6")),
+        "turnover_unit": "CNY",
+        "amplitude": to_number(row.get("f7")),
+        "turnover_rate": to_number(row.get("f8")),
+        "volume_ratio": to_number(row.get("f10")),
+        "total_market_value": to_number(row.get("f20")),
+        "circulating_market_value": to_number(row.get("f21")),
+        "market_time": market_time,
+        "source": "eastmoney_batch",
+    }
+
+
+def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
+    securities, errors = normalize_batch_symbols(symbols)
+    results: list[dict[str, Any]] = []
+    source_errors: list[str] = []
+    source = []
+    if securities:
+        try:
+            rows, host = get_eastmoney_batch_quote_rows(securities)
+            source.append(f"eastmoney_batch:{host}")
+            rows_by_symbol = {str(row.get("f12") or "").zfill(6): row for row in rows}
+            for security in securities:
+                row = rows_by_symbol.get(security["symbol"])
+                if row is None:
+                    errors.append(
+                        {
+                            "identifier": security["identifier"],
+                            "symbol": security["symbol"],
+                            "code": "no_data",
+                            "error": "The public batch source did not return this security.",
+                        }
+                    )
+                    continue
+                results.append(batch_quote_from_eastmoney_row(row, security))
+        except HTTPException as exc:
+            source_errors.append(str(exc.detail))
+            for security in securities:
+                errors.append(
+                    {
+                        "identifier": security["identifier"],
+                        "symbol": security["symbol"],
+                        "code": "upstream_error",
+                        "error": "The public batch quote source is temporarily unavailable.",
+                    }
+                )
+
+    market_times = sorted(item["market_time"] for item in results if item.get("market_time"))
+    return {
+        "requested_count": len(symbols),
+        "count": len(results),
+        "results": results,
+        "errors": errors,
+        "source": source,
+        "source_errors": source_errors,
+        "market_time": market_times[-1] if market_times else None,
+        "market_time_range": (
+            {"earliest": market_times[0], "latest": market_times[-1]} if market_times else None
+        ),
+        "queried_at": now_iso(),
+        "data_status": "full_data" if results and not errors else "partial_data" if results else "no_data",
+        "note": "All successful quotes are requested from one public batch snapshot; no investment judgement is generated.",
     }
 
 
@@ -900,7 +1342,9 @@ def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[s
         ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
     ):
         try:
-            return getter()
+            payload = getter()
+            payload["source_errors"] = errors
+            return payload
         except HTTPException as exc:
             errors.append(f"{source}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
@@ -936,6 +1380,7 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
             {
                 "time": values[0],
                 "open": to_number(values[1]),
+                "close": to_number(values[2]),
                 "price": to_number(values[2]),
                 "high": to_number(values[3]),
                 "low": to_number(values[4]),
@@ -944,6 +1389,7 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
                 "turnover": to_number(values[6]),
                 "turnover_unit": "CNY",
                 "average_price": to_number(values[7]),
+                "average_price_scope": "source_reported_cumulative_day_average",
             }
         )
 
@@ -996,11 +1442,17 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
         parsed.append(
             {
                 "time": f"{trade_date} {values[0][:2]}:{values[0][2:]}",
+                "open": None,
+                "close": to_number(values[1]),
                 "price": to_number(values[1]),
+                "high": None,
+                "low": None,
                 "volume": max(0.0, cumulative_volume - previous_volume) * 100,
                 "turnover": max(0.0, cumulative_turnover - previous_turnover),
                 "volume_unit": "share",
                 "turnover_unit": "CNY",
+                "average_price": None,
+                "average_price_scope": "unavailable_from_tencent_minute_source",
             }
         )
         previous_volume = cumulative_volume
@@ -1022,6 +1474,91 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
     }
 
 
+def intraday_item_is_unfinished(item_time: Any) -> bool:
+    try:
+        timestamp = datetime.strptime(str(item_time), "%Y-%m-%d %H:%M").replace(
+            tzinfo=MARKET_TIMEZONE
+        )
+    except ValueError:
+        return False
+    now = datetime.now(MARKET_TIMEZONE)
+    return (
+        timestamp.date() == now.date()
+        and timestamp.hour == now.hour
+        and timestamp.minute == now.minute
+        and market_status_at(now) == "open"
+    )
+
+
+def add_intraday_completion_flags(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for item in items:
+        item["is_current_minute_unfinished"] = intraday_item_is_unfinished(item.get("time"))
+    return items
+
+
+def percentage_change(current: float | None, reference: float | None) -> float | None:
+    if current is None or reference in (None, 0):
+        return None
+    return round((current - reference) / reference * 100, 4)
+
+
+def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any]:
+    prices = [to_number(item.get("price") or item.get("close")) for item in items]
+    valid_prices = [price for price in prices if price is not None]
+    if not valid_prices:
+        return {"status": "unavailable_without_minute_prices"}
+
+    current = valid_prices[-1]
+
+    def window_return(minutes: int) -> float | None:
+        if len(valid_prices) < minutes + 1:
+            return None
+        return percentage_change(current, valid_prices[-(minutes + 1)])
+
+    highs = [to_number(item.get("high")) or to_number(item.get("price")) for item in items]
+    lows = [to_number(item.get("low")) or to_number(item.get("price")) for item in items]
+    day_high = max(value for value in highs if value is not None)
+    day_low = min(value for value in lows if value is not None)
+    opening_price = to_number(items[0].get("open")) or to_number(items[0].get("price"))
+    source_average = to_number(items[-1].get("average_price"))
+    total_turnover = sum(to_number(item.get("turnover")) or 0 for item in items)
+    total_volume = sum(to_number(item.get("volume")) or 0 for item in items)
+    calculated_average = total_turnover / total_volume if total_volume else None
+    average_price = source_average or calculated_average
+    average_scope = (
+        items[-1].get("average_price_scope")
+        if source_average is not None
+        else "returned_minutes_vwap_not_full_day"
+    )
+    recent_turnover = sum(to_number(item.get("turnover")) or 0 for item in items[-5:])
+    prior_turnover = sum(to_number(item.get("turnover")) or 0 for item in items[-10:-5])
+
+    return {
+        "status": "available",
+        "return_5m": window_return(5),
+        "return_15m": window_return(15),
+        "return_30m": window_return(30),
+        "distance_from_high_pct": percentage_change(current, day_high),
+        "distance_from_low_pct": percentage_change(current, day_low),
+        "price_above_average_pct": percentage_change(current, average_price),
+        "average_price": average_price,
+        "average_price_scope": average_scope,
+        "return_from_open_pct": percentage_change(current, opening_price),
+        "turnover_last_5_reported_minutes": recent_turnover,
+        "turnover_previous_5_reported_minutes": prior_turnover if len(items) >= 10 else None,
+        "turnover_speed_5m_vs_previous_5m_pct": (
+            percentage_change(recent_turnover, prior_turnover) if len(items) >= 10 else None
+        ),
+        "at_intraday_high": current >= max(valid_prices),
+        "at_intraday_low": current <= min(valid_prices),
+        "definitions": {
+            "returns": "Current price compared with the price N reported trading minutes earlier.",
+            "turnover_speed": "Most recent five reported trading minutes compared with the preceding five; lunch-break minutes are not generated.",
+            "average_price": "Source cumulative-day average when available; otherwise VWAP of the returned minute window only.",
+        },
+    }
+
+
 def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
     errors = []
     all_not_found = True
@@ -1030,12 +1567,163 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
         ("tencent", get_tencent_intraday),
     ):
         try:
-            return getter(symbol, limit)
+            payload = getter(symbol, limit)
+            payload["items"] = add_intraday_completion_flags(payload["items"])
+            payload["market_time"] = format_market_time(payload.get("latest_market_time"))
+            payload["mechanical_indicators"] = intraday_mechanical_indicators(payload["items"])
+            payload["security_type"] = security_metadata(symbol)["security_type"]
+            payload["exchange"] = security_metadata(symbol)["exchange"]
+            payload["source_errors"] = errors
+            payload["note"] = "Minute facts and mechanical indicators only; no trading or investment judgement is generated."
+            return payload
         except HTTPException as exc:
             errors.append(f"{source}: {exc.detail}")
             all_not_found = all_not_found and exc.status_code == 404
     status_code = 404 if all_not_found else 502
     raise HTTPException(status_code=status_code, detail="; ".join(errors))
+
+
+def get_auction_data(symbol: str) -> dict[str, Any]:
+    payload = get_quote_data(symbol)
+    quote = payload["quote"]
+    opening_price = to_number(quote.get("open"))
+    previous_close = to_number(quote.get("previous_close"))
+    opening_change = (
+        opening_price - previous_close
+        if opening_price is not None and previous_close is not None
+        else None
+    )
+    return {
+        "symbol": quote.get("symbol"),
+        "name": quote.get("name"),
+        "security_type": quote.get("security_type"),
+        "exchange": quote.get("exchange"),
+        "trade_date": quote.get("trade_date"),
+        "auction_period": "09:15-09:25 Asia/Shanghai",
+        "auction_price": opening_price,
+        "auction_price_status": "opening_price_from_public_quote",
+        "auction_change": opening_change,
+        "auction_change_pct": percentage_change(opening_price, previous_close),
+        "auction_turnover": None,
+        "final_auction_volume": None,
+        "unmatched_bid_volume": None,
+        "unmatched_ask_volume": None,
+        "cancellation_change": None,
+        "open": opening_price,
+        "previous_close": previous_close,
+        "auction_market_time": None,
+        "source_updated_at": quote.get("source_updated_at"),
+        "source": payload["source"],
+        "queried_at": payload["queried_at"],
+        "data_status": "partial_data" if opening_price is not None else "no_data",
+        "unavailable_fields": [
+            "auction_price_path_09_15_to_09_25",
+            "auction_turnover",
+            "final_auction_volume",
+            "unmatched_bid_volume",
+            "unmatched_ask_volume",
+            "cancellation_change",
+            "auction_market_time",
+        ],
+        "note": (
+            "The public quote provides the opening price only. It does not provide a verifiable full call-auction "
+            "process, unmatched orders, or cancellation changes."
+        ),
+    }
+
+
+def filter_a_share_securities_data(
+    security_type: str,
+    exclude_st: bool,
+    change_pct_min: float | None,
+    change_pct_max: float | None,
+    turnover_min: float | None,
+    turnover_rate_min: float | None,
+    above_average_price: bool | None,
+    market_cap_max: float | None,
+    limit: int,
+) -> dict[str, Any]:
+    normalized_type = security_type.strip().lower()
+    if normalized_type not in {"stock", "a_share"}:
+        raise HTTPException(
+            status_code=400,
+            detail="This public all-market filter currently supports ordinary A-share stocks only.",
+        )
+    if (
+        change_pct_min is not None
+        and change_pct_max is not None
+        and change_pct_min > change_pct_max
+    ):
+        raise HTTPException(status_code=400, detail="change_pct_min cannot be greater than change_pct_max.")
+
+    rows = get_eastmoney_market_quotes()
+    matched = []
+    for row in rows:
+        name = str(row.get("name") or "")
+        change_pct = to_number(row.get("change_pct"))
+        turnover = to_number(row.get("turnover"))
+        turnover_rate = to_number(row.get("turnover_rate"))
+        market_cap = to_number(row.get("total_market_value"))
+        volume = to_number(row.get("volume"))
+        price = to_number(row.get("price"))
+        average_price = turnover / (volume * 100) if turnover and volume else None
+        if "退" in name or price is None:
+            continue
+        if exclude_st and is_st_security(name):
+            continue
+        if change_pct_min is not None and (change_pct is None or change_pct < change_pct_min):
+            continue
+        if change_pct_max is not None and (change_pct is None or change_pct > change_pct_max):
+            continue
+        if turnover_min is not None and (turnover is None or turnover < turnover_min):
+            continue
+        if turnover_rate_min is not None and (turnover_rate is None or turnover_rate < turnover_rate_min):
+            continue
+        if market_cap_max is not None and (market_cap is None or market_cap > market_cap_max):
+            continue
+        if above_average_price is True and (average_price is None or price <= average_price):
+            continue
+        matched.append(
+            {
+                "symbol": row["symbol"],
+                "name": row["name"],
+                "security_type": "a_share",
+                "exchange": exchange_for_symbol(str(row["symbol"])),
+                "price": price,
+                "change_pct": change_pct,
+                "turnover": turnover,
+                "turnover_unit": "CNY",
+                "turnover_rate": turnover_rate,
+                "total_market_value": market_cap,
+                "average_price": average_price,
+                "price_above_average_pct": percentage_change(price, average_price),
+                "market_time": row.get("market_time"),
+            }
+        )
+
+    market_times = sorted(item["market_time"] for item in matched if item.get("market_time"))
+    conditions = {
+        "security_type": "stock",
+        "exclude_st": exclude_st,
+        "change_pct_min": change_pct_min,
+        "change_pct_max": change_pct_max,
+        "turnover_min": turnover_min,
+        "turnover_rate_min": turnover_rate_min,
+        "above_average_price": above_average_price,
+        "market_cap_max": market_cap_max,
+    }
+    return {
+        "matched_count": len(matched),
+        "returned_count": min(len(matched), limit),
+        "conditions": conditions,
+        "results": matched[:limit],
+        "sort_order": "public_source_change_pct_desc",
+        "source": ["eastmoney_all_a_share_snapshot"],
+        "market_time": market_times[-1] if market_times else None,
+        "queried_at": now_iso(),
+        "scope": "Mechanical conditions only; ordinary A shares only, excluding ETFs, funds, B shares, and delisting-arrangement securities.",
+        "note": "No hidden weights, scores, recommendations, or trading conclusions are applied.",
+    }
 
 
 def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
@@ -1140,7 +1828,9 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
         ("sina", get_sina_fund_flow),
     ):
         try:
-            return getter(symbol, limit)
+            payload = getter(symbol, limit)
+            payload["source_errors"] = errors
+            return payload
         except HTTPException as exc:
             errors.append(f"{source}: {exc.detail}")
             all_not_found = all_not_found and exc.status_code == 404
@@ -1256,7 +1946,7 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
         {
             "fltt": 2,
             "invt": 2,
-            "fields": "f12,f14,f2,f3,f4,f17,f18",
+            "fields": "f12,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18,f124",
             "secids": INDEX_SECIDS,
         }
     )
@@ -1271,11 +1961,15 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
         {
             "symbol": clean_value(row.get("f12")),
             "name": clean_value(row.get("f14")),
-            "price": clean_value(row.get("f2")),
-            "change_pct": clean_value(row.get("f3")),
-            "change": clean_value(row.get("f4")),
-            "open": clean_value(row.get("f17")),
-            "previous_close": clean_value(row.get("f18")),
+            "price": to_number(row.get("f2")),
+            "change_pct": to_number(row.get("f3")),
+            "change": to_number(row.get("f4")),
+            "open": to_number(row.get("f17")),
+            "high": to_number(row.get("f15")),
+            "low": to_number(row.get("f16")),
+            "previous_close": to_number(row.get("f18")),
+            "turnover": to_number(row.get("f6")),
+            "market_time": format_unix_market_time(row.get("f124")),
         }
         for row in index_rows
     ]
@@ -1302,8 +1996,11 @@ def get_tencent_indices() -> list[dict[str, Any]]:
                 "change_pct": to_number(values[32]),
                 "change": to_number(values[31]),
                 "open": to_number(values[5]),
+                "high": None,
+                "low": None,
                 "previous_close": to_number(values[4]),
                 "source_updated_at": format_market_time(values[30]),
+                "market_time": format_market_time(values[30]),
             }
         )
     if not indices:
@@ -1332,7 +2029,10 @@ def get_sina_indices() -> list[dict[str, Any]]:
                 "change": to_number(values[2]),
                 "change_pct": to_number(values[3]),
                 "open": None,
+                "high": None,
+                "low": None,
                 "previous_close": None,
+                "market_time": None,
             }
         )
     if not indices:
@@ -1340,18 +2040,25 @@ def get_sina_indices() -> list[dict[str, Any]]:
     return indices
 
 
-def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
+def _to_int(value: Any) -> int | None:
+    number = to_number(value)
+    return int(number) if number is not None else None
+
+
+def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) -> list[dict[str, Any]]:
+    if sector_type not in SECTOR_TYPE_CONFIG:
+        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
     query = urlencode(
         {
             "pn": 1,
-            "pz": max(limit * 3, 30),
+            "pz": max(30, min(candidate_limit, 500)),
             "po": 1,
             "np": 1,
             "fltt": 2,
             "invt": 2,
             "fid": "f3",
-            "fs": "m:90+t:2",
-            "fields": "f12,f14,f2,f3,f4",
+            "fs": SECTOR_TYPE_CONFIG[sector_type],
+            "fields": "f12,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18,f22,f104,f105,f128,f136,f140",
         }
     )
     errors = []
@@ -1364,7 +2071,7 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
             payload = read_public_json(
                 f"https://{host}/api/qt/clist/get?{query}",
                 "https://quote.eastmoney.com/",
-                5,
+                3,
                 1,
             )
             rows = ((payload.get("data") or {}).get("diff")) or []
@@ -1373,24 +2080,71 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
                     status_code=502,
                     detail=f"{host} returned no industry-board rows.",
                 )
-            boards = [
-                {
-                    "symbol": clean_value(row.get("f12")),
-                    "name": clean_value(row.get("f14")),
-                    **industry_name_metadata(clean_value(row.get("f14"))),
-                    "price": to_number(row.get("f2")),
-                    "change_pct": to_number(row.get("f3")),
-                    "change": to_number(row.get("f4")),
-                }
-                for row in rows
-                if row.get("f14")
-            ]
+            boards = []
+            for row in rows:
+                name = clean_value(row.get("f14"))
+                if not name:
+                    continue
+                metadata = industry_name_metadata(name) if sector_type == "industry" else {}
+                rise_count = _to_int(row.get("f104"))
+                fall_count = _to_int(row.get("f105"))
+                leader_symbol = clean_value(row.get("f140"))
+                leader_name = clean_value(row.get("f128"))
+                top_constituents = []
+                if leader_symbol not in (None, "-") and leader_name not in (None, "-"):
+                    top_constituents.append(
+                        {
+                            "symbol": str(leader_symbol).zfill(6),
+                            "name": leader_name,
+                            "change_pct": to_number(row.get("f136")),
+                            "criterion": "highest_change_pct_reported_by_source",
+                        }
+                    )
+                boards.append(
+                    {
+                        "symbol": clean_value(row.get("f12")),
+                        "name": name,
+                        "sector_type": sector_type,
+                        "level": INDUSTRY_LEVEL_RANK.get(metadata.get("industry_level")),
+                        **metadata,
+                        "price": to_number(row.get("f2")),
+                        "current": to_number(row.get("f2")),
+                        "change_pct": to_number(row.get("f3")),
+                        "change": to_number(row.get("f4")),
+                        "turnover": to_number(row.get("f6")),
+                        "rise_count": rise_count,
+                        "fall_count": fall_count,
+                        "flat_count": None,
+                        "rise_ratio": (
+                            round(rise_count / (rise_count + fall_count), 4)
+                            if rise_count is not None and fall_count is not None and rise_count + fall_count
+                            else None
+                        ),
+                        "rise_ratio_scope": "rising_vs_falling_constituents_only; flat count unavailable",
+                        "limit_up_count": None,
+                        "momentum_5m": None,
+                        "momentum_15m": None,
+                        "momentum_30m": None,
+                        "momentum_status": "unavailable_from_current_public_snapshot",
+                        "source_speed": to_number(row.get("f22")),
+                        "high": to_number(row.get("f15")),
+                        "low": to_number(row.get("f16")),
+                        "open": to_number(row.get("f17")),
+                        "previous_close": to_number(row.get("f18")),
+                        "top_constituents": top_constituents,
+                    }
+                )
             if boards:
-                return deduplicate_industry_boards(boards, limit)
+                return boards
             errors.append(f"{host}: no usable industry-board rows")
         except HTTPException as exc:
             errors.append(f"{host}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
+    boards = get_eastmoney_sector_boards("industry", max(limit * 4, 100))
+    return deduplicate_industry_boards(boards, limit)
 
 
 def industry_name_metadata(name: Any) -> dict[str, str | None]:
@@ -1452,6 +2206,8 @@ def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
     boards = [
         {
             "name": name,
+            "sector_type": "industry",
+            "level": None,
             "industry_name": name,
             "industry_level": None,
             "change_pct": round(sum(changes) / len(changes), 2),
@@ -1466,7 +2222,351 @@ def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
     return boards[:limit]
 
 
+def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
+    page_size = 100
+
+    def fetch_page(host: str, page: int) -> tuple[int, dict[str, Any]]:
+        query = urlencode(
+            {
+                "pn": page,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f3",
+                "fs": MARKET_QUOTE_FS,
+                "fields": MARKET_QUOTE_FIELDS,
+            }
+        )
+        return (
+            page,
+            read_public_json(
+                f"https://{host}/api/qt/clist/get?{query}",
+                "https://quote.eastmoney.com/",
+                3,
+                1,
+            ),
+        )
+
+    errors = []
+    for host in (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
+    ):
+        try:
+            _, first_payload = fetch_page(host, 1)
+            first_data = first_payload.get("data") or {}
+            first_rows = first_data.get("diff") or []
+            if not first_rows:
+                raise HTTPException(status_code=502, detail=f"{host} returned no stock rows.")
+            total = _to_int(first_data.get("total")) or len(first_rows)
+            page_count = ceil(total / page_size)
+            pages: dict[int, list[dict[str, Any]]] = {1: first_rows}
+            if page_count > 1:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [
+                        executor.submit(fetch_page, host, page)
+                        for page in range(2, page_count + 1)
+                    ]
+                    for future in as_completed(futures):
+                        page, payload = future.result()
+                        rows = ((payload.get("data") or {}).get("diff")) or []
+                        if not rows:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"{host} returned no stock rows for page {page}.",
+                            )
+                        pages[page] = rows
+
+            raw_rows = [row for page in range(1, page_count + 1) for row in pages[page]]
+            if len(raw_rows) < total:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{host} returned {len(raw_rows)} of {total} expected stock rows.",
+                )
+            return [
+                {
+                    "symbol": str(row.get("f12") or "").zfill(6),
+                    "name": clean_value(row.get("f14")),
+                    "price": to_number(row.get("f2")),
+                    "change_pct": to_number(row.get("f3")),
+                    "volume": to_number(row.get("f5")),
+                    "turnover": to_number(row.get("f6")),
+                    "turnover_rate": to_number(row.get("f8")),
+                    "high": to_number(row.get("f15")),
+                    "low": to_number(row.get("f16")),
+                    "open": to_number(row.get("f17")),
+                    "previous_close": to_number(row.get("f18")),
+                    "total_market_value": to_number(row.get("f20")),
+                    "market_time": format_unix_market_time(row.get("f124")),
+                }
+                for row in raw_rows
+                if row.get("f12") and row.get("f14")
+            ]
+        except HTTPException as exc:
+            errors.append(f"{host}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def exchange_for_symbol(symbol: str) -> str | None:
+    if symbol.startswith("6"):
+        return "SSE"
+    if symbol.startswith(("0", "2", "3")):
+        return "SZSE"
+    if symbol.startswith(("4", "8", "9")):
+        return "BSE"
+    return None
+
+
+def is_st_security(name: Any) -> bool:
+    normalized = str(name or "").strip().upper().lstrip("*")
+    return normalized.startswith("ST")
+
+
+def price_limit_pct(symbol: str, is_st: bool) -> float:
+    if is_st:
+        return 5.0
+    if symbol.startswith(("300", "301", "688", "689")):
+        return 20.0
+    if exchange_for_symbol(symbol) == "BSE":
+        return 30.0
+    return 10.0
+
+
+def empty_breadth_counts() -> dict[str, Any]:
+    return {
+        "stock_count": 0,
+        "rise_count": 0,
+        "fall_count": 0,
+        "flat_count": 0,
+        "rise_over_3_count": 0,
+        "rise_over_5_count": 0,
+        "rise_over_7_count": 0,
+        "fall_over_3_count": 0,
+        "fall_over_5_count": 0,
+        "fall_over_7_count": 0,
+        "limit_up_count": 0,
+        "limit_down_count": 0,
+        "open_board_count": 0,
+        "consecutive_limit_up_count": None,
+        "st_limit_up_count": 0,
+        "st_limit_down_count": 0,
+    }
+
+
+def add_breadth_row(counts: dict[str, Any], row: dict[str, Any]) -> None:
+    change_pct = row.get("change_pct")
+    if change_pct is None:
+        return
+    counts["stock_count"] += 1
+    if change_pct > 0:
+        counts["rise_count"] += 1
+    elif change_pct < 0:
+        counts["fall_count"] += 1
+    else:
+        counts["flat_count"] += 1
+    for threshold in (3, 5, 7):
+        if change_pct > threshold:
+            counts[f"rise_over_{threshold}_count"] += 1
+        elif change_pct < -threshold:
+            counts[f"fall_over_{threshold}_count"] += 1
+
+    symbol = str(row["symbol"])
+    is_st = is_st_security(row.get("name"))
+    limit_pct = price_limit_pct(symbol, is_st)
+    at_limit_up = change_pct >= limit_pct - 0.15
+    at_limit_down = change_pct <= -limit_pct + 0.15
+    if at_limit_up:
+        counts["limit_up_count"] += 1
+        if is_st:
+            counts["st_limit_up_count"] += 1
+    if at_limit_down:
+        counts["limit_down_count"] += 1
+        if is_st:
+            counts["st_limit_down_count"] += 1
+
+    previous_close = row.get("previous_close")
+    high = row.get("high")
+    if previous_close and high:
+        high_change_pct = (high - previous_close) / previous_close * 100
+        if high_change_pct >= limit_pct - 0.15 and not at_limit_up:
+            counts["open_board_count"] += 1
+
+
+def calculate_market_breadth(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    all_market = empty_breadth_counts()
+    by_exchange = {exchange: empty_breadth_counts() for exchange in ("SSE", "SZSE", "BSE")}
+    for row in rows:
+        exchange = exchange_for_symbol(str(row.get("symbol") or ""))
+        name = str(row.get("name") or "")
+        if not exchange or "退" in name or row.get("price") is None:
+            continue
+        add_breadth_row(all_market, row)
+        add_breadth_row(by_exchange[exchange], row)
+    return {
+        "scope": "Ordinary A shares only; excludes ETFs, funds, B shares, delisting-arrangement securities, and rows without a current price.",
+        "all_market": all_market,
+        "by_exchange": by_exchange,
+        "consecutive_limit_up_status": "unavailable_without_a_historical_limit-up_pool",
+    }
+
+
+def parse_market_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        result = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return result.replace(tzinfo=MARKET_TIMEZONE) if result.tzinfo is None else result.astimezone(MARKET_TIMEZONE)
+
+
+def market_status_at(now: datetime | None = None) -> str:
+    now = now or datetime.now(MARKET_TIMEZONE)
+    if now.weekday() >= 5:
+        return "closed"
+    minute = now.hour * 60 + now.minute
+    if minute < 9 * 60 + 30:
+        return "pre_open"
+    if 9 * 60 + 30 <= minute < 11 * 60 + 30 or 13 * 60 <= minute < 15 * 60:
+        return "open"
+    if 11 * 60 + 30 <= minute < 13 * 60:
+        return "lunch_break"
+    return "closed"
+
+
+def trading_minutes_elapsed(market_time: str | None) -> int | None:
+    timestamp = parse_market_datetime(market_time)
+    if timestamp is None:
+        return None
+    minute = timestamp.hour * 60 + timestamp.minute
+    if minute < 9 * 60 + 30:
+        return 0
+    if minute <= 11 * 60 + 30:
+        return minute - (9 * 60 + 30)
+    if minute < 13 * 60:
+        return 120
+    if minute <= 15 * 60:
+        return 120 + minute - (13 * 60)
+    return 240
+
+
+def market_turnover_summary(rows: list[dict[str, Any]], market_time: str | None) -> dict[str, Any]:
+    eligible_rows = [
+        row
+        for row in rows
+        if exchange_for_symbol(str(row.get("symbol") or ""))
+        and "退" not in str(row.get("name") or "")
+        and row.get("turnover") is not None
+    ]
+    by_exchange = {
+        exchange: sum(
+            row["turnover"]
+            for row in eligible_rows
+            if exchange_for_symbol(str(row["symbol"])) == exchange
+        )
+        for exchange in ("SSE", "SZSE", "BSE")
+    }
+    current = sum(row["turnover"] for row in eligible_rows)
+    elapsed = trading_minutes_elapsed(market_time)
+    estimated = round(current / elapsed * 240, 2) if elapsed and 0 < elapsed < 240 else current if elapsed == 240 else None
+    top_rows = sorted(eligible_rows, key=lambda item: item["turnover"], reverse=True)[:10]
+    return {
+        "current": current,
+        "unit": "CNY",
+        "previous_trade_day_same_time": None,
+        "change": None,
+        "change_pct": None,
+        "comparison_status": "unavailable_without_a_reliable_prior-day_market-wide_intraday_series",
+        "estimated_full_day": estimated,
+        "estimated_full_day_status": "mechanical_elapsed-time_extrapolation" if estimated is not None else "unavailable_before_open",
+        "by_exchange": by_exchange,
+        "top_turnover_securities": [
+            {
+                "symbol": row["symbol"],
+                "name": row["name"],
+                "price": row["price"],
+                "change_pct": row["change_pct"],
+                "turnover": row["turnover"],
+                "exchange": exchange_for_symbol(str(row["symbol"])),
+            }
+            for row in top_rows
+        ],
+        "scope": "Ordinary A shares only; this public all-market source does not include exchange-traded funds in the ranking.",
+    }
+
+
+def latest_market_time(indices: list[dict[str, Any]]) -> str | None:
+    timestamps = [
+        timestamp
+        for index in indices
+        if (timestamp := index.get("market_time") or index.get("source_updated_at"))
+    ]
+    return max(timestamps) if timestamps else None
+
+
+def is_market_time_stale(market_time: str | None) -> bool:
+    now = datetime.now(MARKET_TIMEZONE)
+    if market_status_at(now) != "open":
+        return False
+    source_time = parse_market_datetime(market_time)
+    if source_time is None:
+        return True
+    if source_time.date() != now.date():
+        return True
+    return now - source_time > timedelta(minutes=10)
+
+
+def get_sector_rankings_data(
+    sector_type: str, level: str, sort_by: str, limit: int
+) -> dict[str, Any]:
+    normalized_type = sector_type.strip().lower()
+    if normalized_type not in SECTOR_TYPE_CONFIG:
+        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
+    normalized_level = str(level).strip().lower()
+    if normalized_level not in {"1", "2", "3", "all"}:
+        raise HTTPException(status_code=400, detail="level must be 1, 2, 3, or all.")
+    if sort_by not in {"change_pct", "turnover", "momentum_5m", "momentum_15m", "momentum_30m"}:
+        raise HTTPException(
+            status_code=400,
+            detail="sort_by must be change_pct, turnover, momentum_5m, momentum_15m, or momentum_30m.",
+        )
+    if sort_by.startswith("momentum_"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Minute momentum is not returned because the public board K-line source is not stable enough "
+                "to calculate a complete ranking without gaps. Use change_pct or turnover."
+            ),
+        )
+
+    boards = get_eastmoney_sector_boards(normalized_type)
+    if normalized_type == "industry":
+        boards = deduplicate_industry_boards(boards, len(boards))
+        if normalized_level != "all":
+            boards = [board for board in boards if board.get("level") == int(normalized_level)]
+    boards.sort(
+        key=lambda item: item.get(sort_by) if item.get(sort_by) is not None else float("-inf"),
+        reverse=True,
+    )
+    items = boards[:limit]
+    return {
+        "sector_type": normalized_type,
+        "level": normalized_level if normalized_type == "industry" else None,
+        "sort_by": sort_by,
+        "count": len(items),
+        "items": items,
+        "source": ["eastmoney_sector_snapshot"],
+        "source_errors": [],
+        "queried_at": now_iso(),
+        "note": "Mechanical ranking of public sector quotes only; no theme, trading, or investment judgement is generated.",
+    }
+
+
 def get_market_overview_data(limit: int) -> dict[str, Any]:
+    started_at = perf_counter()
     index_errors = []
     indices = []
     index_source = "unavailable"
@@ -1503,26 +2603,180 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             board_errors.append(f"{source}: {detail}")
 
+    market_time = latest_market_time(indices)
+    source_errors = list(index_errors) + list(board_errors)
+    sources = [f"indices:{index_source}"]
+    if board_source != "unavailable":
+        sources.append(f"industry_boards:{board_source}")
+
+    breadth = None
+    turnover = None
+    try:
+        market_rows = get_eastmoney_market_quotes()
+        breadth = calculate_market_breadth(market_rows)
+        turnover = market_turnover_summary(market_rows, market_time)
+        sources.append("market_breadth:eastmoney_all_a_shares")
+    except HTTPException as exc:
+        source_errors.append(f"market_breadth: {exc.detail}")
+
+    primary_indices = [index for index in indices if index.get("symbol") in PRIMARY_INDEX_SYMBOLS]
+    if not primary_indices:
+        primary_indices = indices[:3]
+    style_indices = [index for index in indices if index not in primary_indices]
+    all_market_breadth = breadth.get("all_market") if breadth else None
+    limit_stats = (
+        {
+            key: all_market_breadth.get(key)
+            for key in (
+                "limit_up_count",
+                "limit_down_count",
+                "open_board_count",
+                "consecutive_limit_up_count",
+                "st_limit_up_count",
+                "st_limit_down_count",
+            )
+        }
+        if all_market_breadth
+        else None
+    )
+
     return {
-        "indices": indices,
+        "market_status": market_status_at(),
+        "trade_date": market_time.split("T", 1)[0] if market_time else None,
+        "market_time": market_time,
+        "indices": primary_indices,
+        "style_indices": style_indices,
         "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
         "industry_board_errors": board_errors if not boards else [],
+        "market_breadth": breadth,
+        "turnover": turnover,
+        "limit_stats": limit_stats,
+        "source": sources,
+        "source_errors": source_errors,
+        "is_stale": is_market_time_stale(market_time),
         "queried_at": now_iso(),
-        "note": "Industry-board data uses public sector quotes when available, with a calculated fallback.",
+        "latency_ms": int((perf_counter() - started_at) * 1000),
+        "data_status": "full_data" if breadth and turnover and boards else "partial_data",
+        "note": "Facts and mechanical calculations only; this service does not generate trading, theme, or investment recommendations.",
     }
 
 
-def mcp_error(symbol: str | None, exc: HTTPException) -> dict[str, Any]:
+def get_market_data_health_data() -> dict[str, Any]:
+    with SOURCE_HEALTH_LOCK:
+        observed = deepcopy(SOURCE_HEALTH)
+
+    sources = []
+    for source in ("eastmoney", "tencent", "sina"):
+        state = observed.get(source)
+        if state is None:
+            sources.append(
+                {
+                    "source": source,
+                    "status": "unknown_not_yet_observed",
+                    "attempt_count": 0,
+                    "success_rate": None,
+                    "average_latency_ms": None,
+                    "last_success_at": None,
+                    "last_error": None,
+                }
+            )
+            continue
+        attempts = state["attempt_count"]
+        success_rate = state["success_count"] / attempts if attempts else None
+        status = "healthy" if state["success_count"] >= state["failure_count"] else "degraded"
+        sources.append(
+            {
+                "source": source,
+                "status": status,
+                "attempt_count": attempts,
+                "success_rate": round(success_rate, 3) if success_rate is not None else None,
+                "average_latency_ms": state["average_latency_ms"],
+                "last_success_at": state["last_success_at"],
+                "last_error": state["last_error"],
+            }
+        )
+
+    degraded = any(item["status"] == "degraded" for item in sources)
+    with TOOL_CACHE_LOCK:
+        cache_entries = len(TOOL_CACHE)
+    return {
+        "sources": sources,
+        "quote_route": {
+            "status": "configured",
+            "providers": ["eastmoney", "tencent", "sina"],
+            "strategy": "parallel_fastest_success_with_6_second_total_budget",
+        },
+        "intraday_route": {
+            "status": "configured",
+            "providers": ["eastmoney", "tencent"],
+            "strategy": "sequential_fallback_with_3_second_per_source_timeout",
+        },
+        "etf_route": {
+            "status": "configured",
+            "providers": ["eastmoney", "tencent", "sina"],
+            "note": "ETF and LOF code prefixes are classified before public-source routing.",
+        },
+        "cache": {"entry_count": cache_entries, "policy": "short_TTL_success_only"},
+        "degraded_mode": degraded,
+        "note": "Observed request health only; this endpoint does not fabricate a live probe or investment conclusion.",
+        "source": ["in_process_observability"],
+    }
+
+
+def mcp_error(
+    symbol: str | None, exc: HTTPException, started_at: float | None = None
+) -> dict[str, Any]:
+    queried_at = now_iso()
+    message = str(exc.detail)
     result: dict[str, Any] = {
         "ok": False,
-        "error": str(exc.detail),
-        "time": now_iso(),
+        "market_status": market_status_at(),
+        "trade_date": None,
+        "market_time": None,
+        "queried_at": queried_at,
+        "source": [],
+        "source_errors": [
+            {
+                "source": "public_market_source",
+                "error_type": classify_error_type(message, exc.status_code),
+                "message": message,
+            }
+        ],
+        "is_stale": False,
+        "stale_reason": None,
+        "data_age_seconds": None,
+        "latency_ms": int((perf_counter() - started_at) * 1000) if started_at else 0,
+        "cache_hit": False,
+        "cache_created_at": None,
+        "cache_age_seconds": None,
+        "error_type": classify_error_type(message, exc.status_code),
+        "error": message,
+        "data": {},
     }
     if symbol:
         result["symbol"] = symbol
     return result
+
+
+def run_cached_tool(
+    tool_name: str,
+    parameters: dict[str, Any],
+    ttl_seconds: int,
+    loader: Any,
+    symbol: str | None = None,
+) -> dict[str, Any]:
+    started_at = perf_counter()
+    try:
+        data, cache = get_cached_tool_data(
+            cache_key(tool_name, parameters),
+            ttl_seconds,
+            loader,
+        )
+    except HTTPException as exc:
+        return mcp_error(symbol, exc, started_at)
+    return standardize_tool_success(data, started_at, cache)
 
 
 @mcp.tool(
@@ -1534,32 +2788,14 @@ def mcp_error(symbol: str | None, exc: HTTPException) -> dict[str, Any]:
 def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
     keyword = keyword.strip()
     if not keyword:
-        return {
-            "ok": False,
-            "error": "keyword is required.",
-            "time": now_iso(),
-        }
-
-    try:
-        payload = search_stock_data(
-            keyword=keyword,
-            limit=max(1, min(limit, 5)),
-        )
-    except HTTPException:
-        return {
-            "ok": False,
-            "error": "Stock search is temporarily unavailable. Try a six-digit stock code.",
-            "queried_at": now_iso(),
-        }
-
-    return {
-        "ok": True,
-        "keyword": payload["keyword"],
-        "count": payload["count"],
-        "results": payload["results"],
-        "source": payload["source"],
-        "queried_at": payload["queried_at"],
-    }
+        return mcp_error(None, HTTPException(status_code=400, detail="keyword is required."))
+    normalized_limit = max(1, min(limit, 5))
+    return run_cached_tool(
+        "search_a_share",
+        {"keyword": keyword, "limit": normalized_limit},
+        60,
+        lambda: search_stock_data(keyword=keyword, limit=normalized_limit),
+    )
 
 
 @mcp.tool(
@@ -1571,30 +2807,42 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
 def get_a_share_quote(symbol: str) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+
+    def quote_response() -> dict[str, Any]:
+        payload = get_quote_data(symbol=symbol)
+        quote = payload["quote"]
         return {
-            "ok": False,
-            "error": "symbol is required.",
-            "time": now_iso(),
+            **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
+            "security_type": quote.get("security_type"),
+            "exchange": quote.get("exchange"),
+            "source": payload["source"],
+            "source_errors": payload.get("source_errors", []),
+            "trade_date": quote.get("trade_date"),
+            "quote_time": quote.get("quote_time"),
+            "source_updated_at": quote.get("source_updated_at"),
+            "note": payload["note"],
         }
 
-    try:
-        payload = get_quote_data(symbol=symbol)
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
+    return run_cached_tool(
+        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol
+    )
 
-    quote = payload["quote"]
-    return {
-        "ok": True,
-        **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
-        "security_type": quote.get("security_type"),
-        "exchange": quote.get("exchange"),
-        "source": payload["source"],
-        "trade_date": quote.get("trade_date"),
-        "quote_time": quote.get("quote_time"),
-        "source_updated_at": quote.get("source_updated_at"),
-        "queried_at": payload["queried_at"],
-        "note": payload["note"],
-    }
+
+@mcp.tool(
+    name="get_a_share_batch_quotes",
+    title="Get A-share and ETF batch quotes",
+    description=(
+        "Get up to 20 A-share, ETF, LOF, or explicit index:code quotes from one public batch snapshot. "
+        "Invalid or missing items are reported without discarding successful items."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_batch_quotes(symbols: list[str]) -> dict[str, Any]:
+    return run_cached_tool(
+        "get_a_share_batch_quotes", {"symbols": symbols}, 2,
+        lambda: get_batch_quote_data(symbols),
+    )
 
 
 @mcp.tool(
@@ -1610,54 +2858,115 @@ def get_a_share_kline(
 ) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_limit = max(1, min(limit, 30))
+
+    def kline_response() -> dict[str, Any]:
+        payload = get_kline_data(symbol=symbol, period=period, limit=normalized_limit)
         return {
-            "ok": False,
-            "error": "symbol is required.",
-            "time": now_iso(),
+            "symbol": payload["symbol"],
+            "security_type": payload.get("security_type"),
+            "exchange": payload.get("exchange"),
+            "period": payload["period"],
+            "count": payload["count"],
+            "items": [
+                {field: clean_value(item.get(field)) for field in KLINE_RESPONSE_FIELDS}
+                for item in payload["items"]
+            ],
+            "source": payload["source"],
+            "source_errors": payload.get("source_errors", []),
+            "latest_trade_date": payload["latest_trade_date"],
+            "note": payload["note"],
         }
 
-    try:
-        payload = get_kline_data(
-            symbol=symbol,
-            period=period,
-            limit=max(1, min(limit, 30)),
-        )
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
-
-    return {
-        "ok": True,
-        "symbol": payload["symbol"],
-        "security_type": payload.get("security_type"),
-        "exchange": payload.get("exchange"),
-        "period": payload["period"],
-        "count": payload["count"],
-        "items": [
-            {field: clean_value(item.get(field)) for field in KLINE_RESPONSE_FIELDS}
-            for item in payload["items"]
-        ],
-        "source": payload["source"],
-        "latest_trade_date": payload["latest_trade_date"],
-        "queried_at": payload["queried_at"],
-        "note": payload["note"],
-    }
+    ttl_seconds = 300 if period in {"daily", "weekly", "monthly"} else 15
+    return run_cached_tool(
+        "get_a_share_kline",
+        {"symbol": symbol, "period": period, "limit": normalized_limit},
+        ttl_seconds,
+        kline_response,
+        symbol,
+    )
 
 
 @mcp.tool(
     name="get_a_share_intraday",
     title="Get A-share intraday prices",
-    description="Get up to 240 one-minute intraday records for one A-share stock.",
+    description=(
+        "Get up to 240 one-minute intraday records for one A-share stock, ETF, or LOF, "
+        "with explicitly defined mechanical intraday indicators."
+    ),
     annotations=READ_ONLY_TOOL,
 )
 def get_a_share_intraday(symbol: str, limit: int = 240) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return {"ok": False, "error": "symbol is required.", "time": now_iso()}
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_limit = max(1, min(limit, 240))
+    return run_cached_tool(
+        "get_a_share_intraday",
+        {"symbol": symbol, "limit": normalized_limit},
+        15,
+        lambda: get_intraday_data(symbol, normalized_limit),
+        symbol,
+    )
 
-    try:
-        return {"ok": True, **get_intraday_data(symbol, max(1, min(limit, 240)))}
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
+
+@mcp.tool(
+    name="get_a_share_auction",
+    title="Get A-share opening-auction facts",
+    description=(
+        "Get publicly verifiable opening-auction facts for one A-share stock, ETF, or LOF. "
+        "Fields not provided by public sources are returned as unavailable."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_auction(symbol: str) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    return run_cached_tool(
+        "get_a_share_auction", {"symbol": symbol}, 3,
+        lambda: get_auction_data(symbol), symbol,
+    )
+
+
+@mcp.tool(
+    name="filter_a_share_securities",
+    title="Filter A-share securities by explicit conditions",
+    description=(
+        "Mechanically filter ordinary A-share stocks with caller-supplied price-change, turnover, turnover-rate, "
+        "VWAP, and market-cap conditions. No scores or recommendations are applied."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def filter_a_share_securities(
+    security_type: str = "stock",
+    exclude_st: bool = True,
+    change_pct_min: float | None = None,
+    change_pct_max: float | None = None,
+    turnover_min: float | None = None,
+    turnover_rate_min: float | None = None,
+    above_average_price: bool | None = None,
+    market_cap_max: float | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    normalized_limit = max(1, min(limit, 200))
+    parameters = {
+        "security_type": security_type,
+        "exclude_st": exclude_st,
+        "change_pct_min": change_pct_min,
+        "change_pct_max": change_pct_max,
+        "turnover_min": turnover_min,
+        "turnover_rate_min": turnover_rate_min,
+        "above_average_price": above_average_price,
+        "market_cap_max": market_cap_max,
+        "limit": normalized_limit,
+    }
+    return run_cached_tool(
+        "filter_a_share_securities", parameters, 3,
+        lambda: filter_a_share_securities_data(**parameters),
+    )
 
 
 @mcp.tool(
@@ -1669,12 +2978,12 @@ def get_a_share_intraday(symbol: str, limit: int = 240) -> dict[str, Any]:
 def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return {"ok": False, "error": "symbol is required.", "time": now_iso()}
-
-    try:
-        return {"ok": True, **get_fund_flow_data(symbol, max(1, min(limit, 10)))}
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_limit = max(1, min(limit, 10))
+    return run_cached_tool(
+        "get_a_share_fund_flow", {"symbol": symbol, "limit": normalized_limit}, 30,
+        lambda: get_fund_flow_data(symbol, normalized_limit), symbol,
+    )
 
 
 @mcp.tool(
@@ -1686,12 +2995,12 @@ def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
 def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return {"ok": False, "error": "symbol is required.", "time": now_iso()}
-
-    try:
-        return {"ok": True, **get_financial_data(symbol, max(1, min(limit, 4)))}
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_limit = max(1, min(limit, 4))
+    return run_cached_tool(
+        "get_a_share_financials", {"symbol": symbol, "limit": normalized_limit}, 21600,
+        lambda: get_financial_data(symbol, normalized_limit), symbol,
+    )
 
 
 @mcp.tool(
@@ -1703,25 +3012,75 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
 def get_a_share_news(symbol: str, limit: int = 5) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return {"ok": False, "error": "symbol is required.", "time": now_iso()}
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_limit = max(1, min(limit, 10))
+    return run_cached_tool(
+        "get_a_share_news", {"symbol": symbol, "limit": normalized_limit}, 120,
+        lambda: get_news_data(symbol, normalized_limit), symbol,
+    )
 
-    try:
-        return {"ok": True, **get_news_data(symbol, max(1, min(limit, 10)))}
-    except HTTPException as exc:
-        return mcp_error(symbol, exc)
+
+@mcp.tool(
+    name="get_a_share_sector_rankings",
+    title="Get A-share sector rankings",
+    description=(
+        "Get a mechanically sorted public industry or concept-board snapshot. "
+        "Industry requests can select one disclosed level to avoid mixed-level rankings."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_sector_rankings(
+    sector_type: str = "industry",
+    level: str = "2",
+    sort_by: str = "change_pct",
+    limit: int = 20,
+) -> dict[str, Any]:
+    normalized_limit = max(1, min(limit, 50))
+    return run_cached_tool(
+        "get_a_share_sector_rankings",
+        {
+            "sector_type": sector_type,
+            "level": level,
+            "sort_by": sort_by,
+            "limit": normalized_limit,
+        },
+        10,
+        lambda: get_sector_rankings_data(
+            sector_type, level, sort_by, normalized_limit,
+        ),
+    )
 
 
 @mcp.tool(
     name="get_a_share_market_overview",
     title="Get A-share market overview",
-    description="Get major A-share index quotes and, when available, leading industry-board performance.",
+    description=(
+        "Get major and style index quotes, all-market A-share breadth, turnover, limit statistics, "
+        "and leading industry-board performance."
+    ),
     annotations=READ_ONLY_TOOL,
 )
-def get_a_share_market_overview(limit: int = 5) -> dict[str, Any]:
-    try:
-        return {"ok": True, **get_market_overview_data(max(1, min(limit, 10)))}
-    except HTTPException as exc:
-        return mcp_error(None, exc)
+def get_a_share_market_overview(limit: int = 10) -> dict[str, Any]:
+    normalized_limit = max(1, min(limit, 20))
+    return run_cached_tool(
+        "get_a_share_market_overview", {"limit": normalized_limit}, 5,
+        lambda: get_market_overview_data(normalized_limit),
+    )
+
+
+@mcp.tool(
+    name="get_market_data_health",
+    title="Get market data route health",
+    description=(
+        "Get observed availability, latency, recent failure rate, cache state, and degraded-mode status "
+        "for the public quote, intraday, and ETF data routes. This is operational status, not investment advice."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_market_data_health() -> dict[str, Any]:
+    return run_cached_tool(
+        "get_market_data_health", {}, 1, get_market_data_health_data,
+    )
 
 
 # Mount last so the health endpoint keeps its direct HTTP path.
