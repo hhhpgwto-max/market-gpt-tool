@@ -371,10 +371,18 @@ def test_industry_board_deduplication() -> None:
             {"name": "油气开采Ⅲ", "industry_name": "油气开采", "industry_level": "Ⅲ", "change_pct": 2.17},
             {"name": "油气开采Ⅱ", "industry_name": "油气开采", "industry_level": "Ⅱ", "change_pct": 2.17},
             {"name": "国有大型银行Ⅲ", "industry_name": "国有大型银行", "industry_level": "Ⅲ", "change_pct": 2.07},
+            {"name": "城商行Ⅲ", "industry_name": "城商行", "industry_level": "Ⅲ", "change_pct": 1.69},
+            {"name": "农商行Ⅲ", "industry_name": "农商行", "industry_level": "Ⅲ", "change_pct": 1.69},
         ],
         5,
     )
-    assert [board["name"] for board in boards] == ["中药Ⅱ", "油气开采Ⅱ", "国有大型银行Ⅲ"]
+    assert [board["name"] for board in boards] == [
+        "中药Ⅱ",
+        "油气开采Ⅱ",
+        "国有大型银行Ⅲ",
+        "城商行Ⅲ",
+        "农商行Ⅲ",
+    ]
 
 
 def test_intraday_and_index_fallback_parsers() -> None:
