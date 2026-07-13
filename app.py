@@ -378,6 +378,27 @@ def get_cached_tool_data(
     )
 
 
+def get_cached_tool_snapshot(
+    key: str, max_age_seconds: int
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    now = datetime.now(timezone.utc)
+    with TOOL_CACHE_LOCK:
+        cached = TOOL_CACHE.get(key)
+        if cached is None:
+            return None
+        age_seconds = (now - cached["created_at"]).total_seconds()
+        if age_seconds > max_age_seconds:
+            return None
+        return (
+            deepcopy(cached["data"]),
+            {
+                "cache_hit": True,
+                "cache_created_at": cached["created_at"].isoformat(),
+                "cache_age_seconds": round(age_seconds, 3),
+            },
+        )
+
+
 def source_name_from_url(url: str) -> str:
     text = url.lower()
     if "eastmoney" in text:
@@ -592,6 +613,10 @@ def derive_quote_timestamps(source_updated_at: str | None) -> dict[str, str | No
     return result
 
 
+def market_time_from_source_update(source_updated_at: str | None) -> str | None:
+    return derive_quote_timestamps(source_updated_at)["quote_time"]
+
+
 def clean_value(value: Any) -> Any:
     if pd.isna(value):
         return None
@@ -660,7 +685,7 @@ def read_public_json(
     referer: str,
     timeout: int = 3,
     attempts: int = 1,
-) -> dict[str, Any]:
+) -> Any:
     request = Request(
         url,
         headers={
@@ -1350,6 +1375,33 @@ def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[s
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
+def parse_intraday_minute(value: Any) -> datetime | None:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M").replace(
+            tzinfo=MARKET_TIMEZONE
+        )
+    except ValueError:
+        return None
+
+
+def intraday_item_is_trading_minute(item: dict[str, Any]) -> bool:
+    timestamp = parse_intraday_minute(item.get("time"))
+    if timestamp is None or timestamp.weekday() >= 5:
+        return False
+    minute = timestamp.hour * 60 + timestamp.minute
+    return (
+        9 * 60 + 30 <= minute <= 11 * 60 + 30
+        or 13 * 60 <= minute <= 15 * 60
+    )
+
+
+def filter_intraday_trading_items(
+    items: list[dict[str, Any]], limit: int | None = None
+) -> list[dict[str, Any]]:
+    filtered = [item for item in items if intraday_item_is_trading_minute(item)]
+    return filtered[-limit:] if limit is not None else filtered
+
+
 def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     query = urlencode(
@@ -1370,13 +1422,13 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
     if not trends:
         raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
 
-    items = []
-    for trend in trends[-limit:]:
+    parsed_items = []
+    for trend in trends:
         values = trend.split(",")
         if len(values) < 8:
             continue
         volume = to_number(values[5])
-        items.append(
+        parsed_items.append(
             {
                 "time": values[0],
                 "open": to_number(values[1]),
@@ -1392,6 +1444,13 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
                 "average_price_scope": "source_reported_cumulative_day_average",
             }
         )
+    valid_items = filter_intraday_trading_items(parsed_items)
+    items = valid_items[-limit:]
+    if not items:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Intraday source returned no valid A-share trading-session minutes: {symbol}",
+        )
 
     return {
         "symbol": symbol,
@@ -1399,6 +1458,9 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
         "previous_close": clean_value(data.get("preClose")),
         "count": len(items),
         "items": items,
+        "raw_count": len(parsed_items),
+        "filtered_out_of_session_count": len(parsed_items) - len(valid_items),
+        "session_filter": "09:30-11:30 and 13:00-15:00 Asia/Shanghai",
         "source": "eastmoney",
         "latest_market_time": items[-1]["time"],
         "queried_at": now_iso(),
@@ -1429,6 +1491,7 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
 
     parsed = []
+    raw_count = 0
     previous_volume = 0.0
     previous_turnover = 0.0
     for row in rows:
@@ -1439,22 +1502,24 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
         cumulative_turnover = to_number(values[3])
         if cumulative_volume is None or cumulative_turnover is None:
             continue
-        parsed.append(
-            {
-                "time": f"{trade_date} {values[0][:2]}:{values[0][2:]}",
-                "open": None,
-                "close": to_number(values[1]),
-                "price": to_number(values[1]),
-                "high": None,
-                "low": None,
-                "volume": max(0.0, cumulative_volume - previous_volume) * 100,
-                "turnover": max(0.0, cumulative_turnover - previous_turnover),
-                "volume_unit": "share",
-                "turnover_unit": "CNY",
-                "average_price": None,
-                "average_price_scope": "unavailable_from_tencent_minute_source",
-            }
-        )
+        raw_count += 1
+        item = {
+            "time": f"{trade_date} {values[0][:2]}:{values[0][2:]}",
+            "open": None,
+            "close": to_number(values[1]),
+            "price": to_number(values[1]),
+            "high": None,
+            "low": None,
+            "volume": max(0.0, cumulative_volume - previous_volume) * 100,
+            "turnover": max(0.0, cumulative_turnover - previous_turnover),
+            "volume_unit": "share",
+            "turnover_unit": "CNY",
+            "average_price": None,
+            "average_price_scope": "unavailable_from_tencent_minute_source",
+        }
+        if not intraday_item_is_trading_minute(item):
+            continue
+        parsed.append(item)
         previous_volume = cumulative_volume
         previous_turnover = cumulative_turnover
     items = parsed[-limit:]
@@ -1467,6 +1532,9 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
         "previous_close": to_number(quote[4]) if len(quote) > 4 else None,
         "count": len(items),
         "items": items,
+        "raw_count": raw_count,
+        "filtered_out_of_session_count": raw_count - len(parsed),
+        "session_filter": "09:30-11:30 and 13:00-15:00 Asia/Shanghai",
         "source": "tencent",
         "latest_market_time": items[-1]["time"],
         "queried_at": now_iso(),
@@ -1475,11 +1543,8 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
 
 
 def intraday_item_is_unfinished(item_time: Any) -> bool:
-    try:
-        timestamp = datetime.strptime(str(item_time), "%Y-%m-%d %H:%M").replace(
-            tzinfo=MARKET_TIMEZONE
-        )
-    except ValueError:
+    timestamp = parse_intraday_minute(item_time)
+    if timestamp is None:
         return False
     now = datetime.now(MARKET_TIMEZONE)
     return (
@@ -1503,6 +1568,9 @@ def percentage_change(current: float | None, reference: float | None) -> float |
 
 
 def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any]:
+    items = filter_intraday_trading_items(items)
+    if not items:
+        return {"status": "unavailable_without_trading_session_minutes"}
     prices = [to_number(item.get("price") or item.get("close")) for item in items]
     valid_prices = [price for price in prices if price is not None]
     if not valid_prices:
@@ -1560,26 +1628,76 @@ def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any
 
 
 def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
-    errors = []
-    all_not_found = True
-    for source, getter in (
+    source_getters = (
         ("eastmoney", get_eastmoney_intraday),
         ("tencent", get_tencent_intraday),
-    ):
-        try:
-            payload = getter(symbol, limit)
-            payload["items"] = add_intraday_completion_flags(payload["items"])
-            payload["market_time"] = format_market_time(payload.get("latest_market_time"))
-            payload["mechanical_indicators"] = intraday_mechanical_indicators(payload["items"])
-            payload["security_type"] = security_metadata(symbol)["security_type"]
-            payload["exchange"] = security_metadata(symbol)["exchange"]
-            payload["source_errors"] = errors
-            payload["note"] = "Minute facts and mechanical indicators only; no trading or investment judgement is generated."
-            return payload
-        except HTTPException as exc:
-            errors.append(f"{source}: {exc.detail}")
-            all_not_found = all_not_found and exc.status_code == 404
-    status_code = 404 if all_not_found else 502
+    )
+
+    def finalize_payload(
+        payload: dict[str, Any], source: str, errors: list[str]
+    ) -> dict[str, Any]:
+        original_count = len(payload["items"])
+        payload["items"] = filter_intraday_trading_items(payload["items"], limit)
+        if not payload["items"]:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{source} returned no valid trading-session minutes.",
+            )
+        payload["items"] = add_intraday_completion_flags(payload["items"])
+        payload["count"] = len(payload["items"])
+        payload["filtered_out_of_session_count"] = (
+            payload.get("filtered_out_of_session_count", 0)
+            + original_count
+            - len(payload["items"])
+        )
+        payload["latest_market_time"] = payload["items"][-1]["time"]
+        payload["market_time"] = format_market_time(payload["latest_market_time"])
+        payload["mechanical_indicators"] = intraday_mechanical_indicators(payload["items"])
+        payload["security_type"] = security_metadata(symbol)["security_type"]
+        payload["exchange"] = security_metadata(symbol)["exchange"]
+        payload["source_errors"] = errors
+        payload["note"] = "Minute facts and mechanical indicators only; no trading or investment judgement is generated."
+        return payload
+
+    executor = ThreadPoolExecutor(max_workers=len(source_getters))
+    futures = {
+        executor.submit(getter, symbol, limit): source
+        for source, getter in source_getters
+    }
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    deadline = perf_counter() + 4
+    try:
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                source = futures[future]
+                try:
+                    return finalize_payload(future.result(), source, errors)
+                except HTTPException as exc:
+                    errors.append(f"{source}: {exc.detail}")
+                    status_codes.append(exc.status_code)
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
+                    status_codes.append(502)
+        for future in pending:
+            future.cancel()
+            errors.append(f"{futures[future]}: request exceeded the 4 second budget")
+            status_codes.append(502)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
     raise HTTPException(status_code=status_code, detail="; ".join(errors))
 
 
@@ -1969,7 +2087,10 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
             "low": to_number(row.get("f16")),
             "previous_close": to_number(row.get("f18")),
             "turnover": to_number(row.get("f6")),
-            "market_time": format_unix_market_time(row.get("f124")),
+            "source_updated_at": format_unix_market_time(row.get("f124")),
+            "market_time": market_time_from_source_update(
+                format_unix_market_time(row.get("f124"))
+            ),
         }
         for row in index_rows
     ]
@@ -2000,7 +2121,9 @@ def get_tencent_indices() -> list[dict[str, Any]]:
                 "low": None,
                 "previous_close": to_number(values[4]),
                 "source_updated_at": format_market_time(values[30]),
-                "market_time": format_market_time(values[30]),
+                "market_time": market_time_from_source_update(
+                    format_market_time(values[30])
+                ),
             }
         )
     if not indices:
@@ -2300,7 +2423,10 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
                     "open": to_number(row.get("f17")),
                     "previous_close": to_number(row.get("f18")),
                     "total_market_value": to_number(row.get("f20")),
-                    "market_time": format_unix_market_time(row.get("f124")),
+                    "source_updated_at": format_unix_market_time(row.get("f124")),
+                    "market_time": market_time_from_source_update(
+                        format_unix_market_time(row.get("f124"))
+                    ),
                 }
                 for row in raw_rows
                 if row.get("f12") and row.get("f14")
@@ -2308,6 +2434,117 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
         except HTTPException as exc:
             errors.append(f"{host}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_sina_market_quotes() -> dict[str, Any]:
+    count_url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        "Market_Center.getHQNodeStockCount?node=hs_a"
+    )
+    try:
+        count_text = read_market_text(
+            count_url,
+            "https://vip.stock.finance.sina.com.cn/",
+            timeout=3,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch Sina market count: {exc}",
+        ) from exc
+    match = re.search(r"\d+", count_text)
+    if match is None:
+        raise HTTPException(status_code=502, detail="Unexpected Sina market-count response.")
+
+    expected_count = int(match.group(0))
+    page_size = 100
+    page_count = ceil(expected_count / page_size)
+
+    def fetch_page(page: int) -> tuple[int, list[dict[str, Any]]]:
+        query = urlencode(
+            {
+                "page": page,
+                "num": page_size,
+                "sort": "changepercent",
+                "asc": 0,
+                "node": "hs_a",
+                "symbol": "",
+                "_s_r_a": "page",
+            }
+        )
+        payload = read_public_json(
+            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            f"Market_Center.getHQNodeData?{query}",
+            "https://vip.stock.finance.sina.com.cn/",
+            timeout=3,
+            attempts=1,
+        )
+        if not isinstance(payload, list):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unexpected Sina market page {page} response.",
+            )
+        return page, payload
+
+    executor = ThreadPoolExecutor(max_workers=20)
+    futures = {executor.submit(fetch_page, page): page for page in range(1, page_count + 1)}
+    done, pending = wait(futures, timeout=5)
+    pages: dict[int, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for future in done:
+        page = futures[future]
+        try:
+            page_number, rows = future.result()
+            pages[page_number] = rows
+        except (HTTPException, OSError, ValueError, TypeError) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            errors.append(f"sina page {page}: {detail}")
+    for future in pending:
+        future.cancel()
+        errors.append(f"sina page {futures[future]}: request exceeded the 5 second budget")
+    executor.shutdown(wait=False, cancel_futures=True)
+
+    raw_rows = [row for page in sorted(pages) for row in pages[page]]
+    minimum_acceptable_rows = ceil(expected_count * 0.8)
+    if len(raw_rows) < minimum_acceptable_rows:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Sina returned only {len(raw_rows)} of about {expected_count} market rows; "
+                + "; ".join(errors)
+            ),
+        )
+
+    rows = [
+        {
+            "symbol": str(row.get("code") or "").zfill(6),
+            "name": clean_value(row.get("name")),
+            "price": to_number(row.get("trade")),
+            "change_pct": to_number(row.get("changepercent")),
+            "volume": to_number(row.get("volume")),
+            "turnover": to_number(row.get("amount")),
+            "turnover_rate": to_number(row.get("turnoverratio")),
+            "high": to_number(row.get("high")),
+            "low": to_number(row.get("low")),
+            "open": to_number(row.get("open")),
+            "previous_close": to_number(row.get("settlement")),
+            "total_market_value": (
+                to_number(row.get("mktcap")) * 10_000
+                if to_number(row.get("mktcap")) is not None
+                else None
+            ),
+            "market_time": None,
+        }
+        for row in raw_rows
+        if row.get("code") and row.get("name")
+    ]
+    return {
+        "rows": rows,
+        "expected_count": expected_count,
+        "returned_count": len(rows),
+        "coverage_status": "complete" if not errors and len(raw_rows) >= expected_count else "partial",
+        "source_errors": errors,
+    }
 
 
 def exchange_for_symbol(symbol: str) -> str | None:
@@ -2565,30 +2802,80 @@ def get_sector_rankings_data(
     }
 
 
-def get_market_overview_data(limit: int) -> dict[str, Any]:
-    started_at = perf_counter()
-    index_errors = []
-    indices = []
-    index_source = "unavailable"
-    for source, getter in (
+def get_fastest_index_component() -> dict[str, Any]:
+    source_getters = (
         ("eastmoney", get_eastmoney_indices),
         ("tencent", get_tencent_indices),
         ("sina", get_sina_indices),
-    ):
-        try:
-            indices = getter()
-            if not indices:
-                raise HTTPException(status_code=502, detail=f"{source} returned no major-index rows.")
-            index_source = source
-            break
-        except HTTPException as exc:
-            index_errors.append(f"{source}: {exc.detail}")
-    if not indices:
-        raise HTTPException(status_code=502, detail="; ".join(index_errors))
+    )
+    executor = ThreadPoolExecutor(max_workers=len(source_getters))
+    futures = {executor.submit(getter): source for source, getter in source_getters}
+    pending = set(futures)
+    successes: list[tuple[str, list[dict[str, Any]]]] = []
+    errors: list[str] = []
+    deadline = perf_counter() + 3.2
+    try:
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                source = futures[future]
+                try:
+                    rows = future.result()
+                    if not rows:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"{source} returned no major-index rows.",
+                        )
+                    successes.append((source, rows))
+                except HTTPException as exc:
+                    errors.append(f"{source}: {exc.detail}")
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
 
-    board_errors = []
-    boards: list[dict[str, Any]] = []
-    board_source = "unavailable"
+            eastmoney_success = next(
+                (item for item in successes if item[0] == "eastmoney"),
+                None,
+            )
+            if eastmoney_success:
+                return {
+                    "indices": eastmoney_success[1],
+                    "source": eastmoney_success[0],
+                    "source_errors": errors,
+                }
+            eastmoney_pending = any(
+                futures[future] == "eastmoney" for future in pending
+            )
+            if successes and not eastmoney_pending:
+                break
+
+        for future in pending:
+            future.cancel()
+            errors.append(
+                f"{futures[future]}: index request exceeded the 3.2 second budget"
+            )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if successes:
+        source, rows = min(
+            successes,
+            key=lambda item: {"eastmoney": 0, "tencent": 1, "sina": 2}[item[0]],
+        )
+        return {"indices": rows, "source": source, "source_errors": errors}
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_overview_board_component(limit: int) -> dict[str, Any]:
+    errors = []
     for source, getter in (
         ("eastmoney_industry", get_eastmoney_industry_boards),
         ("efinance_calculated", get_calculated_industry_boards),
@@ -2596,30 +2883,203 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         try:
             boards = getter(limit)
             if not boards:
-                raise HTTPException(status_code=502, detail=f"{source} returned no industry-board rows.")
-            board_source = source
-            break
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{source} returned no industry-board rows.",
+                )
+            return {"boards": boards, "source": source, "source_errors": errors}
         except (HTTPException, OSError, ValueError, TypeError) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            board_errors.append(f"{source}: {detail}")
+            errors.append(f"{source}: {detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
 
-    market_time = latest_market_time(indices)
-    source_errors = list(index_errors) + list(board_errors)
-    sources = [f"indices:{index_source}"]
-    if board_source != "unavailable":
-        sources.append(f"industry_boards:{board_source}")
 
-    breadth = None
-    turnover = None
+def get_overview_breadth_component() -> dict[str, Any]:
+    source_getters = (
+        (
+            "eastmoney_all_a_shares",
+            lambda: {
+                "rows": get_eastmoney_market_quotes(),
+                "coverage_status": "complete",
+                "source_errors": [],
+            },
+        ),
+        ("sina_all_a_shares", get_sina_market_quotes),
+    )
+    executor = ThreadPoolExecutor(max_workers=len(source_getters))
+    futures = {executor.submit(getter): source for source, getter in source_getters}
+    pending = set(futures)
+    errors: list[str] = []
+    deadline = perf_counter() + 5.5
     try:
-        market_rows = get_eastmoney_market_quotes()
-        breadth = calculate_market_breadth(market_rows)
-        turnover = market_turnover_summary(market_rows, market_time)
-        sources.append("market_breadth:eastmoney_all_a_shares")
-    except HTTPException as exc:
-        source_errors.append(f"market_breadth: {exc.detail}")
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                source = futures[future]
+                try:
+                    payload = future.result()
+                    rows = payload["rows"]
+                    if not rows:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"{source} returned no usable stock rows.",
+                        )
+                    market_times = [
+                        row["market_time"] for row in rows if row.get("market_time")
+                    ]
+                    market_time = max(market_times) if market_times else None
+                    return {
+                        "breadth": calculate_market_breadth(rows),
+                        "turnover": market_turnover_summary(rows, market_time),
+                        "market_time": market_time,
+                        "row_count": len(rows),
+                        "coverage_status": payload.get("coverage_status", "complete"),
+                        "source": source,
+                        "source_errors": errors + payload.get("source_errors", []),
+                    }
+                except (HTTPException, OSError, ValueError, TypeError) as exc:
+                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                    errors.append(f"{source}: {detail}")
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
+        for future in pending:
+            future.cancel()
+            errors.append(
+                f"{futures[future]}: breadth request exceeded the 5.5 second budget"
+            )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    raise HTTPException(status_code=502, detail="; ".join(errors))
 
-    primary_indices = [index for index in indices if index.get("symbol") in PRIMARY_INDEX_SYMBOLS]
+
+def get_market_overview_data(limit: int) -> dict[str, Any]:
+    started_at = perf_counter()
+    response_budget_seconds = 6.0
+    component_specs = {
+        "indices": {
+            "key": cache_key("overview_component_indices", {}),
+            "ttl": 2,
+            "max_stale_age": 60,
+            "loader": get_fastest_index_component,
+        },
+        "industry_boards": {
+            "key": cache_key("overview_component_boards", {"limit": limit}),
+            "ttl": 15,
+            "max_stale_age": 300,
+            "loader": lambda: get_overview_board_component(limit),
+        },
+        "market_breadth": {
+            "key": cache_key("overview_component_breadth", {}),
+            "ttl": 15,
+            "max_stale_age": 180,
+            "loader": get_overview_breadth_component,
+        },
+    }
+
+    executor = ThreadPoolExecutor(max_workers=len(component_specs))
+    futures = {
+        executor.submit(
+            get_cached_tool_data,
+            spec["key"],
+            spec["ttl"],
+            spec["loader"],
+        ): name
+        for name, spec in component_specs.items()
+    }
+    done, pending = wait(futures, timeout=response_budget_seconds)
+    component_results: dict[str, dict[str, Any]] = {}
+    component_status: dict[str, dict[str, Any]] = {}
+    source_errors: list[str] = []
+
+    for future in done:
+        name = futures[future]
+        try:
+            data, cache = future.result()
+            component_results[name] = data
+            component_status[name] = {
+                "status": "fresh_cache" if cache["cache_hit"] else "live",
+                "cache_age_seconds": cache["cache_age_seconds"],
+            }
+        except HTTPException as exc:
+            source_errors.append(f"{name}: {exc.detail}")
+        except Exception as exc:  # pragma: no cover - defensive component boundary
+            source_errors.append(f"{name}: {exc}")
+
+    missing_names = {futures[future] for future in pending} | (
+        set(component_specs) - set(component_results) - {futures[future] for future in pending}
+    )
+    for name in missing_names:
+        spec = component_specs[name]
+        cached = get_cached_tool_snapshot(spec["key"], spec["max_stale_age"])
+        if cached:
+            data, cache = cached
+            component_results[name] = data
+            component_status[name] = {
+                "status": "stale_cache",
+                "cache_age_seconds": cache["cache_age_seconds"],
+            }
+            source_errors.append(
+                f"{name}: live component unavailable within {response_budget_seconds:g} seconds; using recent cache"
+            )
+        else:
+            component_status[name] = {
+                "status": "unavailable_within_response_budget",
+                "cache_age_seconds": None,
+            }
+            source_errors.append(
+                f"{name}: unavailable within the {response_budget_seconds:g} second response budget"
+            )
+    executor.shutdown(wait=False, cancel_futures=False)
+
+    index_component = component_results.get("indices")
+    if not index_component:
+        raise HTTPException(status_code=502, detail="; ".join(source_errors))
+
+    indices = index_component["indices"]
+    index_source = index_component["source"]
+    board_component = component_results.get("industry_boards") or {}
+    boards = board_component.get("boards") or []
+    board_source = board_component.get("source", "unavailable")
+    breadth_component = component_results.get("market_breadth") or {}
+    breadth = breadth_component.get("breadth")
+    turnover = breadth_component.get("turnover")
+    market_time = latest_market_time(indices) or breadth_component.get("market_time")
+    if turnover and market_time:
+        elapsed = trading_minutes_elapsed(market_time)
+        current_turnover = turnover.get("current")
+        if current_turnover is not None and elapsed:
+            turnover["estimated_full_day"] = (
+                round(current_turnover / elapsed * 240, 2)
+                if 0 < elapsed < 240
+                else current_turnover
+            )
+            turnover["estimated_full_day_status"] = (
+                "mechanical_elapsed-time_extrapolation"
+                if elapsed < 240
+                else "completed_trading_day"
+            )
+
+    source_errors.extend(index_component.get("source_errors", []))
+    source_errors.extend(board_component.get("source_errors", []))
+    source_errors.extend(breadth_component.get("source_errors", []))
+    sources = [f"indices:{index_source}"]
+    if boards:
+        sources.append(f"industry_boards:{board_source}")
+    if breadth:
+        sources.append(f"market_breadth:{breadth_component.get('source', 'unavailable')}")
+
+    primary_indices = [
+        index for index in indices if index.get("symbol") in PRIMARY_INDEX_SYMBOLS
+    ]
     if not primary_indices:
         primary_indices = indices[:3]
     style_indices = [index for index in indices if index not in primary_indices]
@@ -2649,17 +3109,29 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
-        "industry_board_errors": board_errors if not boards else [],
+        "industry_board_errors": board_component.get("source_errors", []) if not boards else [],
         "market_breadth": breadth,
+        "market_breadth_source": breadth_component.get("source", "unavailable"),
+        "market_breadth_coverage_status": breadth_component.get("coverage_status"),
+        "market_breadth_row_count": breadth_component.get("row_count"),
         "turnover": turnover,
         "limit_stats": limit_stats,
+        "component_status": component_status,
+        "response_budget_ms": int(response_budget_seconds * 1000),
         "source": sources,
         "source_errors": source_errors,
         "is_stale": is_market_time_stale(market_time),
         "queried_at": now_iso(),
         "latency_ms": int((perf_counter() - started_at) * 1000),
-        "data_status": "full_data" if breadth and turnover and boards else "partial_data",
-        "note": "Facts and mechanical calculations only; this service does not generate trading, theme, or investment recommendations.",
+        "data_status": (
+            "full_data"
+            if breadth
+            and turnover
+            and boards
+            and breadth_component.get("coverage_status") == "complete"
+            else "partial_data"
+        ),
+        "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a six-second budget.",
     }
 
 
@@ -2711,7 +3183,7 @@ def get_market_data_health_data() -> dict[str, Any]:
         "intraday_route": {
             "status": "configured",
             "providers": ["eastmoney", "tencent"],
-            "strategy": "sequential_fallback_with_3_second_per_source_timeout",
+            "strategy": "parallel_fastest_success_with_4_second_total_budget_and_session_filter",
         },
         "etf_route": {
             "status": "configured",

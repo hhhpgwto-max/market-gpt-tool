@@ -509,9 +509,12 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         assert batch["errors"][0]["code"] == "invalid_symbol"
         assert market_app.batch_security_metadata("index:000300")["security_type"] == "index"
 
+        base_minute = market_app.datetime(2026, 7, 10, 9, 30)
         items = [
             {
-                "time": f"2026-07-10 09:{30 + minute:02d}",
+                "time": (base_minute + market_app.timedelta(minutes=minute)).strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
                 "price": 10.0 + minute,
                 "high": 10.0 + minute,
                 "low": 10.0 + minute,
@@ -578,6 +581,43 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         market_app.get_quote_data = original_quote_data
 
 
+def test_intraday_session_filter_and_market_time_cap() -> None:
+    original_json = market_app.read_public_json
+    try:
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "name": "Test ETF",
+                "preClose": 1.0,
+                "trends": [
+                    "2026-07-10 14:59,1.00,1.01,1.01,1.00,10,1010,1.005",
+                    "2026-07-10 15:00,1.01,1.02,1.02,1.01,20,2040,1.010",
+                    "2026-07-10 15:01,1.02,1.02,1.02,1.02,0,0,1.010",
+                    "2026-07-10 15:11,1.02,1.02,1.02,1.02,0,0,1.010",
+                ],
+            }
+        }
+        intraday = market_app.get_eastmoney_intraday("512760", 20)
+        assert [item["time"] for item in intraday["items"]] == [
+            "2026-07-10 14:59",
+            "2026-07-10 15:00",
+        ]
+        assert intraday["latest_market_time"] == "2026-07-10 15:00"
+        assert intraday["filtered_out_of_session_count"] == 2
+
+        indicators = market_app.intraday_mechanical_indicators(
+            intraday["items"]
+            + [{"time": "2026-07-10 15:11", "price": 999.0, "high": 999.0, "low": 999.0}]
+        )
+        assert indicators["at_intraday_high"] is True
+        assert indicators["distance_from_high_pct"] == 0.0
+
+        assert market_app.market_time_from_source_update(
+            "2026-07-10T16:14:42+08:00"
+        ) == "2026-07-10T15:00:00+08:00"
+    finally:
+        market_app.read_public_json = original_json
+
+
 def test_market_quote_pagination() -> None:
     original_json = market_app.read_public_json
     try:
@@ -613,6 +653,58 @@ def test_market_quote_pagination() -> None:
         assert set(requested_pages) == {1, 2, 3}
     finally:
         market_app.read_public_json = original_json
+
+
+def test_sina_market_pagination_and_breadth_fallback() -> None:
+    original_json = market_app.read_public_json
+    original_text = market_app.read_market_text
+    original_eastmoney_rows = market_app.get_eastmoney_market_quotes
+    original_sina_rows = market_app.get_sina_market_quotes
+    try:
+        market_app.read_market_text = lambda *_args, **_kwargs: '"201"'
+
+        def sina_page(url: str, *_args: object, **_kwargs: object) -> list[dict]:
+            match = market_app.re.search(r"(?:\?|&)page=(\d+)", url)
+            assert match is not None
+            page = int(match.group(1))
+            start = (page - 1) * 100
+            end = min(start + 100, 201)
+            return [
+                {
+                    "code": str(600000 + number),
+                    "name": f"Test {number}",
+                    "trade": "10.0",
+                    "changepercent": 1.0,
+                    "volume": 100,
+                    "amount": 1000,
+                    "turnoverratio": 1.0,
+                    "high": "10.1",
+                    "low": "9.9",
+                    "open": "10.0",
+                    "settlement": "9.9",
+                    "mktcap": 10000,
+                }
+                for number in range(start, end)
+            ]
+
+        market_app.read_public_json = sina_page
+        sina = market_app.get_sina_market_quotes()
+        assert sina["returned_count"] == 201
+        assert sina["coverage_status"] == "complete"
+
+        market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="blocked")
+        )
+        market_app.get_sina_market_quotes = lambda: sina
+        breadth = market_app.get_overview_breadth_component()
+        assert breadth["source"] == "sina_all_a_shares"
+        assert breadth["row_count"] == 201
+        assert breadth["breadth"]["all_market"]["stock_count"] == 201
+    finally:
+        market_app.read_public_json = original_json
+        market_app.read_market_text = original_text
+        market_app.get_eastmoney_market_quotes = original_eastmoney_rows
+        market_app.get_sina_market_quotes = original_sina_rows
 
 
 def test_intraday_and_index_fallback_parsers() -> None:
@@ -691,12 +783,18 @@ def test_intraday_and_index_fallback_parsers() -> None:
         fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
         fields[30:33] = ["20260710150000", "1.0", "1.01"]
         market_app.read_market_text = lambda *_: f'v_sh000001="{"~".join(fields)}";'
+        market_app.TOOL_CACHE.clear()
         overview = market_app.get_market_overview_data(3)
         assert overview["index_source"] == "tencent"
         assert overview["indices"][0]["change"] == 1.0
         assert overview["indices"][0]["change_pct"] == 1.01
         assert overview["industry_board_source"] == "eastmoney_industry"
         assert overview["industry_boards"][0]["name"] == "Test Industry"
+        assert overview["response_budget_ms"] == 6000
+        assert overview["component_status"]["indices"]["status"] in {
+            "live",
+            "fresh_cache",
+        }
 
         market_app.read_market_text = lambda *_: 'v_sh000001="' + "~".join([""] * 32) + '";'
         try:
@@ -711,6 +809,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.read_market_text = lambda *_: (
             'var hq_str_s_sh000001="Test Index,100.0,1.0,1.01,0,0";'
         )
+        market_app.TOOL_CACHE.clear()
         overview = market_app.get_market_overview_data(3)
         assert overview["index_source"] == "sina"
         assert overview["indices"][0]["price"] == 100.0
@@ -809,7 +908,9 @@ def main() -> None:
     test_industry_board_deduplication()
     test_market_structure_calculations()
     test_batch_quotes_intraday_indicators_and_filtering()
+    test_intraday_session_filter_and_market_time_cap()
     test_market_quote_pagination()
+    test_sina_market_pagination_and_breadth_fallback()
     test_intraday_and_index_fallback_parsers()
     test_reliability_envelope_cache_and_health()
     market_app.TOOL_CACHE.clear()
