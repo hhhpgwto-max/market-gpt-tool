@@ -59,6 +59,57 @@ def fake_get_quote_data(symbol: str) -> dict:
     }
 
 
+def fake_get_batch_quote_data(symbols: list[str]) -> dict:
+    return {
+        "requested_count": len(symbols),
+        "count": 1,
+        "results": [
+            {
+                "symbol": symbols[0],
+                "name": "Test Security",
+                "security_type": "etf",
+                "exchange": "SSE",
+                "price": 1.23,
+                "volume": 100000,
+                "volume_unit": "share",
+                "turnover": 123000,
+                "turnover_unit": "CNY",
+                "market_time": "2026-07-10T15:00:00+08:00",
+                "source": "test",
+            }
+        ],
+        "errors": [],
+        "source": ["test"],
+        "source_errors": [],
+        "market_time": "2026-07-10T15:00:00+08:00",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+        "data_status": "full_data",
+    }
+
+
+def fake_get_auction_data(symbol: str) -> dict:
+    return {
+        "symbol": symbol,
+        "opening_price": 123.45,
+        "auction_turnover": None,
+        "data_status": "partial_data",
+        "source": "test",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_filter_a_share_securities_data(**_: object) -> dict:
+    return {
+        "matched_count": 1,
+        "returned_count": 1,
+        "conditions": {"security_type": "stock"},
+        "results": [{"symbol": "600519", "name": "Test Stock"}],
+        "source": ["test"],
+        "market_time": "2026-07-10T15:00:00+08:00",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
 def fake_search_stock_data(keyword: str, limit: int) -> dict:
     return {
         "keyword": keyword,
@@ -144,6 +195,19 @@ def fake_get_market_overview_data(limit: int) -> dict:
         "industry_boards": [],
         "time": "2026-07-10T00:00:00+00:00",
         "note": "For information only. Not investment advice.",
+    }
+
+
+def fake_get_sector_rankings_data(sector_type: str, level: str, sort_by: str, limit: int) -> dict:
+    return {
+        "sector_type": sector_type,
+        "level": level,
+        "sort_by": sort_by,
+        "count": 1,
+        "items": [{"symbol": "BK0001", "name": "Test Sector", "change_pct": 1.2}],
+        "source": ["test"],
+        "source_errors": [],
+        "queried_at": "2026-07-10T00:00:00+00:00",
     }
 
 
@@ -326,19 +390,17 @@ def test_industry_board_parser() -> None:
         boards = market_app.get_eastmoney_industry_boards(5)
         assert "push2.eastmoney.com" in calls[0][0]
         assert "push2delay.eastmoney.com" in calls[1][0]
-        assert calls[0][1][-2:] == (5, 1)
-        assert calls[1][1][-2:] == (5, 1)
-        assert boards == [
-            {
-                "symbol": "BK0001",
-                "name": "Test Industry",
-                "industry_name": "Test Industry",
-                "industry_level": None,
-                "price": 100.5,
-                "change_pct": 2.3,
-                "change": 2.25,
-            }
-        ]
+        assert calls[0][1][-2:] == (3, 1)
+        assert calls[1][1][-2:] == (3, 1)
+        assert boards[0]["symbol"] == "BK0001"
+        assert boards[0]["sector_type"] == "industry"
+        assert boards[0]["industry_name"] == "Test Industry"
+        assert boards[0]["industry_level"] is None
+        assert boards[0]["price"] == 100.5
+        assert boards[0]["current"] == 100.5
+        assert boards[0]["change_pct"] == 2.3
+        assert boards[0]["turnover"] is None
+        assert boards[0]["top_constituents"] == []
 
         market_app.read_public_json = lambda *_: {
             "data": {
@@ -348,17 +410,8 @@ def test_industry_board_parser() -> None:
             }
         }
         boards = market_app.get_eastmoney_industry_boards(5)
-        assert boards == [
-            {
-                "symbol": "BK0001",
-                "name": "Test Industry",
-                "industry_name": "Test Industry",
-                "industry_level": None,
-                "price": 100.5,
-                "change_pct": 2.3,
-                "change": 2.25,
-            }
-        ]
+        assert boards[0]["name"] == "Test Industry"
+        assert boards[0]["momentum_15m"] is None
     finally:
         market_app.read_public_json = original_json
 
@@ -383,6 +436,183 @@ def test_industry_board_deduplication() -> None:
         "城商行Ⅲ",
         "农商行Ⅲ",
     ]
+
+
+def test_market_structure_calculations() -> None:
+    rows = [
+        {"symbol": "600001", "name": "Test Main", "price": 11.0, "change_pct": 10.0, "turnover": 100.0, "high": 11.0, "previous_close": 10.0},
+        {"symbol": "300001", "name": "Test Growth", "price": 12.0, "change_pct": 20.0, "turnover": 200.0, "high": 12.0, "previous_close": 10.0},
+        {"symbol": "430001", "name": "Test BSE", "price": 7.0, "change_pct": -30.0, "turnover": 300.0, "high": 8.0, "previous_close": 10.0},
+        {"symbol": "600002", "name": "*ST Test", "price": 10.5, "change_pct": 5.0, "turnover": 150.0, "high": 10.5, "previous_close": 10.0},
+        {"symbol": "600003", "name": "Test Open Board", "price": 10.5, "change_pct": 5.0, "turnover": 50.0, "high": 11.0, "previous_close": 10.0},
+    ]
+    breadth = market_app.calculate_market_breadth(rows)
+    totals = breadth["all_market"]
+    assert totals["stock_count"] == 5
+    assert totals["rise_count"] == 4
+    assert totals["fall_count"] == 1
+    assert totals["limit_up_count"] == 3
+    assert totals["limit_down_count"] == 1
+    assert totals["st_limit_up_count"] == 1
+    assert totals["open_board_count"] == 1
+    assert breadth["by_exchange"]["BSE"]["limit_down_count"] == 1
+
+    turnover = market_app.market_turnover_summary(rows, "2026-07-10T11:30:00+08:00")
+    assert turnover["current"] == 800.0
+    assert turnover["estimated_full_day"] == 1600.0
+    assert turnover["previous_trade_day_same_time"] is None
+    assert turnover["top_turnover_securities"][0]["symbol"] == "430001"
+
+    try:
+        market_app.get_sector_rankings_data("industry", "2", "momentum_15m", 20)
+        raise AssertionError("Expected unstable minute momentum ranking to be rejected.")
+    except market_app.HTTPException as exc:
+        assert exc.status_code == 400
+
+
+def test_batch_quotes_intraday_indicators_and_filtering() -> None:
+    original_json = market_app.read_public_json
+    original_batch_rows = market_app.get_eastmoney_batch_quote_rows
+    original_market_rows = market_app.get_eastmoney_market_quotes
+    original_quote_data = market_app.get_quote_data
+    try:
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "diff": [
+                    {
+                        "f12": "512760",
+                        "f14": "Test ETF",
+                        "f2": 1.23,
+                        "f3": 2.5,
+                        "f4": 0.03,
+                        "f5": 1000,
+                        "f6": 123000,
+                        "f7": 3.2,
+                        "f8": 4.5,
+                        "f10": 1.2,
+                        "f15": 1.25,
+                        "f16": 1.2,
+                        "f17": 1.21,
+                        "f18": 1.2,
+                        "f20": 1000000000,
+                        "f21": 1000000000,
+                        "f124": 1783913737,
+                    }
+                ]
+            }
+        }
+        batch = market_app.get_batch_quote_data(["512760", "not-a-code"])
+        assert batch["count"] == 1
+        assert batch["results"][0]["security_type"] == "etf"
+        assert batch["results"][0]["volume"] == 100000
+        assert batch["results"][0]["volume_unit"] == "share"
+        assert batch["errors"][0]["code"] == "invalid_symbol"
+        assert market_app.batch_security_metadata("index:000300")["security_type"] == "index"
+
+        items = [
+            {
+                "time": f"2026-07-10 09:{30 + minute:02d}",
+                "price": 10.0 + minute,
+                "high": 10.0 + minute,
+                "low": 10.0 + minute,
+                "volume": 100,
+                "turnover": (10.0 + minute) * 100,
+                "average_price": 10.0 + minute / 2,
+                "average_price_scope": "test",
+            }
+            for minute in range(31)
+        ]
+        indicators = market_app.intraday_mechanical_indicators(items)
+        assert indicators["return_5m"] is not None
+        assert indicators["return_15m"] is not None
+        assert indicators["return_30m"] == 300.0
+        assert indicators["at_intraday_high"] is True
+
+        market_app.get_eastmoney_market_quotes = lambda: [
+            {
+                "symbol": "600001",
+                "name": "Eligible Stock",
+                "price": 11.0,
+                "change_pct": 3.0,
+                "volume": 1000.0,
+                "turnover": 1000000.0,
+                "turnover_rate": 3.0,
+                "total_market_value": 10000000000.0,
+                "market_time": "2026-07-10T10:00:00+08:00",
+            },
+            {
+                "symbol": "600002",
+                "name": "*ST Excluded",
+                "price": 12.0,
+                "change_pct": 3.0,
+                "volume": 1000.0,
+                "turnover": 1000000.0,
+                "turnover_rate": 3.0,
+                "total_market_value": 10000000000.0,
+                "market_time": "2026-07-10T10:00:00+08:00",
+            },
+        ]
+        filtered = market_app.filter_a_share_securities_data(
+            security_type="stock",
+            exclude_st=True,
+            change_pct_min=1.0,
+            change_pct_max=5.0,
+            turnover_min=500000.0,
+            turnover_rate_min=2.0,
+            above_average_price=True,
+            market_cap_max=50000000000.0,
+            limit=20,
+        )
+        assert filtered["matched_count"] == 1
+        assert filtered["results"][0]["symbol"] == "600001"
+
+        market_app.get_quote_data = lambda _: fake_get_quote_data("600519")
+        auction = market_app.get_auction_data("600519")
+        assert auction["auction_price"] == 122.0
+        assert auction["auction_turnover"] is None
+        assert auction["data_status"] == "partial_data"
+    finally:
+        market_app.read_public_json = original_json
+        market_app.get_eastmoney_batch_quote_rows = original_batch_rows
+        market_app.get_eastmoney_market_quotes = original_market_rows
+        market_app.get_quote_data = original_quote_data
+
+
+def test_market_quote_pagination() -> None:
+    original_json = market_app.read_public_json
+    try:
+        requested_pages: list[int] = []
+
+        def paged_market_rows(url: str, *_: object) -> dict:
+            match = market_app.re.search(r"(?:\?|&)pn=(\d+)", url)
+            assert match is not None
+            page = int(match.group(1))
+            requested_pages.append(page)
+            start = (page - 1) * 100
+            end = min(start + 100, 201)
+            return {
+                "data": {
+                    "total": 201,
+                    "diff": [
+                        {
+                            "f12": str(600000 + number),
+                            "f14": f"Test {number}",
+                            "f2": 10.0,
+                            "f3": 1.0,
+                            "f5": 100,
+                            "f6": 100000,
+                        }
+                        for number in range(start, end)
+                    ],
+                }
+            }
+
+        market_app.read_public_json = paged_market_rows
+        rows = market_app.get_eastmoney_market_quotes()
+        assert len(rows) == 201
+        assert set(requested_pages) == {1, 2, 3}
+    finally:
+        market_app.read_public_json = original_json
 
 
 def test_intraday_and_index_fallback_parsers() -> None:
@@ -527,6 +757,48 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_all_realtime_quotes = original_all_realtime_quotes
 
 
+def test_reliability_envelope_cache_and_health() -> None:
+    market_app.TOOL_CACHE.clear()
+    market_app.SOURCE_HEALTH.clear()
+    calls = 0
+
+    def loader() -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "symbol": "600519",
+            "source": "eastmoney",
+            "market_time": "2026-07-10T15:00:00+08:00",
+        }
+
+    key = market_app.cache_key("test", {"symbol": "600519"})
+    first, first_cache = market_app.get_cached_tool_data(key, 10, loader)
+    second, second_cache = market_app.get_cached_tool_data(key, 10, loader)
+    assert calls == 1
+    assert first == second
+    assert first_cache["cache_hit"] is False
+    assert second_cache["cache_hit"] is True
+
+    result = market_app.standardize_tool_success(first, market_app.perf_counter(), second_cache)
+    assert result["ok"] is True
+    assert result["source"] == ["eastmoney"]
+    assert result["cache_hit"] is True
+    assert result["data"]["symbol"] == "600519"
+    assert "latency_ms" in result
+
+    market_app.record_source_health("eastmoney", True, 42)
+    health = market_app.get_market_data_health_data()
+    eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
+    assert eastmoney["status"] == "healthy"
+    assert health["quote_route"]["status"] == "configured"
+
+    error = market_app.mcp_error(
+        "bad", market_app.HTTPException(status_code=400, detail="symbol is required.")
+    )
+    assert error["error_type"] == "invalid_symbol"
+    assert error["source_errors"][0]["error_type"] == "invalid_symbol"
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
@@ -535,15 +807,24 @@ def main() -> None:
     test_quote_timestamp_semantics()
     test_industry_board_parser()
     test_industry_board_deduplication()
+    test_market_structure_calculations()
+    test_batch_quotes_intraday_indicators_and_filtering()
+    test_market_quote_pagination()
     test_intraday_and_index_fallback_parsers()
+    test_reliability_envelope_cache_and_health()
+    market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
+    market_app.get_batch_quote_data = fake_get_batch_quote_data
     market_app.get_kline_data = fake_get_kline_data
     market_app.get_intraday_data = fake_get_intraday_data
+    market_app.get_auction_data = fake_get_auction_data
+    market_app.filter_a_share_securities_data = fake_filter_a_share_securities_data
     market_app.get_fund_flow_data = fake_get_fund_flow_data
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_news_data = fake_get_news_data
     market_app.get_market_overview_data = fake_get_market_overview_data
+    market_app.get_sector_rankings_data = fake_get_sector_rankings_data
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -590,12 +871,17 @@ def main() -> None:
         assert names == {
             "search_a_share",
             "get_a_share_quote",
+            "get_a_share_batch_quotes",
             "get_a_share_kline",
             "get_a_share_intraday",
+            "get_a_share_auction",
+            "filter_a_share_securities",
             "get_a_share_fund_flow",
             "get_a_share_financials",
             "get_a_share_news",
+            "get_a_share_sector_rankings",
             "get_a_share_market_overview",
+            "get_market_data_health",
         }
         assert all(tool["annotations"]["readOnlyHint"] is True for tool in registered_tools)
 
@@ -627,11 +913,14 @@ def main() -> None:
         assert result["ok"] is True
         assert result["symbol"] == "600519"
         assert "time" not in result
-        assert "market_time" not in result
+        assert result["market_time"] == "2026-07-10T15:00:00+08:00"
         assert result["trade_date"] == "2026-07-10"
         assert result["quote_time"] == "2026-07-10T15:00:00+08:00"
         assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
-        assert result["queried_at"] == "2026-07-10T00:05:00+00:00"
+        assert result["queried_at"] != "2026-07-10T00:05:00+00:00"
+        assert result["source"] == ["test"]
+        assert result["cache_hit"] is False
+        assert result["data"]["symbol"] == "600519"
         assert result["volume_unit"] == "share"
         assert result["turnover_unit"] == "CNY"
         assert "pe_dynamic" not in result
@@ -640,10 +929,15 @@ def main() -> None:
         for request_id, tool_name, arguments in (
             (5, "get_a_share_kline", {"symbol": "600519"}),
             (6, "get_a_share_intraday", {"symbol": "600519"}),
-            (7, "get_a_share_fund_flow", {"symbol": "600519"}),
-            (8, "get_a_share_financials", {"symbol": "600519"}),
-            (9, "get_a_share_news", {"symbol": "600519"}),
-            (10, "get_a_share_market_overview", {}),
+            (7, "get_a_share_batch_quotes", {"symbols": ["512760", "600519"]}),
+            (8, "get_a_share_auction", {"symbol": "600519"}),
+            (9, "filter_a_share_securities", {"change_pct_min": 1}),
+            (10, "get_a_share_fund_flow", {"symbol": "600519"}),
+            (11, "get_a_share_financials", {"symbol": "600519"}),
+            (12, "get_a_share_news", {"symbol": "600519"}),
+            (13, "get_a_share_sector_rankings", {"sector_type": "industry"}),
+            (14, "get_a_share_market_overview", {}),
+            (15, "get_market_data_health", {}),
         ):
             response = client.post(
                 "/mcp",
@@ -655,7 +949,11 @@ def main() -> None:
                 ),
             )
             assert response.status_code == 200, response.text
-            assert response.json()["result"]["structuredContent"]["ok"] is True
+            content = response.json()["result"]["structuredContent"]
+            assert content["ok"] is True
+            assert "source_errors" in content
+            assert "cache_hit" in content
+            assert "data" in content
 
     assert market_app.format_market_time("20260710150146") == "2026-07-10T15:01:46+08:00"
 
