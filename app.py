@@ -20,7 +20,7 @@ from mcp.types import ToolAnnotations
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
 
 MCP_INSTRUCTIONS = (
-    "Use these read-only tools for current A-share market data, intraday prices, news, "
+    "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "fund flows, financial metrics, and market overview. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
@@ -187,15 +187,81 @@ MARKET_TIMEZONE = timezone(timedelta(hours=8))
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
 
+# These codes are listed on the Shanghai and Shenzhen exchanges rather than being
+# ordinary company shares.  Keeping the prefixes here prevents a Shanghai ETF such
+# as 512760 from being sent to public sources as the incorrect sz512760 / 0.512760.
+ETF_PREFIXES = (
+    "510",
+    "511",
+    "512",
+    "513",
+    "515",
+    "516",
+    "517",
+    "518",
+    "560",
+    "561",
+    "562",
+    "563",
+    "588",
+    "159",
+)
+LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169")
+
 
 def normalize_symbol(symbol: str) -> str:
     normalized = symbol.strip()
     if not SYMBOL_PATTERN.fullmatch(normalized):
         raise HTTPException(
             status_code=400,
-            detail="symbol must be a six-digit A-share stock code.",
+            detail="symbol must be a six-digit mainland stock or exchange-listed fund code.",
         )
     return normalized
+
+
+def security_metadata(symbol: str) -> dict[str, str]:
+    """Classify a listed security and centralize source-specific market prefixes."""
+    symbol = normalize_symbol(symbol)
+    if symbol.startswith(("5", "6", "9")):
+        exchange = "SSE"
+        exchange_name = "Shanghai Stock Exchange"
+        market_prefix = "sh"
+        eastmoney_market = "1"
+        eastmoney_suffix = "SH"
+    elif symbol.startswith(("0", "1", "2", "3")):
+        exchange = "SZSE"
+        exchange_name = "Shenzhen Stock Exchange"
+        market_prefix = "sz"
+        eastmoney_market = "0"
+        eastmoney_suffix = "SZ"
+    elif symbol.startswith(("4", "8")):
+        exchange = "BSE"
+        exchange_name = "Beijing Stock Exchange"
+        market_prefix = "bj"
+        eastmoney_market = "0"
+        eastmoney_suffix = "BJ"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported mainland exchange code: {symbol}",
+        )
+
+    if symbol.startswith(ETF_PREFIXES):
+        security_type = "etf"
+    elif symbol.startswith(LOF_PREFIXES):
+        security_type = "lof"
+    else:
+        security_type = "a_share"
+
+    return {
+        "symbol": symbol,
+        "security_type": security_type,
+        "exchange": exchange,
+        "exchange_name": exchange_name,
+        "market_prefix": market_prefix,
+        "eastmoney_market": eastmoney_market,
+        "eastmoney_suffix": eastmoney_suffix,
+    }
 
 
 def now_iso() -> str:
@@ -280,13 +346,13 @@ def scaled(value: Any, divisor: float = 100) -> Any:
 
 
 def eastmoney_secid(symbol: str) -> str:
-    market = "1" if symbol.startswith(("6", "9")) else "0"
-    return f"{market}.{symbol}"
+    security = security_metadata(symbol)
+    return f"{security['eastmoney_market']}.{security['symbol']}"
 
 
 def market_symbol(symbol: str) -> str:
-    prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
-    return f"{prefix}{symbol}"
+    security = security_metadata(symbol)
+    return f"{security['market_prefix']}{security['symbol']}"
 
 
 def to_number(value: Any) -> float | None:
@@ -537,11 +603,16 @@ def search_tencent_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Tencent search format.")
 
-    market_names = {"sh": "沪A", "sz": "深A", "bj": "北交所"}
     results = []
     for candidate in text.split('"', 2)[1].split("^"):
         parts = candidate.split("~")
-        if len(parts) < 5 or parts[4] != "GP-A" or not SYMBOL_PATTERN.fullmatch(parts[1]):
+        if len(parts) < 5 or not SYMBOL_PATTERN.fullmatch(parts[1]):
+            continue
+        try:
+            security = security_metadata(parts[1])
+        except HTTPException:
+            continue
+        if parts[0].lower() != security["market_prefix"]:
             continue
         try:
             name = json.loads(f'"{parts[2]}"')
@@ -551,7 +622,8 @@ def search_tencent_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
             {
                 "symbol": parts[1],
                 "name": name,
-                "market": market_names.get(parts[0], parts[0]),
+                "market": security["exchange_name"],
+                "security_type": security["security_type"],
             }
         )
         if len(results) >= limit:
@@ -571,20 +643,24 @@ def search_sina_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Sina search format.")
 
-    market_names = {"sh": "沪A", "sz": "深A", "bj": "北交所"}
     results = []
     for candidate in text.split('"', 2)[1].split(";"):
         parts = candidate.split(",")
         if len(parts) < 4 or not SYMBOL_PATTERN.fullmatch(parts[2]):
             continue
         market_prefix = parts[3][:2].lower()
-        if market_prefix not in market_names:
+        try:
+            security = security_metadata(parts[2])
+        except HTTPException:
+            continue
+        if market_prefix != security["market_prefix"]:
             continue
         results.append(
             {
                 "symbol": parts[2],
                 "name": parts[0],
-                "market": market_names[market_prefix],
+                "market": security["exchange_name"],
+                "security_type": security["security_type"],
             }
         )
         if len(results) >= limit:
@@ -623,6 +699,7 @@ def search_stock_data(keyword: str, limit: int) -> dict[str, Any]:
 
 def get_quote_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
 
     try:
         data = get_all_realtime_quotes()
@@ -654,6 +731,12 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
 
     quote = normalize_quote_units(quote, source)
     quote.update(derive_quote_timestamps(quote.get("source_updated_at")))
+    quote.update(
+        {
+            "security_type": security["security_type"],
+            "exchange": security["exchange"],
+        }
+    )
 
     return {
         "quote": quote,
@@ -669,7 +752,15 @@ def get_kline_data(symbol: str, period: str, limit: int) -> dict[str, Any]:
     if klt is None:
         raise HTTPException(status_code=400, detail=f"Unsupported period: {period}")
 
-    return get_fallback_kline(symbol, period, klt, limit)
+    payload = get_fallback_kline(symbol, period, klt, limit)
+    security = security_metadata(symbol)
+    payload.update(
+        {
+            "security_type": security["security_type"],
+            "exchange": security["exchange"],
+        }
+    )
+    return payload
 
 
 def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
@@ -1049,7 +1140,13 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
-    secucode = f"{symbol}.{'SH' if symbol.startswith(('6', '9')) else 'SZ'}"
+    security = security_metadata(symbol)
+    if security["security_type"] in {"etf", "lof"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Financial statements are not applicable to exchange-listed funds.",
+        )
+    secucode = f"{symbol}.{security['eastmoney_suffix']}"
     query = urlencode(
         {
             "reportName": "RPT_F10_FINANCE_MAINFINADATA",
@@ -1070,6 +1167,8 @@ def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
 
     return {
         "symbol": symbol,
+        "security_type": security["security_type"],
+        "exchange": security["exchange"],
         "name": clean_value(rows[0].get("SECURITY_NAME_ABBR")),
         "count": len(rows),
         "items": [row_to_dict(row, FINANCIAL_RESPONSE_FIELDS) for row in rows],
@@ -1088,6 +1187,7 @@ def strip_html(value: Any) -> str | None:
 
 def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
     callback = "marketNewsCallback"
     parameters = {
         "uid": "",
@@ -1131,6 +1231,8 @@ def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
     ]
     return {
         "symbol": symbol,
+        "security_type": security["security_type"],
+        "exchange": security["exchange"],
         "count": len(items),
         "items": items,
         "source": "eastmoney",
@@ -1301,8 +1403,8 @@ def mcp_error(symbol: str | None, exc: HTTPException) -> dict[str, Any]:
 
 @mcp.tool(
     name="search_a_share",
-    title="Search A-share stocks",
-    description="Search A-share stocks by a stock code or company name before querying a quote.",
+    title="Search A-share stocks and listed funds",
+    description="Search A-share stocks, ETFs, and LOFs by code or name before querying a quote.",
     annotations=READ_ONLY_TOOL,
 )
 def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
@@ -1338,8 +1440,8 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
 
 @mcp.tool(
     name="get_a_share_quote",
-    title="Get an A-share quote",
-    description="Get the latest available price, daily change, trading range, volume, and turnover for one A-share stock code.",
+    title="Get a stock or listed-fund quote",
+    description="Get the latest available price, daily change, trading range, volume, and turnover for one A-share stock, ETF, or LOF code.",
     annotations=READ_ONLY_TOOL,
 )
 def get_a_share_quote(symbol: str) -> dict[str, Any]:
@@ -1360,6 +1462,8 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
     return {
         "ok": True,
         **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
+        "security_type": quote.get("security_type"),
+        "exchange": quote.get("exchange"),
         "source": payload["source"],
         "trade_date": quote.get("trade_date"),
         "quote_time": quote.get("quote_time"),
@@ -1371,8 +1475,8 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
 
 @mcp.tool(
     name="get_a_share_kline",
-    title="Get A-share price history",
-    description="Get up to 30 recent A-share price records for a daily, weekly, monthly, or intraday period.",
+    title="Get stock or listed-fund price history",
+    description="Get up to 30 recent A-share stock, ETF, or LOF price records for a daily, weekly, monthly, or intraday period.",
     annotations=READ_ONLY_TOOL,
 )
 def get_a_share_kline(
@@ -1400,6 +1504,8 @@ def get_a_share_kline(
     return {
         "ok": True,
         "symbol": payload["symbol"],
+        "security_type": payload.get("security_type"),
+        "exchange": payload.get("exchange"),
         "period": payload["period"],
         "count": payload["count"],
         "items": [

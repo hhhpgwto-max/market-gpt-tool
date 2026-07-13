@@ -219,6 +219,69 @@ def test_search_source_parser() -> None:
         market_app.read_market_text = original_text_reader
 
 
+def test_etf_market_routing_and_search() -> None:
+    etf = market_app.security_metadata("512760")
+    assert etf["security_type"] == "etf"
+    assert etf["exchange"] == "SSE"
+    assert market_app.market_symbol("512760") == "sh512760"
+    assert market_app.eastmoney_secid("512760") == "1.512760"
+
+    assert market_app.security_metadata("159915")["security_type"] == "etf"
+    assert market_app.market_symbol("159915") == "sz159915"
+    assert market_app.eastmoney_secid("159915") == "0.159915"
+    assert market_app.security_metadata("501050")["security_type"] == "lof"
+
+    original_text_reader = market_app.read_market_text
+    original_json_reader = market_app.read_public_json
+    try:
+        market_app.read_market_text = lambda *_: (
+            r'v_hint="sh~512760~\u56fd\u6cf0\u534a\u5bfc\u4f53ETF~gtbdt~ETF";'
+        )
+        tencent = market_app.search_tencent_stock("512760", 5)
+        assert tencent == [
+            {
+                "symbol": "512760",
+                "name": "国泰半导体ETF",
+                "market": "Shanghai Stock Exchange",
+                "security_type": "etf",
+            }
+        ]
+
+        market_app.read_market_text = lambda *_: (
+            'var suggestdata="国泰半导体ETF,14,512760,sh512760,国泰半导体ETF,,国泰半导体ETF,99,1,,";'
+        )
+        sina = market_app.search_sina_stock("512760", 5)
+        assert sina[0]["symbol"] == "512760"
+        assert sina[0]["security_type"] == "etf"
+
+        quote_urls: list[str] = []
+        market_app.read_market_text = lambda url, *_: (
+            quote_urls.append(url)
+            or 'var hq_str_sh512760="Test ETF,10.00,10.10,10.20,10.30,9.90,0,0,100,1000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2026-07-10,15:00:00";'
+        )
+        quote = market_app.get_sina_quote("512760")
+        assert quote["symbol"] == "512760"
+        assert quote_urls == ["http://hq.sinajs.cn/list=sh512760"]
+
+        kline_urls: list[str] = []
+        market_app.read_public_json = lambda url, *_: (
+            kline_urls.append(url)
+            or {
+                "data": {
+                    "sh512760": {
+                        "qfqday": [["2026-07-10", "10.0", "10.2", "10.3", "9.9", "1000"]]
+                    }
+                }
+            }
+        )
+        kline = market_app.get_tencent_kline("512760", "daily", 1)
+        assert kline["items"][0]["close"] == 10.2
+        assert "sh512760" in kline_urls[0]
+    finally:
+        market_app.read_market_text = original_text_reader
+        market_app.read_public_json = original_json_reader
+
+
 def test_quote_unit_normalization() -> None:
     result = market_app.normalize_quote_units(
         {"volume": 2603164, "turnover": 458798}, "tencent"
@@ -362,6 +425,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
+    test_etf_market_routing_and_search()
     test_quote_unit_normalization()
     test_quote_timestamp_semantics()
     test_intraday_and_index_fallback_parsers()
