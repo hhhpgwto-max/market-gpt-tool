@@ -240,8 +240,13 @@ def test_intraday_and_index_fallback_parsers() -> None:
     original_json = market_app.read_public_json
     original_text = market_app.read_market_text
     original_eastmoney_intraday = market_app.get_eastmoney_intraday
+    original_tencent_intraday = market_app.get_tencent_intraday
     original_eastmoney_indices = market_app.get_eastmoney_indices
+    original_tencent_indices = market_app.get_tencent_indices
+    original_eastmoney_fund_flow = market_app.get_eastmoney_fund_flow
+    original_sina_fund_flow = market_app.get_sina_fund_flow
     original_sina_quote = market_app.get_sina_quote
+    original_all_realtime_quotes = market_app.get_all_realtime_quotes
     try:
         market_app.get_eastmoney_intraday = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="blocked")
@@ -263,9 +268,30 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert intraday["items"][1]["turnover"] == 3030
         assert intraday["items"][1]["volume_unit"] == "share"
 
-        market_app.get_eastmoney_indices = lambda: (_ for _ in ()).throw(
-            market_app.HTTPException(status_code=502, detail="blocked")
+        market_app.read_public_json = lambda *_: {
+            "data": {"sh600519": {"data": {"date": "20261399", "data": ["0930 10 2 2"]}}}
+        }
+        try:
+            market_app.get_tencent_intraday("600519", 1)
+            raise AssertionError("Expected malformed Tencent date to fail.")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 502
+
+        market_app.get_eastmoney_intraday = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=404, detail="not found")
         )
+        market_app.get_tencent_intraday = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=404, detail="not found")
+        )
+        try:
+            market_app.get_intraday_data("600519", 1)
+            raise AssertionError("Expected all-not-found intraday sources to return 404.")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 404
+        market_app.get_tencent_intraday = original_tencent_intraday
+
+        market_app.get_eastmoney_indices = lambda: []
+        market_app.get_all_realtime_quotes = lambda: market_app.pd.DataFrame()
         fields = [""] * 33
         fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
         fields[30:33] = ["20260710150000", "1.0", "1.01"]
@@ -275,28 +301,62 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert overview["indices"][0]["change"] == 1.0
         assert overview["indices"][0]["change_pct"] == 1.01
 
-        market_app.read_public_json = lambda *_: {
-            "name": "Test",
-            "r0_in": "3000",
-            "r0_out": "1000",
-            "netamount": "1500",
-            "trade": "10.10",
-            "changeratio": "0.01",
-        }
+        market_app.read_market_text = lambda *_: 'v_sh000001="' + "~".join([""] * 32) + '";'
+        try:
+            market_app.get_tencent_indices()
+            raise AssertionError("Expected short Tencent index row to fail.")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 502
+
+        market_app.get_tencent_indices = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="blocked")
+        )
+        market_app.read_market_text = lambda *_: (
+            'var hq_str_s_sh000001="Test Index,100.0,1.0,1.01,0,0";'
+        )
+        overview = market_app.get_market_overview_data(3)
+        assert overview["index_source"] == "sina"
+        assert overview["indices"][0]["price"] == 100.0
+
+        market_app.get_eastmoney_fund_flow = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="blocked")
+        )
+        market_app.read_market_text = lambda *_: (
+            '({r0_in:"3000",r0_out:"1000",netamount:"1500",name:"Test",'
+            'trade:"10.10",changeratio:"0.01"});'
+        )
         market_app.get_sina_quote = lambda *_: {
             "source_updated_at": "2026-07-10T15:00:00+08:00"
         }
-        fund_flow = market_app.get_sina_fund_flow("600519", 5)
+        fund_flow = market_app.get_fund_flow_data("600519", 5)
+        assert fund_flow["source"] == "sina"
         assert fund_flow["data_status"] == "partial_data"
         assert fund_flow["count"] == 1
         assert fund_flow["items"][0]["main_net_inflow"] == 2000
         assert fund_flow["items"][0]["change_pct"] == 1.0
+
+        market_app.get_eastmoney_fund_flow = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=404, detail="not found")
+        )
+        market_app.get_sina_fund_flow = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=404, detail="not found")
+        )
+        try:
+            market_app.get_fund_flow_data("600519", 1)
+            raise AssertionError("Expected all-not-found fund-flow sources to return 404.")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 404
     finally:
         market_app.read_public_json = original_json
         market_app.read_market_text = original_text
         market_app.get_eastmoney_intraday = original_eastmoney_intraday
+        market_app.get_tencent_intraday = original_tencent_intraday
         market_app.get_eastmoney_indices = original_eastmoney_indices
+        market_app.get_tencent_indices = original_tencent_indices
+        market_app.get_eastmoney_fund_flow = original_eastmoney_fund_flow
+        market_app.get_sina_fund_flow = original_sina_fund_flow
         market_app.get_sina_quote = original_sina_quote
+        market_app.get_all_realtime_quotes = original_all_realtime_quotes
 
 
 def main() -> None:

@@ -351,6 +351,20 @@ def read_public_jsonp(url: str, referer: str) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"Failed to fetch public market news: {exc}") from exc
 
 
+def read_sina_object(url: str, referer: str) -> dict[str, Any]:
+    try:
+        text = read_market_text(url, referer).strip().rstrip(";").strip()
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        text = re.sub(r'([,{]\s*)([A-Za-z_]\w*)\s*:', r'\1"\2":', text)
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected Sina object response.")
+        return payload
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina market data: {exc}") from exc
+
+
 def get_tencent_quote(symbol: str) -> dict[str, Any]:
     url = f"http://qt.gtimg.cn/q={market_symbol(symbol)}"
     try:
@@ -857,7 +871,13 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
     rows = data.get("data") or []
     trade_date = clean_value(data.get("date"))
     if trade_date and re.fullmatch(r"\d{8}", str(trade_date)):
-        trade_date = datetime.strptime(str(trade_date), "%Y%m%d").date().isoformat()
+        try:
+            trade_date = datetime.strptime(str(trade_date), "%Y%m%d").date().isoformat()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unexpected Tencent intraday date for {symbol}: {trade_date}",
+            ) from exc
     if not rows or not trade_date:
         raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
 
@@ -903,6 +923,7 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
 
 def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
     errors = []
+    all_not_found = True
     for source, getter in (
         ("eastmoney", get_eastmoney_intraday),
         ("tencent", get_tencent_intraday),
@@ -911,7 +932,9 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
             return getter(symbol, limit)
         except HTTPException as exc:
             errors.append(f"{source}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+            all_not_found = all_not_found and exc.status_code == 404
+    status_code = 404 if all_not_found else 502
+    raise HTTPException(status_code=status_code, detail="; ".join(errors))
 
 
 def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
@@ -968,7 +991,7 @@ def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
 def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     code = market_symbol(symbol)
-    payload = read_public_json(
+    payload = read_sina_object(
         "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
         f"MoneyFlow.ssi_ssfx_flzjtj?daima={code}",
         "https://finance.sina.com.cn/",
@@ -1010,6 +1033,7 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
     errors = []
+    all_not_found = True
     for source, getter in (
         ("eastmoney", get_eastmoney_fund_flow),
         ("sina", get_sina_fund_flow),
@@ -1018,7 +1042,9 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
             return getter(symbol, limit)
         except HTTPException as exc:
             errors.append(f"{source}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+            all_not_found = all_not_found and exc.status_code == 404
+    status_code = 404 if all_not_found else 502
+    raise HTTPException(status_code=status_code, detail="; ".join(errors))
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
@@ -1127,6 +1153,8 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
         "https://quote.eastmoney.com/",
     )
     index_rows = ((index_payload.get("data") or {}).get("diff")) or []
+    if not index_rows:
+        raise HTTPException(status_code=502, detail="Eastmoney returned no major-index rows.")
     return [
         {
             "symbol": clean_value(row.get("f12")),
@@ -1152,7 +1180,7 @@ def get_tencent_indices() -> list[dict[str, Any]]:
     indices = []
     for match in re.finditer(r'v_\w+="([^"]*)"', text):
         values = match.group(1).split("~")
-        if len(values) < 32:
+        if len(values) < 33:
             continue
         indices.append(
             {
@@ -1171,13 +1199,48 @@ def get_tencent_indices() -> list[dict[str, Any]]:
     return indices
 
 
+def get_sina_indices() -> list[dict[str, Any]]:
+    try:
+        text = read_market_text(
+            "https://hq.sinajs.cn/list=s_sh000001,s_sz399001,s_sz399006",
+            "https://finance.sina.com.cn/",
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina indices: {exc}") from exc
+    indices = []
+    for match in re.finditer(r'var hq_str_s_(?:sh|sz)(\d+)="([^"]*)";', text):
+        values = match.group(2).split(",")
+        if len(values) < 4 or not values[0]:
+            continue
+        indices.append(
+            {
+                "symbol": match.group(1),
+                "name": clean_value(values[0]),
+                "price": to_number(values[1]),
+                "change": to_number(values[2]),
+                "change_pct": to_number(values[3]),
+                "open": None,
+                "previous_close": None,
+            }
+        )
+    if not indices:
+        raise HTTPException(status_code=502, detail="Unexpected Sina index response.")
+    return indices
+
+
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     index_errors = []
     indices = []
     index_source = "unavailable"
-    for source, getter in (("eastmoney", get_eastmoney_indices), ("tencent", get_tencent_indices)):
+    for source, getter in (
+        ("eastmoney", get_eastmoney_indices),
+        ("tencent", get_tencent_indices),
+        ("sina", get_sina_indices),
+    ):
         try:
             indices = getter()
+            if not indices:
+                raise HTTPException(status_code=502, detail=f"{source} returned no major-index rows.")
             index_source = source
             break
         except HTTPException as exc:
@@ -1187,32 +1250,33 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
 
     boards: list[dict[str, Any]] = []
     board_source = "unavailable"
-    try:
-        data = get_all_realtime_quotes()
-        industry_column = next(
-            (column for column in ("所属行业", "所处行业", "行业") if column in data.columns),
-            None,
-        )
-        if industry_column and "涨跌幅" in data.columns:
-            grouped: dict[str, list[float]] = {}
-            for _, row in data.iterrows():
-                industry = clean_value(row.get(industry_column))
-                change_pct = to_number(row.get("涨跌幅"))
-                if industry and change_pct is not None:
-                    grouped.setdefault(str(industry), []).append(change_pct)
-            boards = [
-                {
-                    "name": name,
-                    "average_change_pct": round(sum(changes) / len(changes), 2),
-                    "stock_count": len(changes),
-                }
-                for name, changes in grouped.items()
-            ]
-            boards.sort(key=lambda item: item["average_change_pct"], reverse=True)
-            boards = boards[:limit]
-            board_source = "efinance_calculated"
-    except (HTTPException, OSError, ValueError, TypeError):
-        pass
+    if index_source == "eastmoney":
+        try:
+            data = get_all_realtime_quotes()
+            industry_column = next(
+                (column for column in ("所属行业", "所处行业", "行业") if column in data.columns),
+                None,
+            )
+            if industry_column and "涨跌幅" in data.columns:
+                grouped: dict[str, list[float]] = {}
+                for _, row in data.iterrows():
+                    industry = clean_value(row.get(industry_column))
+                    change_pct = to_number(row.get("涨跌幅"))
+                    if industry and change_pct is not None:
+                        grouped.setdefault(str(industry), []).append(change_pct)
+                boards = [
+                    {
+                        "name": name,
+                        "average_change_pct": round(sum(changes) / len(changes), 2),
+                        "stock_count": len(changes),
+                    }
+                    for name, changes in grouped.items()
+                ]
+                boards.sort(key=lambda item: item["average_change_pct"], reverse=True)
+                boards = boards[:limit]
+                board_source = "efinance_calculated"
+        except (HTTPException, OSError, ValueError, TypeError):
+            pass
 
     return {
         "indices": indices,
