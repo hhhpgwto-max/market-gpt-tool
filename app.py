@@ -2903,12 +2903,62 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
             "secids": "1.000002,0.399107,0.899050",
         }
     )
-    payload = read_public_json(
-        f"https://push2.eastmoney.com/api/qt/ulist.np/get?{query}",
-        "https://quote.eastmoney.com/",
-        timeout=2,
-        attempts=1,
+    hosts = (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
     )
+    executor = ThreadPoolExecutor(max_workers=len(hosts))
+    futures = {
+        executor.submit(
+            read_public_json,
+            f"https://{host}/api/qt/ulist.np/get?{query}",
+            "https://quote.eastmoney.com/",
+            2,
+            1,
+        ): host
+        for host in hosts
+    }
+    pending = set(futures)
+    payload: dict[str, Any] | None = None
+    errors: list[str] = []
+    deadline = perf_counter() + 2.2
+    try:
+        while pending and payload is None:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                host = futures[future]
+                try:
+                    candidate = future.result()
+                    if not (((candidate.get("data") or {}).get("diff")) or []):
+                        raise HTTPException(
+                            status_code=502,
+                            detail="aggregate response contained no rows",
+                        )
+                    payload = candidate
+                    break
+                except HTTPException as exc:
+                    errors.append(f"{host}: {exc.detail}")
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{host}: {exc}")
+        for future in pending:
+            future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if payload is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Fast market aggregate unavailable within 2.2 seconds: " + "; ".join(errors),
+        )
     rows = ((payload.get("data") or {}).get("diff")) or []
     exchange_by_symbol = {"000002": "SSE", "399107": "SZSE", "899050": "BSE"}
     parsed: dict[str, dict[str, Any]] = {}
@@ -3295,6 +3345,15 @@ def get_market_data_health_data() -> dict[str, Any]:
             "status": "configured",
             "providers": ["eastmoney", "tencent"],
             "strategy": "parallel_fastest_success_with_4_second_total_budget_and_session_filter",
+        },
+        "market_overview_route": {
+            "status": "configured",
+            "breadth_providers": [
+                "eastmoney_push2",
+                "eastmoney_push2delay",
+                "eastmoney_82_push2",
+            ],
+            "strategy": "parallel_fastest_exchange_aggregate_v2_with_paged_fallback",
         },
         "etf_route": {
             "status": "configured",
