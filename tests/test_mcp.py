@@ -660,6 +660,7 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
     original_text = market_app.read_market_text
     original_eastmoney_rows = market_app.get_eastmoney_market_quotes
     original_sina_rows = market_app.get_sina_market_quotes
+    original_aggregate = market_app.get_eastmoney_market_aggregate
     try:
         market_app.read_market_text = lambda *_args, **_kwargs: '"201"'
 
@@ -695,6 +696,9 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
         market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="blocked")
         )
+        market_app.get_eastmoney_market_aggregate = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="aggregate blocked")
+        )
         market_app.get_sina_market_quotes = lambda: sina
         breadth = market_app.get_overview_breadth_component()
         assert breadth["source"] == "sina_all_a_shares"
@@ -705,6 +709,33 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
         market_app.read_market_text = original_text
         market_app.get_eastmoney_market_quotes = original_eastmoney_rows
         market_app.get_sina_market_quotes = original_sina_rows
+        market_app.get_eastmoney_market_aggregate = original_aggregate
+
+
+def test_fast_market_aggregate() -> None:
+    original_json = market_app.read_public_json
+    try:
+        market_app.read_public_json = lambda *_args, **_kwargs: {
+            "data": {
+                "diff": [
+                    {"f12": "000002", "f104": 10, "f105": 20, "f106": 2, "f6": 1000, "f124": 1783930322},
+                    {"f12": "399107", "f104": 30, "f105": 40, "f106": 3, "f6": 2000, "f124": 1783930305},
+                    {"f12": "899050", "f104": 5, "f105": 6, "f106": 1, "f6": 300, "f124": 1783928233},
+                ]
+            }
+        }
+        component = market_app.get_eastmoney_market_aggregate()
+        totals = component["breadth"]["all_market"]
+        assert totals["stock_count"] == 117
+        assert totals["rise_count"] == 45
+        assert totals["fall_count"] == 66
+        assert totals["flat_count"] == 6
+        assert totals["limit_up_count"] is None
+        assert component["turnover"]["current"] == 3300
+        assert component["coverage_status"] == "complete_exchange_aggregate"
+        assert component["market_time"] == "2026-07-13T15:00:00+08:00"
+    finally:
+        market_app.read_public_json = original_json
 
 
 def test_intraday_and_index_fallback_parsers() -> None:
@@ -911,6 +942,7 @@ def main() -> None:
     test_intraday_session_filter_and_market_time_cap()
     test_market_quote_pagination()
     test_sina_market_pagination_and_breadth_fallback()
+    test_fast_market_aggregate()
     test_intraday_and_index_fallback_parsers()
     test_reliability_envelope_cache_and_health()
     market_app.TOOL_CACHE.clear()
