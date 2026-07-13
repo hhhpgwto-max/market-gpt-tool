@@ -1330,6 +1330,70 @@ def get_sina_indices() -> list[dict[str, Any]]:
     return indices
 
 
+def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
+    query = urlencode(
+        {
+            "pn": 1,
+            "pz": limit,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": "m:90+t:2",
+            "fields": "f12,f14,f2,f3,f4",
+        }
+    )
+    payload = read_public_json(
+        f"https://push2.eastmoney.com/api/qt/clist/get?{query}",
+        "https://quote.eastmoney.com/",
+    )
+    rows = ((payload.get("data") or {}).get("diff")) or []
+    if not rows:
+        raise HTTPException(status_code=502, detail="Eastmoney returned no industry-board rows.")
+    return [
+        {
+            "symbol": clean_value(row.get("f12")),
+            "name": clean_value(row.get("f14")),
+            "price": to_number(row.get("f2")),
+            "change_pct": to_number(row.get("f3")),
+            "change": to_number(row.get("f4")),
+        }
+        for row in rows[:limit]
+        if row.get("f14")
+    ]
+
+
+def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
+    data = get_all_realtime_quotes()
+    industry_column = next(
+        (column for column in ("所属行业", "所处行业", "行业") if column in data.columns),
+        None,
+    )
+    if not industry_column or "涨跌幅" not in data.columns:
+        raise HTTPException(status_code=502, detail="Realtime quotes did not include industry data.")
+
+    grouped: dict[str, list[float]] = {}
+    for _, row in data.iterrows():
+        industry = clean_value(row.get(industry_column))
+        change_pct = to_number(row.get("涨跌幅"))
+        if industry and change_pct is not None:
+            grouped.setdefault(str(industry), []).append(change_pct)
+    boards = [
+        {
+            "name": name,
+            "change_pct": round(sum(changes) / len(changes), 2),
+            "average_change_pct": round(sum(changes) / len(changes), 2),
+            "stock_count": len(changes),
+        }
+        for name, changes in grouped.items()
+    ]
+    boards.sort(key=lambda item: item["change_pct"], reverse=True)
+    if not boards:
+        raise HTTPException(status_code=502, detail="Realtime quotes produced no industry-board data.")
+    return boards[:limit]
+
+
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     index_errors = []
     indices = []
@@ -1350,43 +1414,31 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     if not indices:
         raise HTTPException(status_code=502, detail="; ".join(index_errors))
 
+    board_errors = []
     boards: list[dict[str, Any]] = []
     board_source = "unavailable"
-    if index_source == "eastmoney":
+    for source, getter in (
+        ("eastmoney_industry", get_eastmoney_industry_boards),
+        ("efinance_calculated", get_calculated_industry_boards),
+    ):
         try:
-            data = get_all_realtime_quotes()
-            industry_column = next(
-                (column for column in ("所属行业", "所处行业", "行业") if column in data.columns),
-                None,
-            )
-            if industry_column and "涨跌幅" in data.columns:
-                grouped: dict[str, list[float]] = {}
-                for _, row in data.iterrows():
-                    industry = clean_value(row.get(industry_column))
-                    change_pct = to_number(row.get("涨跌幅"))
-                    if industry and change_pct is not None:
-                        grouped.setdefault(str(industry), []).append(change_pct)
-                boards = [
-                    {
-                        "name": name,
-                        "average_change_pct": round(sum(changes) / len(changes), 2),
-                        "stock_count": len(changes),
-                    }
-                    for name, changes in grouped.items()
-                ]
-                boards.sort(key=lambda item: item["average_change_pct"], reverse=True)
-                boards = boards[:limit]
-                board_source = "efinance_calculated"
-        except (HTTPException, OSError, ValueError, TypeError):
-            pass
+            boards = getter(limit)
+            if not boards:
+                raise HTTPException(status_code=502, detail=f"{source} returned no industry-board rows.")
+            board_source = source
+            break
+        except (HTTPException, OSError, ValueError, TypeError) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            board_errors.append(f"{source}: {detail}")
 
     return {
         "indices": indices,
         "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
+        "industry_board_errors": board_errors if not boards else [],
         "queried_at": now_iso(),
-        "note": "Industry-board changes are calculated from available constituent quotes when present.",
+        "note": "Industry-board data uses public sector quotes when available, with a calculated fallback.",
     }
 
 

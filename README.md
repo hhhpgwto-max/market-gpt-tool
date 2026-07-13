@@ -33,7 +33,7 @@ ChatGPT Business 自定义应用填写方式：
 - `get_a_share_fund_flow`：查询最多 10 个交易日的公开资金流估算。
 - `get_a_share_financials`：查询最多 4 期公开财务关键指标。
 - `get_a_share_news`：查询最多 10 条提及该股票代码的公开新闻。
-- `get_a_share_market_overview`：查询上证、深证、创业板指数，以及可用时的行业板块表现。
+- `get_a_share_market_overview`：查询上证、深证、创业板指数和涨跌居前的行业板块。
 
 全部工具都标记为只读，不创建、修改或删除任何数据。
 
@@ -43,6 +43,7 @@ ChatGPT Business 自定义应用填写方式：
 - 报价中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 已统一换算为人民币元，`turnover_unit` 固定为 `CNY`。
 - 代码会先识别证券类别和交易所，再转换为各数据源需要的格式。例如上交所 ETF `512760` 会使用 `sh512760`（腾讯/新浪）和 `1.512760`（东方财富），不会误当成深市股票。股票、ETF 和 LOF 名称搜索优先使用腾讯轻量接口，结果为空时自动回退新浪。
 - K 线中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 使用人民币元，`turnover_unit` 固定为 `CNY`。`latest_trade_date` 是最后一根 K 线所属交易日。K 线优先直连东方财富，失败时自动回退腾讯。
+- 大盘概览会分别获取三大指数和行业板块；行业板块优先使用东方财富行业板块行情，临时不可用时再从全市场公开行情计算，避免因指数来源切换而返回空数组。
 
 ## 本地运行
 
