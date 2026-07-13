@@ -1667,7 +1667,7 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
     pending = set(futures)
     errors: list[str] = []
     status_codes: list[int] = []
-    deadline = perf_counter() + 4
+    deadline = perf_counter() + 9
     try:
         while pending:
             remaining = deadline - perf_counter()
@@ -1692,7 +1692,7 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
                     status_codes.append(502)
         for future in pending:
             future.cancel()
-            errors.append(f"{futures[future]}: request exceeded the 4 second budget")
+            errors.append(f"{futures[future]}: request exceeded the 9 second budget")
             status_codes.append(502)
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -2813,7 +2813,7 @@ def get_fastest_index_component() -> dict[str, Any]:
     pending = set(futures)
     successes: list[tuple[str, list[dict[str, Any]]]] = []
     errors: list[str] = []
-    deadline = perf_counter() + 3.2
+    deadline = perf_counter() + 8.5
     try:
         while pending:
             remaining = deadline - perf_counter()
@@ -2860,7 +2860,7 @@ def get_fastest_index_component() -> dict[str, Any]:
         for future in pending:
             future.cancel()
             errors.append(
-                f"{futures[future]}: index request exceeded the 3.2 second budget"
+                f"{futures[future]}: index request exceeded the 8.5 second budget"
             )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -2914,7 +2914,7 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
             read_public_json,
             f"https://{host}/api/qt/ulist.np/get?{query}",
             "https://quote.eastmoney.com/",
-            2,
+            5,
             1,
         ): host
         for host in hosts
@@ -2922,7 +2922,7 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
     pending = set(futures)
     payload: dict[str, Any] | None = None
     errors: list[str] = []
-    deadline = perf_counter() + 2.2
+    deadline = perf_counter() + 6.5
     try:
         while pending and payload is None:
             remaining = deadline - perf_counter()
@@ -2957,7 +2957,7 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
     if payload is None:
         raise HTTPException(
             status_code=502,
-            detail="Fast market aggregate unavailable within 2.2 seconds: " + "; ".join(errors),
+            detail="Fast market aggregate unavailable within 6.5 seconds: " + "; ".join(errors),
         )
     rows = ((payload.get("data") or {}).get("diff")) or []
     exchange_by_symbol = {"000002": "SSE", "399107": "SZSE", "899050": "BSE"}
@@ -3049,98 +3049,35 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
 
 
 def get_overview_breadth_component() -> dict[str, Any]:
-    aggregate_error: str | None = None
     try:
         return get_eastmoney_market_aggregate()
     except (HTTPException, OSError, ValueError, TypeError) as exc:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        aggregate_error = f"eastmoney_a_share_exchange_aggregate: {detail}"
-
-    source_getters = (
-        (
-            "eastmoney_all_a_shares",
-            lambda: {
-                "rows": get_eastmoney_market_quotes(),
-                "coverage_status": "complete",
-                "source_errors": [],
-            },
-        ),
-        ("sina_all_a_shares", get_sina_market_quotes),
-    )
-    executor = ThreadPoolExecutor(max_workers=len(source_getters))
-    futures = {executor.submit(getter): source for source, getter in source_getters}
-    pending = set(futures)
-    errors: list[str] = [aggregate_error] if aggregate_error else []
-    deadline = perf_counter() + 5.5
-    try:
-        while pending:
-            remaining = deadline - perf_counter()
-            if remaining <= 0:
-                break
-            completed, pending = wait(
-                pending,
-                timeout=remaining,
-                return_when=FIRST_COMPLETED,
-            )
-            if not completed:
-                break
-            for future in completed:
-                source = futures[future]
-                try:
-                    payload = future.result()
-                    rows = payload["rows"]
-                    if not rows:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"{source} returned no usable stock rows.",
-                        )
-                    market_times = [
-                        row["market_time"] for row in rows if row.get("market_time")
-                    ]
-                    market_time = max(market_times) if market_times else None
-                    return {
-                        "breadth": calculate_market_breadth(rows),
-                        "turnover": market_turnover_summary(rows, market_time),
-                        "market_time": market_time,
-                        "row_count": len(rows),
-                        "coverage_status": payload.get("coverage_status", "complete"),
-                        "source": source,
-                        "source_errors": errors + payload.get("source_errors", []),
-                    }
-                except (HTTPException, OSError, ValueError, TypeError) as exc:
-                    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-                    errors.append(f"{source}: {detail}")
-                except Exception as exc:  # pragma: no cover - defensive source boundary
-                    errors.append(f"{source}: {exc}")
-        for future in pending:
-            future.cancel()
-            errors.append(
-                f"{futures[future]}: breadth request exceeded the 5.5 second budget"
-            )
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+        raise HTTPException(
+            status_code=502,
+            detail=f"eastmoney_a_share_exchange_aggregate: {detail}",
+        ) from exc
 
 
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     started_at = perf_counter()
-    response_budget_seconds = 6.0
+    response_budget_seconds = 9.0
     component_specs = {
         "indices": {
             "key": cache_key("overview_component_indices", {}),
-            "ttl": 2,
+            "ttl": 30,
             "max_stale_age": 60,
             "loader": get_fastest_index_component,
         },
         "industry_boards": {
             "key": cache_key("overview_component_boards", {"limit": limit}),
-            "ttl": 15,
+            "ttl": 30,
             "max_stale_age": 300,
             "loader": lambda: get_overview_board_component(limit),
         },
         "market_breadth": {
             "key": cache_key("overview_component_breadth", {}),
-            "ttl": 15,
+            "ttl": 30,
             "max_stale_age": 180,
             "loader": get_overview_breadth_component,
         },
@@ -3344,7 +3281,7 @@ def get_market_data_health_data() -> dict[str, Any]:
         "intraday_route": {
             "status": "configured",
             "providers": ["eastmoney", "tencent"],
-            "strategy": "parallel_fastest_success_with_4_second_total_budget_and_session_filter",
+            "strategy": "parallel_fastest_success_with_9_second_total_budget_and_session_filter",
         },
         "market_overview_route": {
             "status": "configured",
@@ -3353,7 +3290,7 @@ def get_market_data_health_data() -> dict[str, Any]:
                 "eastmoney_push2delay",
                 "eastmoney_82_push2",
             ],
-            "strategy": "parallel_fastest_exchange_aggregate_v2_with_paged_fallback",
+            "strategy": "parallel_fastest_exchange_aggregate_v3_production_latency_budget",
         },
         "etf_route": {
             "status": "configured",
