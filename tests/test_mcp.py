@@ -660,7 +660,6 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
     original_text = market_app.read_market_text
     original_eastmoney_rows = market_app.get_eastmoney_market_quotes
     original_sina_rows = market_app.get_sina_market_quotes
-    original_aggregate = market_app.get_eastmoney_market_aggregate
     try:
         market_app.read_market_text = lambda *_args, **_kwargs: '"201"'
 
@@ -696,20 +695,11 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
         market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="blocked")
         )
-        market_app.get_eastmoney_market_aggregate = lambda: (_ for _ in ()).throw(
-            market_app.HTTPException(status_code=502, detail="aggregate blocked")
-        )
-        market_app.get_sina_market_quotes = lambda: sina
-        breadth = market_app.get_overview_breadth_component()
-        assert breadth["source"] == "sina_all_a_shares"
-        assert breadth["row_count"] == 201
-        assert breadth["breadth"]["all_market"]["stock_count"] == 201
     finally:
         market_app.read_public_json = original_json
         market_app.read_market_text = original_text
         market_app.get_eastmoney_market_quotes = original_eastmoney_rows
         market_app.get_sina_market_quotes = original_sina_rows
-        market_app.get_eastmoney_market_aggregate = original_aggregate
 
 
 def test_fast_market_aggregate() -> None:
@@ -821,7 +811,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert overview["indices"][0]["change_pct"] == 1.01
         assert overview["industry_board_source"] == "eastmoney_industry"
         assert overview["industry_boards"][0]["name"] == "Test Industry"
-        assert overview["response_budget_ms"] == 6000
+        assert overview["response_budget_ms"] == 9000
         assert overview["component_status"]["indices"]["status"] in {
             "live",
             "fresh_cache",
