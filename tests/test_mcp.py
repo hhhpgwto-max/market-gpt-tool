@@ -330,6 +330,8 @@ def test_industry_board_parser() -> None:
             {
                 "symbol": "BK0001",
                 "name": "Test Industry",
+                "industry_name": "Test Industry",
+                "industry_level": None,
                 "price": 100.5,
                 "change_pct": 2.3,
                 "change": 2.25,
@@ -348,6 +350,8 @@ def test_industry_board_parser() -> None:
             {
                 "symbol": "BK0001",
                 "name": "Test Industry",
+                "industry_name": "Test Industry",
+                "industry_level": None,
                 "price": 100.5,
                 "change_pct": 2.3,
                 "change": 2.25,
@@ -355,6 +359,20 @@ def test_industry_board_parser() -> None:
         ]
     finally:
         market_app.read_public_json = original_json
+
+
+def test_industry_board_deduplication() -> None:
+    boards = market_app.deduplicate_industry_boards(
+        [
+            {"name": "中药Ⅲ", "industry_name": "中药", "industry_level": "Ⅲ", "change_pct": 3.26},
+            {"name": "中药Ⅱ", "industry_name": "中药", "industry_level": "Ⅱ", "change_pct": 3.26},
+            {"name": "油气开采Ⅲ", "industry_name": "油气开采", "industry_level": "Ⅲ", "change_pct": 2.17},
+            {"name": "油气开采Ⅱ", "industry_name": "油气开采", "industry_level": "Ⅱ", "change_pct": 2.17},
+            {"name": "国有大型银行Ⅲ", "industry_name": "国有大型银行", "industry_level": "Ⅲ", "change_pct": 2.07},
+        ],
+        5,
+    )
+    assert [board["name"] for board in boards] == ["中药Ⅱ", "油气开采Ⅱ", "国有大型银行Ⅲ"]
 
 
 def test_intraday_and_index_fallback_parsers() -> None:
@@ -370,6 +388,18 @@ def test_intraday_and_index_fallback_parsers() -> None:
     original_sina_quote = market_app.get_sina_quote
     original_all_realtime_quotes = market_app.get_all_realtime_quotes
     try:
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "name": "Test Stock",
+                "preClose": 9.9,
+                "trends": ["2026-07-10 09:30,10.00,10.10,10.20,9.90,2,2000,10.05"],
+            }
+        }
+        eastmoney_intraday = market_app.get_eastmoney_intraday("600519", 1)
+        assert eastmoney_intraday["items"][0]["volume"] == 200
+        assert eastmoney_intraday["items"][0]["volume_unit"] == "share"
+        assert eastmoney_intraday["items"][0]["turnover_unit"] == "CNY"
+
         market_app.get_eastmoney_intraday = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="blocked")
         )
@@ -494,6 +524,7 @@ def main() -> None:
     test_quote_unit_normalization()
     test_quote_timestamp_semantics()
     test_industry_board_parser()
+    test_industry_board_deduplication()
     test_intraday_and_index_fallback_parsers()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data

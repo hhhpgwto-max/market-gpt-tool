@@ -43,7 +43,9 @@ ChatGPT Business 自定义应用填写方式：
 - 报价中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 已统一换算为人民币元，`turnover_unit` 固定为 `CNY`。
 - 代码会先识别证券类别和交易所，再转换为各数据源需要的格式。例如上交所 ETF `512760` 会使用 `sh512760`（腾讯/新浪）和 `1.512760`（东方财富），不会误当成深市股票。股票、ETF 和 LOF 名称搜索优先使用腾讯轻量接口，结果为空时自动回退新浪。
 - K 线中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 使用人民币元，`turnover_unit` 固定为 `CNY`。`latest_trade_date` 是最后一根 K 线所属交易日。K 线优先直连东方财富，失败时自动回退腾讯。
+- 分钟线中的 `volume` 同样统一为股，`volume_unit` 固定为 `share`；`turnover_unit` 固定为 `CNY`。
 - 大盘概览会分别获取三大指数和行业板块；行业板块会依次尝试东方财富的多个公开入口，临时不可用时再从全市场公开行情计算，避免因单一入口或指数来源切换而返回空数组。
+- 行业板块默认会合并同名的二级、三级行业，优先保留层级更高的记录，并返回 `industry_name` 与 `industry_level` 说明层级。
 
 ## 本地运行
 
