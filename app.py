@@ -186,6 +186,8 @@ INDEX_SECIDS = "1.000001,0.399001,0.399006"
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
+INDUSTRY_LEVEL_PATTERN = re.compile(r"^(?P<industry_name>.+?)(?P<industry_level>[ⅠⅡⅢ])$")
+INDUSTRY_LEVEL_RANK = {"Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3}
 
 # These codes are listed on the Shanghai and Shenzhen exchanges rather than being
 # ordinary company shares.  Keeping the prefixes here prevents a Shanghai ETF such
@@ -924,6 +926,7 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
         values = trend.split(",")
         if len(values) < 8:
             continue
+        volume = to_number(values[5])
         items.append(
             {
                 "time": values[0],
@@ -931,8 +934,10 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
                 "price": to_number(values[2]),
                 "high": to_number(values[3]),
                 "low": to_number(values[4]),
-                "volume": to_number(values[5]),
+                "volume": None if volume is None else volume * 100,
+                "volume_unit": "share",
                 "turnover": to_number(values[6]),
+                "turnover_unit": "CNY",
                 "average_price": to_number(values[7]),
             }
         )
@@ -1334,7 +1339,7 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
     query = urlencode(
         {
             "pn": 1,
-            "pz": limit,
+            "pz": max(limit * 3, 30),
             "po": 1,
             "np": 1,
             "fltt": 2,
@@ -1365,6 +1370,7 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
                 {
                     "symbol": clean_value(row.get("f12")),
                     "name": clean_value(row.get("f14")),
+                    **industry_name_metadata(clean_value(row.get("f14"))),
                     "price": to_number(row.get("f2")),
                     "change_pct": to_number(row.get("f3")),
                     "change": to_number(row.get("f4")),
@@ -1373,11 +1379,52 @@ def get_eastmoney_industry_boards(limit: int) -> list[dict[str, Any]]:
                 if row.get("f14")
             ]
             if boards:
-                return boards
+                return deduplicate_industry_boards(boards, limit)
             errors.append(f"{host}: no usable industry-board rows")
         except HTTPException as exc:
             errors.append(f"{host}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def industry_name_metadata(name: Any) -> dict[str, str | None]:
+    text = str(name).strip() if name else ""
+    match = INDUSTRY_LEVEL_PATTERN.fullmatch(text)
+    if not match:
+        return {"industry_name": text or None, "industry_level": None}
+    return {
+        "industry_name": match.group("industry_name"),
+        "industry_level": match.group("industry_level"),
+    }
+
+
+def deduplicate_industry_boards(
+    boards: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    selected: dict[str, dict[str, Any]] = {}
+    for board in boards:
+        industry_name = str(board.get("industry_name") or board.get("name") or "")
+        existing = selected.get(industry_name)
+        if existing is None:
+            selected[industry_name] = board
+            continue
+
+        current_rank = INDUSTRY_LEVEL_RANK.get(board.get("industry_level"), 99)
+        existing_rank = INDUSTRY_LEVEL_RANK.get(existing.get("industry_level"), 99)
+        if current_rank < existing_rank:
+            selected[industry_name] = board
+        elif current_rank == existing_rank:
+            current_change = board.get("change_pct")
+            existing_change = existing.get("change_pct")
+            if (current_change if current_change is not None else float("-inf")) > (
+                existing_change if existing_change is not None else float("-inf")
+            ):
+                selected[industry_name] = board
+
+    return sorted(
+        selected.values(),
+        key=lambda item: item.get("change_pct") if item.get("change_pct") is not None else float("-inf"),
+        reverse=True,
+    )[:limit]
 
 
 def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
@@ -1398,6 +1445,8 @@ def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
     boards = [
         {
             "name": name,
+            "industry_name": name,
+            "industry_level": None,
             "change_pct": round(sum(changes) / len(changes), 2),
             "average_change_pct": round(sum(changes) / len(changes), 2),
             "stock_count": len(changes),
