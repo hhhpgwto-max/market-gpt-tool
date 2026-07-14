@@ -666,6 +666,31 @@ def test_intraday_session_filter_and_market_time_cap() -> None:
         assert intraday["latest_market_time"] == "2026-07-10 15:00"
         assert intraday["filtered_out_of_session_count"] == 2
 
+        market_app.read_public_json = lambda *_: {
+            "data": {
+                "name": "Opening Test",
+                "preClose": 9.8,
+                "trends": [
+                    "2026-07-10 09:30,10.00,10.00,10.00,10.00,10,1000,10.00",
+                    "2026-07-10 09:31,10.10,10.10,10.10,10.10,10,1010,10.05",
+                    "2026-07-10 09:32,10.20,10.20,10.20,10.20,10,1020,10.10",
+                ],
+            }
+        }
+        truncated = market_app.get_eastmoney_intraday("600519", 1)
+        assert truncated["items"][0]["time"] == "2026-07-10 09:32"
+        assert truncated["session_open"] == 10.0
+        indicators = market_app.intraday_mechanical_indicators(
+            truncated["items"],
+            opening_price=truncated["session_open"],
+            opening_price_scope=truncated["session_open_scope"],
+            session_high=truncated["session_high"],
+            session_low=truncated["session_low"],
+        )
+        assert indicators["return_from_open_pct"] == 2.0
+        assert indicators["return_from_first_returned_minute_pct"] == 0.0
+        assert indicators["opening_price_scope"] == "official_open_from_09_30_exchange_minute"
+
         indicators = market_app.intraday_mechanical_indicators(
             intraday["items"]
             + [{"time": "2026-07-10 15:11", "price": 999.0, "high": 999.0, "low": 999.0}]
@@ -814,10 +839,19 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert eastmoney_intraday["items"][0]["volume"] == 200
         assert eastmoney_intraday["items"][0]["volume_unit"] == "share"
         assert eastmoney_intraday["items"][0]["turnover_unit"] == "CNY"
+        assert eastmoney_intraday["session_open"] == 10.0
 
         market_app.get_eastmoney_intraday = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="blocked")
         )
+        tencent_quote = [""] * 35
+        tencent_quote[1] = "Test"
+        tencent_quote[2] = "600519"
+        tencent_quote[3] = "10.10"
+        tencent_quote[4] = "9.90"
+        tencent_quote[5] = "9.95"
+        tencent_quote[33] = "10.20"
+        tencent_quote[34] = "9.90"
         market_app.read_public_json = lambda *_: {
             "data": {
                 "sh600519": {
@@ -825,7 +859,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
                         "date": "20260710",
                         "data": ["0930 10.00 2 2000", "0931 10.10 5 5030"],
                     },
-                    "qt": {"sh600519": ["1", "Test", "600519", "10.10", "9.90"]},
+                    "qt": {"sh600519": tencent_quote},
                 }
             }
         }
@@ -834,6 +868,10 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert intraday["items"][1]["volume"] == 300
         assert intraday["items"][1]["turnover"] == 3030
         assert intraday["items"][1]["volume_unit"] == "share"
+        assert intraday["open"] == 9.95
+        assert intraday["high"] == 10.2
+        assert intraday["low"] == 9.9
+        assert intraday["mechanical_indicators"]["return_from_open_pct"] == 1.5075
 
         market_app.read_public_json = lambda *_: {
             "data": {"sh600519": {"data": {"date": "20261399", "data": ["0930 10 2 2"]}}}
@@ -862,15 +900,18 @@ def test_intraday_and_index_fallback_parsers() -> None:
             {"symbol": "BK0001", "name": "Test Industry", "price": 100, "change_pct": 1.5, "change": 1.48}
         ]
         market_app.get_all_realtime_quotes = lambda: market_app.pd.DataFrame()
-        fields = [""] * 33
+        fields = [""] * 35
         fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
         fields[30:33] = ["20260710150000", "1.0", "1.01"]
+        fields[33:35] = ["101.0", "98.0"]
         market_app.read_market_text = lambda *_: f'v_sh000001="{"~".join(fields)}";'
         market_app.TOOL_CACHE.clear()
         overview = market_app.get_market_overview_data(3)
         assert overview["index_source"] == "tencent"
         assert overview["indices"][0]["change"] == 1.0
         assert overview["indices"][0]["change_pct"] == 1.01
+        assert overview["indices"][0]["high"] == 101.0
+        assert overview["indices"][0]["low"] == 98.0
         assert overview["industry_board_source"] == "eastmoney_industry"
         assert overview["industry_boards"][0]["name"] == "Test Industry"
         assert overview["response_budget_ms"] == 9000
@@ -1100,6 +1141,27 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert result["cache_hit"] is True
     assert result["data"]["symbol"] == "600519"
     assert "latency_ms" in result
+
+    market_app.TOOL_CACHE[key]["created_at"] = market_app.datetime.now(
+        market_app.timezone.utc
+    ) - market_app.timedelta(seconds=20)
+
+    def failing_loader() -> dict:
+        raise market_app.HTTPException(status_code=502, detail="temporary upstream failure")
+
+    stale = market_app.run_cached_tool(
+        "test",
+        {"symbol": "600519"},
+        10,
+        failing_loader,
+        "600519",
+        max_stale_age_seconds=120,
+    )
+    assert stale["ok"] is True
+    assert stale["is_stale"] is True
+    assert stale["stale_reason"] == "live_sources_failed_using_recent_cache"
+    assert stale["served_from_stale_cache"] is True
+    assert stale["cache_hit"] is True
 
     market_app.record_source_health("eastmoney", True, 42)
     health = market_app.get_market_data_health_data()

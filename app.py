@@ -203,6 +203,32 @@ INDEX_SECIDS = ",".join(
     )
 )
 PRIMARY_INDEX_SYMBOLS = {"000001", "399001", "399006"}
+OVERVIEW_INDEX_SYMBOLS = {
+    "000001",
+    "399001",
+    "399006",
+    "000688",
+    "000300",
+    "000905",
+    "399852",
+    "932000",
+    "000016",
+    "000922",
+}
+TENCENT_INDEX_CODES = ",".join(
+    (
+        "sh000001",
+        "sz399001",
+        "sz399006",
+        "sh000688",
+        "sh000300",
+        "sh000905",
+        "sz399852",
+        "sh932000",
+        "sh000016",
+        "sh000922",
+    )
+)
 MARKET_QUOTE_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
 MARKET_QUOTE_FIELDS = "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18,f20,f124"
 BATCH_QUOTE_FIELDS = "f12,f13,f14,f2,f3,f4,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21,f124"
@@ -1497,10 +1523,29 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
             detail=f"Intraday source returned no valid A-share trading-session minutes: {symbol}",
         )
 
+    session_prices = [to_number(item.get("price")) for item in valid_items]
+    session_highs = [to_number(item.get("high")) for item in valid_items]
+    session_lows = [to_number(item.get("low")) for item in valid_items]
+    opening_price = to_number(valid_items[0].get("open")) or to_number(
+        valid_items[0].get("price")
+    )
     return {
         "symbol": symbol,
         "name": clean_value(data.get("name")),
         "previous_close": clean_value(data.get("preClose")),
+        "session_open": opening_price,
+        "session_open_scope": (
+            "official_open_from_09_30_exchange_minute"
+            if str(valid_items[0]["time"]).endswith("09:30")
+            else "first_available_trading_minute_open"
+        ),
+        "session_first_minute_time": valid_items[0]["time"],
+        "session_high": max(value for value in session_highs if value is not None),
+        "session_low": min(value for value in session_lows if value is not None),
+        "session_last_price": next(
+            (value for value in reversed(session_prices) if value is not None),
+            None,
+        ),
         "count": len(items),
         "items": items,
         "raw_count": len(parsed_items),
@@ -1571,10 +1616,32 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
     if not items:
         raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
     quote = (stock.get("qt") or {}).get(code) or []
+    quote_open = to_number(quote[5]) if len(quote) > 5 else None
+    opening_price = quote_open or to_number(parsed[0].get("price"))
+    parsed_prices = [to_number(item.get("price")) for item in parsed]
+    quote_high = to_number(quote[33]) if len(quote) > 33 else None
+    quote_low = to_number(quote[34]) if len(quote) > 34 else None
     return {
         "symbol": symbol,
         "name": clean_value(quote[1]) if len(quote) > 1 else None,
         "previous_close": to_number(quote[4]) if len(quote) > 4 else None,
+        "session_open": opening_price,
+        "session_open_scope": (
+            "official_open_from_tencent_quote"
+            if quote_open is not None
+            else "first_trading_minute_price_fallback"
+        ),
+        "session_first_minute_time": parsed[0]["time"],
+        "session_high": quote_high
+        if quote_high is not None
+        else max(value for value in parsed_prices if value is not None),
+        "session_low": quote_low
+        if quote_low is not None
+        else min(value for value in parsed_prices if value is not None),
+        "session_last_price": next(
+            (value for value in reversed(parsed_prices) if value is not None),
+            None,
+        ),
         "count": len(items),
         "items": items,
         "raw_count": raw_count,
@@ -1612,7 +1679,13 @@ def percentage_change(current: float | None, reference: float | None) -> float |
     return round((current - reference) / reference * 100, 4)
 
 
-def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any]:
+def intraday_mechanical_indicators(
+    items: list[dict[str, Any]],
+    opening_price: float | None = None,
+    opening_price_scope: str | None = None,
+    session_high: float | None = None,
+    session_low: float | None = None,
+) -> dict[str, Any]:
     items = filter_intraday_trading_items(items)
     if not items:
         return {"status": "unavailable_without_trading_session_minutes"}
@@ -1630,9 +1703,13 @@ def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any
 
     highs = [to_number(item.get("high")) or to_number(item.get("price")) for item in items]
     lows = [to_number(item.get("low")) or to_number(item.get("price")) for item in items]
-    day_high = max(value for value in highs if value is not None)
-    day_low = min(value for value in lows if value is not None)
-    opening_price = to_number(items[0].get("open")) or to_number(items[0].get("price"))
+    returned_window_high = max(value for value in highs if value is not None)
+    returned_window_low = min(value for value in lows if value is not None)
+    day_high = session_high if session_high is not None else returned_window_high
+    day_low = session_low if session_low is not None else returned_window_low
+    first_returned_price = to_number(items[0].get("price")) or to_number(
+        items[0].get("close")
+    )
     source_average = to_number(items[-1].get("average_price"))
     total_turnover = sum(to_number(item.get("turnover")) or 0 for item in items)
     total_volume = sum(to_number(item.get("volume")) or 0 for item in items)
@@ -1656,7 +1733,14 @@ def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any
         "price_above_average_pct": percentage_change(current, average_price),
         "average_price": average_price,
         "average_price_scope": average_scope,
+        "opening_price": opening_price,
+        "opening_price_scope": opening_price_scope or "unavailable",
         "return_from_open_pct": percentage_change(current, opening_price),
+        "first_returned_minute_time": items[0].get("time"),
+        "first_returned_minute_price": first_returned_price,
+        "return_from_first_returned_minute_pct": percentage_change(
+            current, first_returned_price
+        ),
         "turnover_last_5_reported_minutes": recent_turnover,
         "turnover_previous_5_reported_minutes": prior_turnover if len(items) >= 10 else None,
         "turnover_speed_5m_vs_previous_5m_pct": (
@@ -1666,6 +1750,8 @@ def intraday_mechanical_indicators(items: list[dict[str, Any]]) -> dict[str, Any
         "at_intraday_low": current <= min(valid_prices),
         "definitions": {
             "returns": "Current price compared with the price N reported trading minutes earlier.",
+            "return_from_open": "Current price compared with the official session opening price, even when the returned minute window starts later than 09:30.",
+            "return_from_first_returned_minute": "Current price compared with the first minute included in this response; this is not labeled as the opening return.",
             "turnover_speed": "Most recent five reported trading minutes compared with the preceding five; lunch-break minutes are not generated.",
             "average_price": "Source cumulative-day average when available; otherwise VWAP of the returned minute window only.",
         },
@@ -1697,7 +1783,16 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
         )
         payload["latest_market_time"] = payload["items"][-1]["time"]
         payload["market_time"] = format_market_time(payload["latest_market_time"])
-        payload["mechanical_indicators"] = intraday_mechanical_indicators(payload["items"])
+        payload["open"] = payload.get("session_open")
+        payload["high"] = payload.get("session_high")
+        payload["low"] = payload.get("session_low")
+        payload["mechanical_indicators"] = intraday_mechanical_indicators(
+            payload["items"],
+            opening_price=to_number(payload.get("session_open")),
+            opening_price_scope=payload.get("session_open_scope"),
+            session_high=to_number(payload.get("session_high")),
+            session_low=to_number(payload.get("session_low")),
+        )
         payload["security_type"] = security_metadata(symbol)["security_type"]
         payload["exchange"] = security_metadata(symbol)["exchange"]
         payload["source_errors"] = errors
@@ -2569,7 +2664,7 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
 def get_tencent_indices() -> list[dict[str, Any]]:
     try:
         text = read_market_text(
-            "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006",
+            f"https://qt.gtimg.cn/q={TENCENT_INDEX_CODES}",
             "https://stockapp.finance.qq.com/",
         )
     except OSError as exc:
@@ -2587,8 +2682,8 @@ def get_tencent_indices() -> list[dict[str, Any]]:
                 "change_pct": to_number(values[32]),
                 "change": to_number(values[31]),
                 "open": to_number(values[5]),
-                "high": None,
-                "low": None,
+                "high": to_number(values[33]) if len(values) > 33 else None,
+                "low": to_number(values[34]) if len(values) > 34 else None,
                 "previous_close": to_number(values[4]),
                 "source_updated_at": format_market_time(values[30]),
                 "market_time": market_time_from_source_update(
@@ -3311,20 +3406,28 @@ def get_fastest_index_component() -> dict[str, Any]:
                 except Exception as exc:  # pragma: no cover - defensive source boundary
                     errors.append(f"{source}: {exc}")
 
-            eastmoney_success = next(
-                (item for item in successes if item[0] == "eastmoney"),
+            complete_success = next(
+                (
+                    item
+                    for preferred_source in ("eastmoney", "tencent")
+                    for item in successes
+                    if item[0] == preferred_source
+                    and PRIMARY_INDEX_SYMBOLS
+                    <= {str(row.get("symbol")) for row in item[1]}
+                    and len(item[1]) >= 9
+                ),
                 None,
             )
-            if eastmoney_success:
+            if complete_success:
                 return {
-                    "indices": eastmoney_success[1],
-                    "source": eastmoney_success[0],
+                    "indices": complete_success[1],
+                    "source": complete_success[0],
                     "source_errors": errors,
                 }
-            eastmoney_pending = any(
-                futures[future] == "eastmoney" for future in pending
+            rich_source_pending = any(
+                futures[future] in {"eastmoney", "tencent"} for future in pending
             )
-            if successes and not eastmoney_pending:
+            if successes and not rich_source_pending:
                 break
 
         for future in pending:
@@ -3651,7 +3754,29 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     if not primary_indices:
         primary_indices = indices[:3]
     style_indices = [index for index in indices if index not in primary_indices]
+    returned_index_symbols = {str(index.get("symbol")) for index in indices}
+    missing_style_index_symbols = sorted(
+        (OVERVIEW_INDEX_SYMBOLS - PRIMARY_INDEX_SYMBOLS) - returned_index_symbols
+    )
     all_market_breadth = breadth.get("all_market") if breadth else None
+    breadth_detail_fields = (
+        "rise_over_3_count",
+        "rise_over_5_count",
+        "rise_over_7_count",
+        "fall_over_3_count",
+        "fall_over_5_count",
+        "fall_over_7_count",
+        "limit_up_count",
+        "limit_down_count",
+        "open_board_count",
+    )
+    unavailable_breadth_detail_fields = (
+        [
+            key
+            for key in breadth_detail_fields
+            if not all_market_breadth or all_market_breadth.get(key) is None
+        ]
+    )
     limit_stats = (
         {
             key: all_market_breadth.get(key)
@@ -3674,6 +3799,14 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "market_time": market_time,
         "indices": primary_indices,
         "style_indices": style_indices,
+        "style_indices_status": (
+            "full_data"
+            if not missing_style_index_symbols
+            else "partial_data"
+            if style_indices
+            else "unavailable"
+        ),
+        "missing_style_index_symbols": missing_style_index_symbols,
         "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
@@ -3682,6 +3815,10 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "market_breadth_source": breadth_component.get("source", "unavailable"),
         "market_breadth_coverage_status": breadth_component.get("coverage_status"),
         "market_breadth_row_count": breadth_component.get("row_count"),
+        "market_breadth_detail_status": (
+            "full_data" if not unavailable_breadth_detail_fields else "aggregate_only"
+        ),
+        "unavailable_breadth_detail_fields": unavailable_breadth_detail_fields,
         "turnover": turnover,
         "limit_stats": limit_stats,
         "component_status": component_status,
@@ -3699,7 +3836,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             and str(breadth_component.get("coverage_status") or "").startswith("complete")
             else "partial_data"
         ),
-        "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a six-second budget.",
+        "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a nine-second budget. Exchange aggregates stay fast and do not pretend to include security-level price-band or limit statistics.",
     }
 
 
@@ -3815,15 +3952,33 @@ def run_cached_tool(
     ttl_seconds: int,
     loader: Any,
     symbol: str | None = None,
+    max_stale_age_seconds: int | None = None,
 ) -> dict[str, Any]:
     started_at = perf_counter()
+    key = cache_key(tool_name, parameters)
     try:
         data, cache = get_cached_tool_data(
-            cache_key(tool_name, parameters),
+            key,
             ttl_seconds,
             loader,
         )
     except HTTPException as exc:
+        stale_snapshot = (
+            get_cached_tool_snapshot(key, max_stale_age_seconds)
+            if max_stale_age_seconds is not None
+            else None
+        )
+        if stale_snapshot is not None:
+            data, cache = stale_snapshot
+            data["served_from_stale_cache"] = True
+            data["live_refresh_error"] = str(exc.detail)
+            data.setdefault("source_errors", []).append(
+                f"live_refresh: {exc.detail}; using a recent successful cache entry"
+            )
+            result = standardize_tool_success(data, started_at, cache)
+            result["is_stale"] = True
+            result["stale_reason"] = "live_sources_failed_using_recent_cache"
+            return result
         return mcp_error(symbol, exc, started_at)
     return standardize_tool_success(data, started_at, cache)
 
@@ -3958,6 +4113,7 @@ def get_a_share_intraday(symbol: str, limit: int = 240) -> dict[str, Any]:
         15,
         lambda: get_intraday_data(symbol, normalized_limit),
         symbol,
+        max_stale_age_seconds=120,
     )
 
 
