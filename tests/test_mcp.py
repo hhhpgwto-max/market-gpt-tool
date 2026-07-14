@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 from pathlib import Path
+from threading import Event
 from time import sleep
 
 from fastapi.testclient import TestClient
@@ -352,15 +353,25 @@ def test_kline_source_parsers() -> None:
         fallback = market_app.get_fallback_kline("600519", "daily", 101, 1)
         assert fallback["source"] == "tencent"
 
-        def slow_eastmoney(*_: object) -> dict:
-            sleep(0.2)
-            raise market_app.HTTPException(status_code=502, detail="slow failure")
+        eastmoney_started = Event()
+        release_eastmoney = Event()
 
-        market_app.get_eastmoney_kline = slow_eastmoney
-        started_at = market_app.perf_counter()
-        fallback = market_app.get_fallback_kline("600519", "daily", 101, 1)
-        assert fallback["source"] == "tencent"
-        assert market_app.perf_counter() - started_at < 0.15
+        def blocked_eastmoney(*_: object) -> dict:
+            eastmoney_started.set()
+            release_eastmoney.wait(1)
+            raise market_app.HTTPException(status_code=502, detail="blocked failure")
+
+        market_app.get_eastmoney_kline = blocked_eastmoney
+        try:
+            with market_app.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    market_app.get_fallback_kline, "600519", "daily", 101, 1
+                )
+                assert eastmoney_started.wait(0.5)
+                fallback = future.result(timeout=0.5)
+                assert fallback["source"] == "tencent"
+        finally:
+            release_eastmoney.set()
     finally:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney
@@ -1270,6 +1281,28 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert concurrent_calls == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is False) == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is True) == 4
+
+    market_app.TOOL_CACHE.clear()
+    failure_calls = 0
+
+    def shared_failing_loader() -> dict:
+        nonlocal failure_calls
+        failure_calls += 1
+        sleep(0.05)
+        raise market_app.HTTPException(status_code=502, detail="shared upstream failure")
+
+    def consume_shared_failure(_: int) -> int:
+        try:
+            market_app.get_cached_tool_data("single-flight-failure", 10, shared_failing_loader)
+        except market_app.HTTPException as exc:
+            return exc.status_code
+        raise AssertionError("Expected the shared loader failure to propagate.")
+
+    with market_app.ThreadPoolExecutor(max_workers=5) as executor:
+        failure_statuses = list(executor.map(consume_shared_failure, range(5)))
+    assert failure_calls == 1
+    assert failure_statuses == [502] * 5
+    assert market_app.TOOL_CACHE_INFLIGHT == {}
 
     market_app.TOOL_CACHE.clear()
 

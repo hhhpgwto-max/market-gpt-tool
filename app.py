@@ -280,9 +280,10 @@ LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "
 
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
-TOOL_CACHE_INFLIGHT: dict[str, Event] = {}
+TOOL_CACHE_INFLIGHT: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
+PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -394,14 +395,25 @@ def get_cached_tool_data(
                             "cache_age_seconds": round(age_seconds, 3),
                         },
                     )
-            inflight = TOOL_CACHE_INFLIGHT.get(key)
-            if inflight is None:
-                inflight = Event()
-                TOOL_CACHE_INFLIGHT[key] = inflight
+            entry = TOOL_CACHE_INFLIGHT.get(key)
+            if entry is None:
+                entry = {"event": Event(), "waiters": 0, "error": None}
+                TOOL_CACHE_INFLIGHT[key] = entry
                 break
+            entry["waiters"] += 1
         # The owner runs its loader without holding a cache lock. Exact-key
         # duplicates wait, while nested loaders for other keys stay independent.
-        inflight.wait()
+        entry["event"].wait()
+        with TOOL_CACHE_LOCK:
+            error = entry["error"]
+            entry["waiters"] -= 1
+            if entry["waiters"] == 0 and TOOL_CACHE_INFLIGHT.get(key) is entry:
+                TOOL_CACHE_INFLIGHT.pop(key, None)
+        if error is not None:
+            error_kind, status_code, detail = error
+            if error_kind == "http":
+                raise HTTPException(status_code=status_code, detail=detail)
+            raise RuntimeError(detail)
 
     try:
         data = loader()
@@ -416,11 +428,19 @@ def get_cached_tool_data(
                 "cache_age_seconds": 0.0,
             },
         )
+    except HTTPException as exc:
+        with TOOL_CACHE_LOCK:
+            entry["error"] = ("http", exc.status_code, str(exc.detail))
+        raise
+    except Exception as exc:
+        with TOOL_CACHE_LOCK:
+            entry["error"] = ("exception", 502, str(exc))
+        raise
     finally:
         with TOOL_CACHE_LOCK:
-            if TOOL_CACHE_INFLIGHT.get(key) is inflight:
+            entry["event"].set()
+            if entry["waiters"] == 0 and TOOL_CACHE_INFLIGHT.get(key) is entry:
                 TOOL_CACHE_INFLIGHT.pop(key, None)
-                inflight.set()
 
 
 def get_cached_tool_snapshot(
@@ -507,37 +527,35 @@ def race_public_sources(
     source_getters: tuple[tuple[str, Any], ...], timeout_seconds: float
 ) -> tuple[Any, str, list[str]]:
     """Return the first successful independent source without serial failure delay."""
-    executor = ThreadPoolExecutor(max_workers=len(source_getters))
-    futures = {executor.submit(getter): source for source, getter in source_getters}
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(getter): source for source, getter in source_getters
+    }
     pending = set(futures)
     errors: list[str] = []
     status_codes: list[int] = []
     source_order = {source: index for index, (source, _) in enumerate(source_getters)}
     deadline = perf_counter() + timeout_seconds
-    try:
-        while pending:
-            remaining = deadline - perf_counter()
-            if remaining <= 0:
-                break
-            completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            if not completed:
-                break
-            for future in sorted(completed, key=lambda item: source_order[futures[item]]):
-                source = futures[future]
-                try:
-                    return future.result(), source, errors
-                except HTTPException as exc:
-                    errors.append(f"{source}: {exc.detail}")
-                    status_codes.append(exc.status_code)
-                except Exception as exc:  # pragma: no cover - defensive source boundary
-                    errors.append(f"{source}: {exc}")
-                    status_codes.append(502)
-        for future in pending:
-            future.cancel()
-            errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
-            status_codes.append(502)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    while pending:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in sorted(completed, key=lambda item: source_order[futures[item]]):
+            source = futures[future]
+            try:
+                return future.result(), source, errors
+            except HTTPException as exc:
+                errors.append(f"{source}: {exc.detail}")
+                status_codes.append(exc.status_code)
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{source}: {exc}")
+                status_codes.append(502)
+    for future in pending:
+        future.cancel()
+        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        status_codes.append(502)
     status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
     raise HTTPException(
         status_code=status_code,
@@ -2147,45 +2165,43 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
         ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
         ("sina", lambda: get_sina_fund_flow(symbol, limit)),
     )
-    executor = ThreadPoolExecutor(max_workers=2)
-    futures = {executor.submit(getter): source for source, getter in source_getters}
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(getter): source for source, getter in source_getters
+    }
     pending = set(futures)
     errors: list[str] = []
     status_codes: list[int] = []
     sina_fallback: dict[str, Any] | None = None
     deadline = perf_counter() + 3.5
-    try:
-        while pending:
-            remaining = deadline - perf_counter()
-            if remaining <= 0:
-                break
-            completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            if not completed:
-                break
-            for future in sorted(completed, key=lambda item: futures[item] != "eastmoney"):
-                source = futures[future]
-                try:
-                    payload = future.result()
-                    if source == "eastmoney":
-                        payload["source_errors"] = errors
-                        return payload
-                    sina_fallback = payload
-                except HTTPException as exc:
-                    errors.append(f"{source}: {exc.detail}")
-                    status_codes.append(exc.status_code)
-                except Exception as exc:  # pragma: no cover - defensive source boundary
-                    errors.append(f"{source}: {exc}")
-                    status_codes.append(502)
-            eastmoney_pending = any(futures[future] == "eastmoney" for future in pending)
-            if sina_fallback is not None and not eastmoney_pending:
-                sina_fallback["source_errors"] = errors
-                return sina_fallback
-        for future in pending:
-            future.cancel()
-            errors.append(f"{futures[future]}: request exceeded the 3.5 second budget")
-            status_codes.append(502)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    while pending:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in sorted(completed, key=lambda item: futures[item] != "eastmoney"):
+            source = futures[future]
+            try:
+                payload = future.result()
+                if source == "eastmoney":
+                    payload["source_errors"] = errors
+                    return payload
+                sina_fallback = payload
+            except HTTPException as exc:
+                errors.append(f"{source}: {exc.detail}")
+                status_codes.append(exc.status_code)
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{source}: {exc}")
+                status_codes.append(502)
+        eastmoney_pending = any(futures[future] == "eastmoney" for future in pending)
+        if sina_fallback is not None and not eastmoney_pending:
+            sina_fallback["source_errors"] = errors
+            return sina_fallback
+    for future in pending:
+        future.cancel()
+        errors.append(f"{futures[future]}: request exceeded the 3.5 second budget")
+        status_codes.append(502)
     if sina_fallback is not None:
         sina_fallback["source_errors"] = errors
         return sina_fallback
