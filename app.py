@@ -23,6 +23,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
+ROUTING_REVISION = "parallel_fallback_singleflight_stale_cache_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -279,6 +280,7 @@ LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "
 
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
+TOOL_CACHE_KEY_LOCKS = tuple(Lock() for _ in range(64))
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
 
@@ -377,33 +379,36 @@ def cache_key(tool_name: str, parameters: Any) -> str:
 def get_cached_tool_data(
     key: str, ttl_seconds: int, loader: Any
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    with TOOL_CACHE_LOCK:
-        cached = TOOL_CACHE.get(key)
-        if cached is not None:
-            age_seconds = (now - cached["created_at"]).total_seconds()
-            if age_seconds <= ttl_seconds:
-                return (
-                    deepcopy(cached["data"]),
-                    {
-                        "cache_hit": True,
-                        "cache_created_at": cached["created_at"].isoformat(),
-                        "cache_age_seconds": round(age_seconds, 3),
-                    },
-                )
+    key_lock = TOOL_CACHE_KEY_LOCKS[hash(key) % len(TOOL_CACHE_KEY_LOCKS)]
+    # Collapse duplicate concurrent requests without blocking unrelated cache keys.
+    with key_lock:
+        now = datetime.now(timezone.utc)
+        with TOOL_CACHE_LOCK:
+            cached = TOOL_CACHE.get(key)
+            if cached is not None:
+                age_seconds = (now - cached["created_at"]).total_seconds()
+                if age_seconds <= ttl_seconds:
+                    return (
+                        deepcopy(cached["data"]),
+                        {
+                            "cache_hit": True,
+                            "cache_created_at": cached["created_at"].isoformat(),
+                            "cache_age_seconds": round(age_seconds, 3),
+                        },
+                    )
 
-    data = loader()
-    created_at = datetime.now(timezone.utc)
-    with TOOL_CACHE_LOCK:
-        TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
-    return (
-        data,
-        {
-            "cache_hit": False,
-            "cache_created_at": created_at.isoformat(),
-            "cache_age_seconds": 0.0,
-        },
-    )
+        data = loader()
+        created_at = datetime.now(timezone.utc)
+        with TOOL_CACHE_LOCK:
+            TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
+        return (
+            data,
+            {
+                "cache_hit": False,
+                "cache_created_at": created_at.isoformat(),
+                "cache_age_seconds": 0.0,
+            },
+        )
 
 
 def get_cached_tool_snapshot(
@@ -484,6 +489,48 @@ def classify_error_type(message: Any, status_code: int | None = None) -> str:
     if "502" in text or "503" in text or "504" in text or "upstream" in text:
         return "upstream_5xx"
     return "network_error"
+
+
+def race_public_sources(
+    source_getters: tuple[tuple[str, Any], ...], timeout_seconds: float
+) -> tuple[Any, str, list[str]]:
+    """Return the first successful independent source without serial failure delay."""
+    executor = ThreadPoolExecutor(max_workers=len(source_getters))
+    futures = {executor.submit(getter): source for source, getter in source_getters}
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    source_order = {source: index for index, (source, _) in enumerate(source_getters)}
+    deadline = perf_counter() + timeout_seconds
+    try:
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not completed:
+                break
+            for future in sorted(completed, key=lambda item: source_order[futures[item]]):
+                source = futures[future]
+                try:
+                    return future.result(), source, errors
+                except HTTPException as exc:
+                    errors.append(f"{source}: {exc.detail}")
+                    status_codes.append(exc.status_code)
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
+                    status_codes.append(502)
+        for future in pending:
+            future.cancel()
+            errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+            status_codes.append(502)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    raise HTTPException(
+        status_code=status_code,
+        detail="; ".join(errors) or "All public market sources are unavailable.",
+    )
 
 
 def normalize_sources(value: Any) -> list[str]:
@@ -1046,6 +1093,7 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "name": APP_NAME,
+        "routing_revision": ROUTING_REVISION,
         "time": now_iso(),
         "data_health": get_market_data_health_data(),
     }
@@ -1141,26 +1189,28 @@ def get_eastmoney_batch_quote_rows(securities: list[dict[str, str]]) -> tuple[li
             "secids": ",".join(security["eastmoney_secid"] for security in securities),
         }
     )
-    errors = []
-    for host in (
+    hosts = (
         "push2.eastmoney.com",
         "push2delay.eastmoney.com",
         "82.push2.eastmoney.com",
-    ):
-        try:
-            payload = read_public_json(
-                f"https://{host}/api/qt/ulist.np/get?{query}",
-                "https://quote.eastmoney.com/",
-                3,
-                1,
-            )
-            rows = ((payload.get("data") or {}).get("diff")) or []
-            if rows:
-                return rows, host
-            errors.append(f"{host}: no quote rows")
-        except HTTPException as exc:
-            errors.append(f"{host}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+    )
+
+    def load_host(host: str) -> list[dict[str, Any]]:
+        payload = read_public_json(
+            f"https://{host}/api/qt/ulist.np/get?{query}",
+            "https://quote.eastmoney.com/",
+            3,
+            1,
+        )
+        rows = ((payload.get("data") or {}).get("diff")) or []
+        if not rows:
+            raise HTTPException(status_code=502, detail="no quote rows")
+        return rows
+
+    rows, host, _ = race_public_sources(
+        tuple((host, lambda host=host: load_host(host)) for host in hosts), 4
+    )
+    return rows, host
 
 
 def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str]]:
@@ -1437,18 +1487,15 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
 
 
 def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
-    errors = []
-    for source, getter in (
-        ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
-        ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
-    ):
-        try:
-            payload = getter()
-            payload["source_errors"] = errors
-            return payload
-        except HTTPException as exc:
-            errors.append(f"{source}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+    payload, _, errors = race_public_sources(
+        (
+            ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
+            ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
+        ),
+        5,
+    )
+    payload["source_errors"] = errors
+    return payload
 
 
 def parse_intraday_minute(value: Any) -> datetime | None:
@@ -2084,21 +2131,15 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
-    errors = []
-    all_not_found = True
-    for source, getter in (
-        ("eastmoney", get_eastmoney_fund_flow),
-        ("sina", get_sina_fund_flow),
-    ):
-        try:
-            payload = getter(symbol, limit)
-            payload["source_errors"] = errors
-            return payload
-        except HTTPException as exc:
-            errors.append(f"{source}: {exc.detail}")
-            all_not_found = all_not_found and exc.status_code == 404
-    status_code = 404 if all_not_found else 502
-    raise HTTPException(status_code=status_code, detail="; ".join(errors))
+    payload, _, errors = race_public_sources(
+        (
+            ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
+            ("sina", lambda: get_sina_fund_flow(symbol, limit)),
+        ),
+        5,
+    )
+    payload["source_errors"] = errors
+    return payload
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
@@ -4471,6 +4512,7 @@ def get_market_data_health_data() -> dict[str, Any]:
             "note": "ETF and LOF code prefixes are classified before public-source routing.",
         },
         "cache": {"entry_count": cache_entries, "policy": "short_TTL_success_only"},
+        "routing_revision": ROUTING_REVISION,
         "degraded_mode": degraded,
         "note": "Observed request health only; this endpoint does not fabricate a live probe or investment conclusion.",
         "source": ["in_process_observability"],
@@ -4595,7 +4637,8 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
         }
 
     return run_cached_tool(
-        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol
+        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol,
+        max_stale_age_seconds=15,
     )
 
 
@@ -4612,6 +4655,7 @@ def get_a_share_batch_quotes(symbols: list[str]) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_batch_quotes", {"symbols": symbols}, 2,
         lambda: get_batch_quote_data(symbols),
+        max_stale_age_seconds=15,
     )
 
 
@@ -4654,12 +4698,14 @@ def get_a_share_kline(
         }
 
     ttl_seconds = 300 if period in {"daily", "weekly", "monthly"} else 15
+    max_stale_age = 86400 if period in {"daily", "weekly", "monthly"} else 120
     return run_cached_tool(
         "get_a_share_kline",
         {"symbol": symbol, "period": period, "limit": normalized_limit},
         ttl_seconds,
         kline_response,
         symbol,
+        max_stale_age_seconds=max_stale_age,
     )
 
 
@@ -4758,6 +4804,7 @@ def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_fund_flow", {"symbol": symbol, "limit": normalized_limit}, 30,
         lambda: get_fund_flow_data(symbol, normalized_limit), symbol,
+        max_stale_age_seconds=3600,
     )
 
 
@@ -5014,6 +5061,7 @@ def get_a_share_sector_rankings(
         lambda: get_sector_rankings_data(
             sector_type, level, sort_by, normalized_limit,
         ),
+        max_stale_age_seconds=300,
     )
 
 
@@ -5031,6 +5079,7 @@ def get_a_share_market_overview(limit: int = 10) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_market_overview", {"limit": normalized_limit}, 5,
         lambda: get_market_overview_data(normalized_limit),
+        max_stale_age_seconds=120,
     )
 
 

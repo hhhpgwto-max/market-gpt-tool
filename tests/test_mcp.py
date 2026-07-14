@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 from pathlib import Path
+from time import sleep
 
 from fastapi.testclient import TestClient
 
@@ -350,6 +351,16 @@ def test_kline_source_parsers() -> None:
         market_app.get_tencent_kline = lambda *_: tencent
         fallback = market_app.get_fallback_kline("600519", "daily", 101, 1)
         assert fallback["source"] == "tencent"
+
+        def slow_eastmoney(*_: object) -> dict:
+            sleep(0.2)
+            raise market_app.HTTPException(status_code=502, detail="slow failure")
+
+        market_app.get_eastmoney_kline = slow_eastmoney
+        started_at = market_app.perf_counter()
+        fallback = market_app.get_fallback_kline("600519", "daily", 101, 1)
+        assert fallback["source"] == "tencent"
+        assert market_app.perf_counter() - started_at < 0.15
     finally:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney
@@ -1218,6 +1229,25 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
+    assert health["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
+
+    market_app.TOOL_CACHE.clear()
+    concurrent_calls = 0
+
+    def slow_loader() -> dict:
+        nonlocal concurrent_calls
+        concurrent_calls += 1
+        sleep(0.05)
+        return {"source": "test", "market_time": "2026-07-10T15:00:00+08:00"}
+
+    with market_app.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(
+            lambda _: market_app.get_cached_tool_data("single-flight", 10, slow_loader),
+            range(5),
+        ))
+    assert concurrent_calls == 1
+    assert sum(1 for _, cache in results if cache["cache_hit"] is False) == 1
+    assert sum(1 for _, cache in results if cache["cache_hit"] is True) == 4
 
     error = market_app.mcp_error(
         "bad", market_app.HTTPException(status_code=400, detail="symbol is required.")
@@ -1385,6 +1415,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
+        assert health.json()["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
