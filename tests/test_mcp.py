@@ -1315,6 +1315,26 @@ def test_historical_context_and_security_status_facts() -> None:
         reference_result = market_app.get_security_reference_data("600519")
         assert reference_result["listing_date"] == "2001-08-27"
         assert reference_result["source"].startswith("eastmoney_security_reference:")
+
+        reference_key = market_app.cache_key(
+            "security_reference_internal", {"symbol": "600519"}
+        )
+        market_app.TOOL_CACHE.pop(reference_key, None)
+        cached_reference = market_app.get_resilient_security_reference_data("600519")
+        assert cached_reference["listing_date"] == "2001-08-27"
+        market_app.TOOL_CACHE[reference_key]["created_at"] = market_app.datetime.now(
+            market_app.timezone.utc
+        ) - market_app.timedelta(hours=7)
+        market_app.read_public_json = lambda *_: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="all hosts blocked")
+        )
+        stale_reference = market_app.get_resilient_security_reference_data("600519")
+        assert stale_reference["listing_date"] == "2001-08-27"
+        assert stale_reference["cache_hit"] is True
+        assert (
+            stale_reference["reference_stale_reason"]
+            == "live_sources_failed_using_slow_changing_reference_cache"
+        )
     finally:
         market_app.get_kline_data = original_kline
         market_app.read_public_json = original_json
