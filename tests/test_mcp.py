@@ -1016,6 +1016,28 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert fund_flow["items"][0]["main_net_inflow"] == 2000
         assert fund_flow["items"][0]["change_pct"] == 1.0
 
+        full_history = {
+            "source": "eastmoney",
+            "count": 5,
+            "items": [{"date": "2026-07-10"}],
+        }
+        partial_day = {
+            "source": "sina",
+            "data_status": "partial_data",
+            "count": 1,
+            "items": [{"date": "2026-07-10"}],
+        }
+
+        def slightly_slower_full_history(*_: object) -> dict:
+            sleep(0.05)
+            return full_history
+
+        market_app.get_eastmoney_fund_flow = slightly_slower_full_history
+        market_app.get_sina_fund_flow = lambda *_: partial_day
+        preferred_flow = market_app.get_fund_flow_data("600519", 5)
+        assert preferred_flow["source"] == "eastmoney"
+        assert preferred_flow["count"] == 5
+
         market_app.get_eastmoney_fund_flow = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=404, detail="not found")
         )
@@ -1248,6 +1270,18 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert concurrent_calls == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is False) == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is True) == 4
+
+    market_app.TOOL_CACHE.clear()
+
+    def parent_loader() -> dict:
+        child, _ = market_app.get_cached_tool_data(
+            "nested-child", 10, lambda: {"value": "child"}
+        )
+        return {"value": child["value"]}
+
+    parent, _ = market_app.get_cached_tool_data("nested-parent", 10, parent_loader)
+    assert parent["value"] == "child"
+    assert market_app.TOOL_CACHE_INFLIGHT == {}
 
     error = market_app.mcp_error(
         "bad", market_app.HTTPException(status_code=400, detail="symbol is required.")

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from math import ceil, sqrt
-from threading import Lock
+from threading import Event, Lock
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlencode
@@ -280,7 +280,7 @@ LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "
 
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
-TOOL_CACHE_KEY_LOCKS = tuple(Lock() for _ in range(64))
+TOOL_CACHE_INFLIGHT: dict[str, Event] = {}
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
 
@@ -379,9 +379,7 @@ def cache_key(tool_name: str, parameters: Any) -> str:
 def get_cached_tool_data(
     key: str, ttl_seconds: int, loader: Any
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    key_lock = TOOL_CACHE_KEY_LOCKS[hash(key) % len(TOOL_CACHE_KEY_LOCKS)]
-    # Collapse duplicate concurrent requests without blocking unrelated cache keys.
-    with key_lock:
+    while True:
         now = datetime.now(timezone.utc)
         with TOOL_CACHE_LOCK:
             cached = TOOL_CACHE.get(key)
@@ -396,7 +394,16 @@ def get_cached_tool_data(
                             "cache_age_seconds": round(age_seconds, 3),
                         },
                     )
+            inflight = TOOL_CACHE_INFLIGHT.get(key)
+            if inflight is None:
+                inflight = Event()
+                TOOL_CACHE_INFLIGHT[key] = inflight
+                break
+        # The owner runs its loader without holding a cache lock. Exact-key
+        # duplicates wait, while nested loaders for other keys stay independent.
+        inflight.wait()
 
+    try:
         data = loader()
         created_at = datetime.now(timezone.utc)
         with TOOL_CACHE_LOCK:
@@ -409,6 +416,11 @@ def get_cached_tool_data(
                 "cache_age_seconds": 0.0,
             },
         )
+    finally:
+        with TOOL_CACHE_LOCK:
+            if TOOL_CACHE_INFLIGHT.get(key) is inflight:
+                TOOL_CACHE_INFLIGHT.pop(key, None)
+                inflight.set()
 
 
 def get_cached_tool_snapshot(
@@ -2131,15 +2143,54 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
-    payload, _, errors = race_public_sources(
-        (
-            ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
-            ("sina", lambda: get_sina_fund_flow(symbol, limit)),
-        ),
-        5,
+    source_getters = (
+        ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
+        ("sina", lambda: get_sina_fund_flow(symbol, limit)),
     )
-    payload["source_errors"] = errors
-    return payload
+    executor = ThreadPoolExecutor(max_workers=2)
+    futures = {executor.submit(getter): source for source, getter in source_getters}
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    sina_fallback: dict[str, Any] | None = None
+    deadline = perf_counter() + 3.5
+    try:
+        while pending:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not completed:
+                break
+            for future in sorted(completed, key=lambda item: futures[item] != "eastmoney"):
+                source = futures[future]
+                try:
+                    payload = future.result()
+                    if source == "eastmoney":
+                        payload["source_errors"] = errors
+                        return payload
+                    sina_fallback = payload
+                except HTTPException as exc:
+                    errors.append(f"{source}: {exc.detail}")
+                    status_codes.append(exc.status_code)
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{source}: {exc}")
+                    status_codes.append(502)
+            eastmoney_pending = any(futures[future] == "eastmoney" for future in pending)
+            if sina_fallback is not None and not eastmoney_pending:
+                sina_fallback["source_errors"] = errors
+                return sina_fallback
+        for future in pending:
+            future.cancel()
+            errors.append(f"{futures[future]}: request exceeded the 3.5 second budget")
+            status_codes.append(502)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if sina_fallback is not None:
+        sina_fallback["source_errors"] = errors
+        return sina_fallback
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    raise HTTPException(status_code=status_code, detail="; ".join(errors))
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
