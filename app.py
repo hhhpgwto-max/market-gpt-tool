@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from math import ceil, sqrt
-from threading import Lock
+from threading import Event, Lock
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlencode
@@ -23,6 +23,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
+ROUTING_REVISION = "parallel_fallback_singleflight_stale_cache_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -279,8 +280,10 @@ LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "
 
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
+TOOL_CACHE_INFLIGHT: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
+PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -377,33 +380,67 @@ def cache_key(tool_name: str, parameters: Any) -> str:
 def get_cached_tool_data(
     key: str, ttl_seconds: int, loader: Any
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    with TOOL_CACHE_LOCK:
-        cached = TOOL_CACHE.get(key)
-        if cached is not None:
-            age_seconds = (now - cached["created_at"]).total_seconds()
-            if age_seconds <= ttl_seconds:
-                return (
-                    deepcopy(cached["data"]),
-                    {
-                        "cache_hit": True,
-                        "cache_created_at": cached["created_at"].isoformat(),
-                        "cache_age_seconds": round(age_seconds, 3),
-                    },
-                )
+    while True:
+        now = datetime.now(timezone.utc)
+        with TOOL_CACHE_LOCK:
+            cached = TOOL_CACHE.get(key)
+            if cached is not None:
+                age_seconds = (now - cached["created_at"]).total_seconds()
+                if age_seconds <= ttl_seconds:
+                    return (
+                        deepcopy(cached["data"]),
+                        {
+                            "cache_hit": True,
+                            "cache_created_at": cached["created_at"].isoformat(),
+                            "cache_age_seconds": round(age_seconds, 3),
+                        },
+                    )
+            entry = TOOL_CACHE_INFLIGHT.get(key)
+            if entry is None:
+                entry = {"event": Event(), "waiters": 0, "error": None}
+                TOOL_CACHE_INFLIGHT[key] = entry
+                break
+            entry["waiters"] += 1
+        # The owner runs its loader without holding a cache lock. Exact-key
+        # duplicates wait, while nested loaders for other keys stay independent.
+        entry["event"].wait()
+        with TOOL_CACHE_LOCK:
+            error = entry["error"]
+            entry["waiters"] -= 1
+            if entry["waiters"] == 0 and TOOL_CACHE_INFLIGHT.get(key) is entry:
+                TOOL_CACHE_INFLIGHT.pop(key, None)
+        if error is not None:
+            error_kind, status_code, detail = error
+            if error_kind == "http":
+                raise HTTPException(status_code=status_code, detail=detail)
+            raise RuntimeError(detail)
 
-    data = loader()
-    created_at = datetime.now(timezone.utc)
-    with TOOL_CACHE_LOCK:
-        TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
-    return (
-        data,
-        {
-            "cache_hit": False,
-            "cache_created_at": created_at.isoformat(),
-            "cache_age_seconds": 0.0,
-        },
-    )
+    try:
+        data = loader()
+        created_at = datetime.now(timezone.utc)
+        with TOOL_CACHE_LOCK:
+            TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
+        return (
+            data,
+            {
+                "cache_hit": False,
+                "cache_created_at": created_at.isoformat(),
+                "cache_age_seconds": 0.0,
+            },
+        )
+    except HTTPException as exc:
+        with TOOL_CACHE_LOCK:
+            entry["error"] = ("http", exc.status_code, str(exc.detail))
+        raise
+    except Exception as exc:
+        with TOOL_CACHE_LOCK:
+            entry["error"] = ("exception", 502, str(exc))
+        raise
+    finally:
+        with TOOL_CACHE_LOCK:
+            entry["event"].set()
+            if entry["waiters"] == 0 and TOOL_CACHE_INFLIGHT.get(key) is entry:
+                TOOL_CACHE_INFLIGHT.pop(key, None)
 
 
 def get_cached_tool_snapshot(
@@ -484,6 +521,97 @@ def classify_error_type(message: Any, status_code: int | None = None) -> str:
     if "502" in text or "503" in text or "504" in text or "upstream" in text:
         return "upstream_5xx"
     return "network_error"
+
+
+def race_public_sources(
+    source_getters: tuple[tuple[str, Any], ...], timeout_seconds: float
+) -> tuple[Any, str, list[str]]:
+    """Return the first successful independent source without serial failure delay."""
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(getter): source for source, getter in source_getters
+    }
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    source_order = {source: index for index, (source, _) in enumerate(source_getters)}
+    deadline = perf_counter() + timeout_seconds
+    while pending:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in sorted(completed, key=lambda item: source_order[futures[item]]):
+            source = futures[future]
+            try:
+                return future.result(), source, errors
+            except HTTPException as exc:
+                errors.append(f"{source}: {exc.detail}")
+                status_codes.append(exc.status_code)
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{source}: {exc}")
+                status_codes.append(502)
+    for future in pending:
+        future.cancel()
+        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        status_codes.append(502)
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    raise HTTPException(
+        status_code=status_code,
+        detail="; ".join(errors) or "All public market sources are unavailable.",
+    )
+
+
+def prefer_primary_public_source(
+    primary: tuple[str, Any], fallback: tuple[str, Any], timeout_seconds: float
+) -> tuple[Any, str, list[str]]:
+    """Prefetch a fallback concurrently without discarding a healthy richer primary."""
+    primary_source, primary_getter = primary
+    fallback_source, fallback_getter = fallback
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(primary_getter): primary_source,
+        PUBLIC_SOURCE_EXECUTOR.submit(fallback_getter): fallback_source,
+    }
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    fallback_payload: Any = None
+    deadline = perf_counter() + timeout_seconds
+    while pending:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in sorted(completed, key=lambda item: futures[item] != primary_source):
+            source = futures[future]
+            try:
+                payload = future.result()
+                if source == primary_source:
+                    return payload, source, errors
+                fallback_payload = payload
+            except HTTPException as exc:
+                errors.append(f"{source}: {exc.detail}")
+                status_codes.append(exc.status_code)
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{source}: {exc}")
+                status_codes.append(502)
+        primary_pending = any(futures[future] == primary_source for future in pending)
+        if fallback_payload is not None and not primary_pending:
+            return fallback_payload, fallback_source, errors
+    for future in pending:
+        future.cancel()
+        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        status_codes.append(502)
+    if fallback_payload is not None:
+        return fallback_payload, fallback_source, errors
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    raise HTTPException(
+        status_code=status_code,
+        detail="; ".join(errors) or "Both preferred and fallback sources are unavailable.",
+    )
 
 
 def normalize_sources(value: Any) -> list[str]:
@@ -1046,6 +1174,7 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "name": APP_NAME,
+        "routing_revision": ROUTING_REVISION,
         "time": now_iso(),
         "data_health": get_market_data_health_data(),
     }
@@ -1141,26 +1270,28 @@ def get_eastmoney_batch_quote_rows(securities: list[dict[str, str]]) -> tuple[li
             "secids": ",".join(security["eastmoney_secid"] for security in securities),
         }
     )
-    errors = []
-    for host in (
+    hosts = (
         "push2.eastmoney.com",
         "push2delay.eastmoney.com",
         "82.push2.eastmoney.com",
-    ):
-        try:
-            payload = read_public_json(
-                f"https://{host}/api/qt/ulist.np/get?{query}",
-                "https://quote.eastmoney.com/",
-                3,
-                1,
-            )
-            rows = ((payload.get("data") or {}).get("diff")) or []
-            if rows:
-                return rows, host
-            errors.append(f"{host}: no quote rows")
-        except HTTPException as exc:
-            errors.append(f"{host}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+    )
+
+    def load_host(host: str) -> list[dict[str, Any]]:
+        payload = read_public_json(
+            f"https://{host}/api/qt/ulist.np/get?{query}",
+            "https://quote.eastmoney.com/",
+            3,
+            1,
+        )
+        rows = ((payload.get("data") or {}).get("diff")) or []
+        if not rows:
+            raise HTTPException(status_code=502, detail="no quote rows")
+        return rows
+
+    rows, host, _ = race_public_sources(
+        tuple((host, lambda host=host: load_host(host)) for host in hosts), 4
+    )
+    return rows, host
 
 
 def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str]]:
@@ -1437,18 +1568,13 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
 
 
 def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
-    errors = []
-    for source, getter in (
+    payload, _, errors = prefer_primary_public_source(
         ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
         ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
-    ):
-        try:
-            payload = getter()
-            payload["source_errors"] = errors
-            return payload
-        except HTTPException as exc:
-            errors.append(f"{source}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="; ".join(errors))
+        3.5,
+    )
+    payload["source_errors"] = errors
+    return payload
 
 
 def parse_intraday_minute(value: Any) -> datetime | None:
@@ -2084,21 +2210,13 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
-    errors = []
-    all_not_found = True
-    for source, getter in (
-        ("eastmoney", get_eastmoney_fund_flow),
-        ("sina", get_sina_fund_flow),
-    ):
-        try:
-            payload = getter(symbol, limit)
-            payload["source_errors"] = errors
-            return payload
-        except HTTPException as exc:
-            errors.append(f"{source}: {exc.detail}")
-            all_not_found = all_not_found and exc.status_code == 404
-    status_code = 404 if all_not_found else 502
-    raise HTTPException(status_code=status_code, detail="; ".join(errors))
+    payload, _, errors = prefer_primary_public_source(
+        ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
+        ("sina", lambda: get_sina_fund_flow(symbol, limit)),
+        3.5,
+    )
+    payload["source_errors"] = errors
+    return payload
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
@@ -4471,6 +4589,7 @@ def get_market_data_health_data() -> dict[str, Any]:
             "note": "ETF and LOF code prefixes are classified before public-source routing.",
         },
         "cache": {"entry_count": cache_entries, "policy": "short_TTL_success_only"},
+        "routing_revision": ROUTING_REVISION,
         "degraded_mode": degraded,
         "note": "Observed request health only; this endpoint does not fabricate a live probe or investment conclusion.",
         "source": ["in_process_observability"],
@@ -4595,7 +4714,8 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
         }
 
     return run_cached_tool(
-        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol
+        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol,
+        max_stale_age_seconds=15,
     )
 
 
@@ -4612,6 +4732,7 @@ def get_a_share_batch_quotes(symbols: list[str]) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_batch_quotes", {"symbols": symbols}, 2,
         lambda: get_batch_quote_data(symbols),
+        max_stale_age_seconds=15,
     )
 
 
@@ -4654,12 +4775,14 @@ def get_a_share_kline(
         }
 
     ttl_seconds = 300 if period in {"daily", "weekly", "monthly"} else 15
+    max_stale_age = 86400 if period in {"daily", "weekly", "monthly"} else 120
     return run_cached_tool(
         "get_a_share_kline",
         {"symbol": symbol, "period": period, "limit": normalized_limit},
         ttl_seconds,
         kline_response,
         symbol,
+        max_stale_age_seconds=max_stale_age,
     )
 
 
@@ -4758,6 +4881,7 @@ def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_fund_flow", {"symbol": symbol, "limit": normalized_limit}, 30,
         lambda: get_fund_flow_data(symbol, normalized_limit), symbol,
+        max_stale_age_seconds=3600,
     )
 
 
@@ -5014,6 +5138,7 @@ def get_a_share_sector_rankings(
         lambda: get_sector_rankings_data(
             sector_type, level, sort_by, normalized_limit,
         ),
+        max_stale_age_seconds=300,
     )
 
 
@@ -5031,6 +5156,7 @@ def get_a_share_market_overview(limit: int = 10) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_market_overview", {"limit": normalized_limit}, 5,
         lambda: get_market_overview_data(normalized_limit),
+        max_stale_age_seconds=120,
     )
 
 

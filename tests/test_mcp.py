@@ -2,6 +2,8 @@ import importlib
 import sys
 import types
 from pathlib import Path
+from threading import Event
+from time import sleep
 
 from fastapi.testclient import TestClient
 
@@ -350,6 +352,43 @@ def test_kline_source_parsers() -> None:
         market_app.get_tencent_kline = lambda *_: tencent
         fallback = market_app.get_fallback_kline("600519", "daily", 101, 1)
         assert fallback["source"] == "tencent"
+
+        eastmoney_started = Event()
+        release_eastmoney = Event()
+
+        def blocked_eastmoney(*_: object) -> dict:
+            eastmoney_started.set()
+            release_eastmoney.wait(1)
+            raise market_app.HTTPException(status_code=502, detail="blocked failure")
+
+        market_app.get_eastmoney_kline = blocked_eastmoney
+        try:
+            with market_app.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    market_app.get_fallback_kline, "600519", "daily", 101, 1
+                )
+                assert eastmoney_started.wait(0.5)
+                assert future.done() is False
+                release_eastmoney.set()
+                fallback = future.result(timeout=0.5)
+                assert fallback["source"] == "tencent"
+        finally:
+            release_eastmoney.set()
+
+        eastmoney_full = {
+            **tencent,
+            "source": "eastmoney",
+            "items": [{**tencent["items"][0], "turnover": 123456.0}],
+        }
+
+        def slightly_slower_eastmoney(*_: object) -> dict:
+            sleep(0.05)
+            return eastmoney_full
+
+        market_app.get_eastmoney_kline = slightly_slower_eastmoney
+        preferred = market_app.get_fallback_kline("600519", "daily", 101, 1)
+        assert preferred["source"] == "eastmoney"
+        assert preferred["items"][0]["turnover"] == 123456.0
     finally:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney
@@ -1005,6 +1044,28 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert fund_flow["items"][0]["main_net_inflow"] == 2000
         assert fund_flow["items"][0]["change_pct"] == 1.0
 
+        full_history = {
+            "source": "eastmoney",
+            "count": 5,
+            "items": [{"date": "2026-07-10"}],
+        }
+        partial_day = {
+            "source": "sina",
+            "data_status": "partial_data",
+            "count": 1,
+            "items": [{"date": "2026-07-10"}],
+        }
+
+        def slightly_slower_full_history(*_: object) -> dict:
+            sleep(0.05)
+            return full_history
+
+        market_app.get_eastmoney_fund_flow = slightly_slower_full_history
+        market_app.get_sina_fund_flow = lambda *_: partial_day
+        preferred_flow = market_app.get_fund_flow_data("600519", 5)
+        assert preferred_flow["source"] == "eastmoney"
+        assert preferred_flow["count"] == 5
+
         market_app.get_eastmoney_fund_flow = lambda *_: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=404, detail="not found")
         )
@@ -1218,6 +1279,59 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
+    assert health["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
+
+    market_app.TOOL_CACHE.clear()
+    concurrent_calls = 0
+
+    def slow_loader() -> dict:
+        nonlocal concurrent_calls
+        concurrent_calls += 1
+        sleep(0.05)
+        return {"source": "test", "market_time": "2026-07-10T15:00:00+08:00"}
+
+    with market_app.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(
+            lambda _: market_app.get_cached_tool_data("single-flight", 10, slow_loader),
+            range(5),
+        ))
+    assert concurrent_calls == 1
+    assert sum(1 for _, cache in results if cache["cache_hit"] is False) == 1
+    assert sum(1 for _, cache in results if cache["cache_hit"] is True) == 4
+
+    market_app.TOOL_CACHE.clear()
+    failure_calls = 0
+
+    def shared_failing_loader() -> dict:
+        nonlocal failure_calls
+        failure_calls += 1
+        sleep(0.05)
+        raise market_app.HTTPException(status_code=502, detail="shared upstream failure")
+
+    def consume_shared_failure(_: int) -> int:
+        try:
+            market_app.get_cached_tool_data("single-flight-failure", 10, shared_failing_loader)
+        except market_app.HTTPException as exc:
+            return exc.status_code
+        raise AssertionError("Expected the shared loader failure to propagate.")
+
+    with market_app.ThreadPoolExecutor(max_workers=5) as executor:
+        failure_statuses = list(executor.map(consume_shared_failure, range(5)))
+    assert failure_calls == 1
+    assert failure_statuses == [502] * 5
+    assert market_app.TOOL_CACHE_INFLIGHT == {}
+
+    market_app.TOOL_CACHE.clear()
+
+    def parent_loader() -> dict:
+        child, _ = market_app.get_cached_tool_data(
+            "nested-child", 10, lambda: {"value": "child"}
+        )
+        return {"value": child["value"]}
+
+    parent, _ = market_app.get_cached_tool_data("nested-parent", 10, parent_loader)
+    assert parent["value"] == "child"
+    assert market_app.TOOL_CACHE_INFLIGHT == {}
 
     error = market_app.mcp_error(
         "bad", market_app.HTTPException(status_code=400, detail="symbol is required.")
@@ -1385,6 +1499,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
+        assert health.json()["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
