@@ -304,6 +304,24 @@ def fake_get_market_overview_data(limit: int) -> dict:
     }
 
 
+def fake_get_limit_activity_data(limit: int) -> dict:
+    return {
+        "trade_date": "2026-07-10",
+        "statistics": {
+            "limit_up_count": 2,
+            "limit_down_count": 1,
+            "open_board_count": 1,
+            "consecutive_limit_up_count": 1,
+            "max_consecutive_limit_up": 2,
+        },
+        "limit_up_items": [{"symbol": "600001"}][:limit],
+        "open_board_items": [{"symbol": "600002"}][:limit],
+        "limit_down_items": [{"symbol": "600003"}][:limit],
+        "source": ["test"],
+        "source_errors": [],
+    }
+
+
 def fake_get_sector_rankings_data(sector_type: str, level: str, sort_by: str, limit: int) -> dict:
     return {
         "sector_type": sector_type,
@@ -611,6 +629,95 @@ def test_market_structure_calculations() -> None:
         raise AssertionError("Expected unstable minute momentum ranking to be rejected.")
     except market_app.HTTPException as exc:
         assert exc.status_code == 400
+
+
+def test_limit_activity_and_index_identity() -> None:
+    original_fetch = market_app.fetch_eastmoney_limit_pool
+    try:
+        rows = {
+            "limit_up": [
+                {
+                    "c": "600001",
+                    "n": "Test Leader",
+                    "p": 11000,
+                    "zdp": 10.0,
+                    "amount": 1000,
+                    "ltsz": 10000,
+                    "hs": 2.0,
+                    "lbc": 3,
+                    "fbt": 92500,
+                    "lbt": 145500,
+                    "fund": 500,
+                    "zbc": 0,
+                    "hybk": "Test Industry",
+                    "zttj": {"days": 3, "ct": 3},
+                },
+                {
+                    "c": "000001",
+                    "n": "*ST Test",
+                    "p": 10500,
+                    "zdp": 5.0,
+                    "amount": 800,
+                    "lbc": 1,
+                    "fund": 100,
+                    "zttj": {"days": 1, "ct": 1},
+                },
+            ],
+            "open_board": [
+                {
+                    "c": "300001",
+                    "n": "Test Open",
+                    "p": 11500,
+                    "ztp": 12000,
+                    "zdp": 15.0,
+                    "amount": 900,
+                    "zbc": 2,
+                    "zttj": {"days": 0, "ct": 0},
+                }
+            ],
+            "limit_down": [
+                {
+                    "c": "430001",
+                    "n": "Test Down",
+                    "p": 7000,
+                    "zdp": -30.0,
+                    "amount": 700,
+                    "days": 2,
+                    "lbt": 150000,
+                    "oc": 3,
+                    "fba": 200,
+                }
+            ],
+        }
+
+        def fake_fetch(pool_type: str, _trade_date: str) -> dict:
+            return {
+                "pool_type": pool_type,
+                "trade_date": "20260714",
+                "source_count": len(rows[pool_type]),
+                "rows": rows[pool_type],
+            }
+
+        market_app.fetch_eastmoney_limit_pool = fake_fetch
+        activity = market_app.get_limit_activity_data(10)
+        statistics = activity["statistics"]
+        assert statistics["limit_up_count"] == 2
+        assert statistics["limit_down_count"] == 1
+        assert statistics["open_board_count"] == 1
+        assert statistics["seal_success_rate_pct"] == 66.67
+        assert statistics["consecutive_limit_up_count"] == 1
+        assert statistics["max_consecutive_limit_up"] == 3
+        assert statistics["st_limit_up_count"] == 1
+        assert activity["by_exchange"]["SSE"]["consecutive_limit_up_count"] == 1
+        assert activity["limit_up_items"][0]["price"] == 11.0
+        assert activity["limit_up_items"][0]["first_seal_time"].endswith("+08:00")
+
+        identity = market_app.enrich_index_identity({"symbol": "932000", "name": None})
+        assert identity["identifier"] == "index:932000"
+        assert identity["eastmoney_secid"] == "2.932000"
+        assert identity["index_role"] == "style"
+    finally:
+        market_app.fetch_eastmoney_limit_pool = original_fetch
 
 
 def test_batch_quotes_intraday_indicators_and_filtering() -> None:
@@ -1324,7 +1431,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "relevant_multi_source_news_v1"
+    assert health["routing_revision"] == "limit_activity_and_index_identity_v1"
 
     market_app.TOOL_CACHE.clear()
     concurrent_calls = 0
@@ -1650,6 +1757,7 @@ def main() -> None:
     test_industry_board_parser()
     test_industry_board_deduplication()
     test_market_structure_calculations()
+    test_limit_activity_and_index_identity()
     test_batch_quotes_intraday_indicators_and_filtering()
     test_intraday_session_filter_and_market_time_cap()
     test_market_quote_pagination()
@@ -1678,6 +1786,7 @@ def main() -> None:
     market_app.get_relative_strength_data = fake_get_relative_strength_data
     market_app.scan_intraday_anomalies_data = fake_scan_intraday_anomalies_data
     market_app.get_market_overview_data = fake_get_market_overview_data
+    market_app.get_limit_activity_data = fake_get_limit_activity_data
     market_app.get_sector_rankings_data = fake_get_sector_rankings_data
     headers = {
         "Accept": "application/json, text/event-stream",
@@ -1687,7 +1796,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "relevant_multi_source_news_v1"
+        assert health.json()["routing_revision"] == "limit_activity_and_index_identity_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -1741,6 +1850,7 @@ def main() -> None:
             "get_a_share_relative_strength",
             "scan_a_share_intraday_anomalies",
             "get_a_share_sector_rankings",
+            "get_a_share_limit_activity",
             "get_a_share_market_overview",
             "get_market_data_health",
         }
@@ -1797,9 +1907,10 @@ def main() -> None:
             (11, "get_a_share_financials", {"symbol": "600519"}),
             (12, "get_a_share_news", {"symbol": "600519"}),
             (13, "get_a_share_sector_rankings", {"sector_type": "industry"}),
-            (14, "get_a_share_market_overview", {}),
-            (15, "get_market_data_health", {}),
-            (16, "get_a_share_announcements", {"symbol": "600519"}),
+            (14, "get_a_share_limit_activity", {}),
+            (15, "get_a_share_market_overview", {}),
+            (16, "get_market_data_health", {}),
+            (17, "get_a_share_announcements", {"symbol": "600519"}),
             (
                 17,
                 "get_a_share_relative_strength",
