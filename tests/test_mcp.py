@@ -914,6 +914,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
     original_eastmoney_industry_boards = market_app.get_eastmoney_industry_boards
     original_eastmoney_fund_flow = market_app.get_eastmoney_fund_flow
     original_sina_fund_flow = market_app.get_sina_fund_flow
+    original_sina_object = market_app.read_sina_object
     original_sina_quote = market_app.get_sina_quote
     original_all_realtime_quotes = market_app.get_all_realtime_quotes
     try:
@@ -1044,6 +1045,44 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert fund_flow["items"][0]["main_net_inflow"] == 2000
         assert fund_flow["items"][0]["change_pct"] == 1.0
 
+        flow_started = Event()
+        quote_started = Event()
+        release_sina = Event()
+
+        def blocked_sina_flow(*_: object) -> dict:
+            flow_started.set()
+            release_sina.wait(1)
+            return {
+                "r0_in": "3000",
+                "r0_out": "1000",
+                "netamount": "1500",
+                "name": "Test",
+                "trade": "10.10",
+                "changeratio": "0.01",
+            }
+
+        def blocked_sina_quote(*_: object) -> dict:
+            quote_started.set()
+            release_sina.wait(1)
+            return {"source_updated_at": "2026-07-10T15:00:00+08:00"}
+
+        market_app.read_sina_object = blocked_sina_flow
+        market_app.get_sina_quote = blocked_sina_quote
+        try:
+            with market_app.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(market_app.get_sina_fund_flow, "600519", 5)
+                assert flow_started.wait(0.5)
+                assert quote_started.wait(0.5)
+                release_sina.set()
+                parallel_sina = future.result(timeout=0.5)
+                assert parallel_sina["source"] == "sina"
+        finally:
+            release_sina.set()
+            market_app.read_sina_object = original_sina_object
+            market_app.get_sina_quote = lambda *_: {
+                "source_updated_at": "2026-07-10T15:00:00+08:00"
+            }
+
         full_history = {
             "source": "eastmoney",
             "count": 5,
@@ -1087,6 +1126,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_eastmoney_industry_boards = original_eastmoney_industry_boards
         market_app.get_eastmoney_fund_flow = original_eastmoney_fund_flow
         market_app.get_sina_fund_flow = original_sina_fund_flow
+        market_app.read_sina_object = original_sina_object
         market_app.get_sina_quote = original_sina_quote
         market_app.get_all_realtime_quotes = original_all_realtime_quotes
 
@@ -1279,7 +1319,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
+    assert health["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v2"
 
     market_app.TOOL_CACHE.clear()
     concurrent_calls = 0
@@ -1499,7 +1539,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v1"
+        assert health.json()["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v2"
 
         for legacy_path in (
             "/search?keyword=600000",

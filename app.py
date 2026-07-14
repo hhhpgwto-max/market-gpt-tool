@@ -23,7 +23,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "parallel_fallback_singleflight_stale_cache_v1"
+ROUTING_REVISION = "parallel_fallback_singleflight_stale_cache_v2"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -284,6 +284,7 @@ TOOL_CACHE_INFLIGHT: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+SINA_AUX_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -2169,12 +2170,21 @@ def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
 def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     code = market_symbol(symbol)
-    payload = read_sina_object(
-        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-        f"MoneyFlow.ssi_ssfx_flzjtj?daima={code}",
+    payload_future = SINA_AUX_EXECUTOR.submit(
+        read_sina_object,
+        (
+            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            f"MoneyFlow.ssi_ssfx_flzjtj?daima={code}"
+        ),
         "https://finance.sina.com.cn/",
     )
-    quote = get_sina_quote(symbol)
+    quote_future = SINA_AUX_EXECUTOR.submit(get_sina_quote, symbol)
+    try:
+        payload = payload_future.result()
+        quote = quote_future.result()
+    finally:
+        payload_future.cancel()
+        quote_future.cancel()
     trade_date = derive_quote_timestamps(quote.get("source_updated_at"))["trade_date"]
     if not payload or not trade_date:
         raise HTTPException(status_code=404, detail=f"Fund-flow data not found: {symbol}")
@@ -2213,7 +2223,7 @@ def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
     payload, _, errors = prefer_primary_public_source(
         ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
         ("sina", lambda: get_sina_fund_flow(symbol, limit)),
-        3.5,
+        5.5,
     )
     payload["source_errors"] = errors
     return payload
