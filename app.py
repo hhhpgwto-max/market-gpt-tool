@@ -26,8 +26,8 @@ APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
-    "fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical sector rankings, and "
-    "operational data-route health. "
+    "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
+    "anomaly scans, relative strength, sector rankings, and operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
     "All data is informational only and is not investment advice."
@@ -63,7 +63,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.6.0",
+    version="0.7.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -205,7 +205,7 @@ INDEX_SECIDS = ",".join(
 PRIMARY_INDEX_SYMBOLS = {"000001", "399001", "399006"}
 MARKET_QUOTE_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
 MARKET_QUOTE_FIELDS = "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18,f20,f124"
-BATCH_QUOTE_FIELDS = "f12,f14,f2,f3,f4,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21,f124"
+BATCH_QUOTE_FIELDS = "f12,f13,f14,f2,f3,f4,f5,f6,f7,f8,f10,f15,f16,f17,f18,f20,f21,f124"
 INDEX_SECID_BY_SYMBOL = {
     "000001": "1.000001",
     "399001": "0.399001",
@@ -217,6 +217,7 @@ INDEX_SECID_BY_SYMBOL = {
     "932000": "2.932000",
     "000016": "1.000016",
     "000922": "1.000922",
+    "899050": "0.899050",
 }
 SECTOR_TYPE_CONFIG = {
     "industry": "m:90+t:2",
@@ -268,7 +269,13 @@ def normalize_symbol(symbol: str) -> str:
 def security_metadata(symbol: str) -> dict[str, str]:
     """Classify a listed security and centralize source-specific market prefixes."""
     symbol = normalize_symbol(symbol)
-    if symbol.startswith(("5", "6", "9")):
+    if symbol.startswith(("920", "4", "8")):
+        exchange = "BSE"
+        exchange_name = "Beijing Stock Exchange"
+        market_prefix = "bj"
+        eastmoney_market = "0"
+        eastmoney_suffix = "BJ"
+    elif symbol.startswith(("5", "6", "9")):
         exchange = "SSE"
         exchange_name = "Shanghai Stock Exchange"
         market_prefix = "sh"
@@ -280,12 +287,6 @@ def security_metadata(symbol: str) -> dict[str, str]:
         market_prefix = "sz"
         eastmoney_market = "0"
         eastmoney_suffix = "SZ"
-    elif symbol.startswith(("4", "8")):
-        exchange = "BSE"
-        exchange_name = "Beijing Stock Exchange"
-        market_prefix = "bj"
-        eastmoney_market = "0"
-        eastmoney_suffix = "BJ"
     else:
         raise HTTPException(
             status_code=400,
@@ -324,7 +325,7 @@ def batch_security_metadata(identifier: Any) -> dict[str, str]:
                     "get_a_share_market_overview."
                 ),
             )
-        exchange = "SZSE" if secid.startswith("0.") else "SSE"
+        exchange = "BSE" if symbol == "899050" else "SZSE" if secid.startswith("0.") else "SSE"
         return {
             "identifier": raw_identifier,
             "symbol": symbol,
@@ -707,6 +708,46 @@ def read_public_json(
             errors.append(str(exc))
             record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
     raise HTTPException(status_code=502, detail=f"Failed to fetch public market data: {'; '.join(errors)}")
+
+
+def read_public_json_post(
+    url: str,
+    referer: str,
+    payload: dict[str, Any],
+    timeout: int = 5,
+) -> Any:
+    request = Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": referer,
+            "Origin": "https://www.szse.cn",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/json",
+            "X-Request-Type": "ajax",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        method="POST",
+    )
+    started_at = perf_counter()
+    source = source_name_from_url(url)
+    try:
+        with urlopen(request, timeout=timeout) as response:  # nosec B310
+            result = json.loads(response.read().decode("utf-8"))
+        record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+        return result
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        record_source_health(
+            source,
+            False,
+            int((perf_counter() - started_at) * 1000),
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch official disclosure data: {exc}",
+        ) from exc
 
 
 def read_public_jsonp(url: str, referer: str) -> dict[str, Any]:
@@ -1142,6 +1183,7 @@ def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]
     volume = to_number(row.get("f5"))
     market_time = format_unix_market_time(row.get("f124"))
     return {
+        "identifier": security["identifier"],
         "symbol": security["symbol"],
         "name": clean_value(row.get("f14")),
         "security_type": security["security_type"],
@@ -1176,9 +1218,12 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         try:
             rows, host = get_eastmoney_batch_quote_rows(securities)
             source.append(f"eastmoney_batch:{host}")
-            rows_by_symbol = {str(row.get("f12") or "").zfill(6): row for row in rows}
+            rows_by_secid = {
+                f"{row.get('f13')}.{str(row.get('f12') or '').zfill(6)}": row
+                for row in rows
+            }
             for security in securities:
-                row = rows_by_symbol.get(security["symbol"])
+                row = rows_by_secid.get(security["eastmoney_secid"])
                 if row is None:
                     errors.append(
                         {
@@ -2056,6 +2101,431 @@ def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
         "source": "eastmoney",
         "queried_at": now_iso(),
         "note": "News search may include broader articles that mention the stock code.",
+    }
+
+
+ANNOUNCEMENT_EVENT_KEYWORDS = {
+    "financial_results": ("年报", "半年报", "季报", "业绩预告", "业绩快报"),
+    "dividend": ("分红", "派息", "权益分派", "利润分配"),
+    "buyback": ("回购",),
+    "shareholder_change": ("增持", "减持", "持股变动", "股东变更"),
+    "unlock": ("解禁", "限售股上市流通"),
+    "suspension_resume": ("停牌", "复牌"),
+    "risk_warning": ("风险警示", "退市风险", "可能被终止上市"),
+    "regulatory": ("问询函", "监管函", "处罚", "立案"),
+    "major_transaction": ("重大资产重组", "收购", "出售资产", "重大合同"),
+    "financing": ("定向增发", "非公开发行", "可转换公司债", "配股"),
+    "governance": ("董事会", "监事会", "股东会", "高管变动"),
+}
+
+
+def announcement_event_tags(title: Any) -> list[str]:
+    text = str(title or "")
+    return [
+        event_type
+        for event_type, keywords in ANNOUNCEMENT_EVENT_KEYWORDS.items()
+        if any(keyword in text for keyword in keywords)
+    ] or ["other"]
+
+
+def get_sse_announcements(
+    symbol: str, start_date: str, end_date: str, limit: int
+) -> list[dict[str, Any]]:
+    query = urlencode(
+        {
+            "isPagination": "true",
+            "pageHelp.pageSize": limit,
+            "pageHelp.pageNo": 1,
+            "pageHelp.beginPage": 1,
+            "pageHelp.cacheSize": 1,
+            "pageHelp.endPage": 1,
+            "START_DATE": start_date,
+            "END_DATE": end_date,
+            "SECURITY_CODE": symbol,
+            "TITLE": "",
+            "BULLETIN_TYPE": "",
+            "stockType": "",
+        }
+    )
+    payload = read_public_json(
+        f"https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?{query}",
+        "https://www.sse.com.cn/disclosure/listedinfo/announcement/",
+        timeout=5,
+        attempts=1,
+    )
+    groups = payload.get("result") or ((payload.get("pageHelp") or {}).get("data")) or []
+    items: list[dict[str, Any]] = []
+    for group in groups:
+        rows = group if isinstance(group, list) else [group]
+        main_rows = [row for row in rows if row.get("ORG_FILE_TYPE") in (0, "0", None)]
+        for row in (main_rows or rows)[:1]:
+            title = clean_value(row.get("TITLE"))
+            path = clean_value(row.get("URL"))
+            items.append(
+                {
+                    "announcement_id": clean_value(row.get("ORG_BULLETIN_ID")),
+                    "symbol": clean_value(row.get("SECURITY_CODE")) or symbol,
+                    "name": clean_value(row.get("SECURITY_NAME")),
+                    "published_at": clean_value(row.get("SSEDATE")),
+                    "title": title,
+                    "category": clean_value(row.get("BULLETIN_TYPE_DESC")),
+                    "event_tags": announcement_event_tags(title),
+                    "event_date": clean_value(row.get("SSEDATE")),
+                    "event_date_type": "announcement_publication_date",
+                    "url": f"https://static.sse.com.cn{path}" if path else None,
+                    "official_source": "Shanghai Stock Exchange",
+                }
+            )
+    return items[:limit]
+
+
+def get_szse_announcements(
+    symbol: str, start_date: str, end_date: str, limit: int
+) -> list[dict[str, Any]]:
+    payload = read_public_json_post(
+        "https://www.szse.cn/api/disc/announcement/annList",
+        "https://www.szse.cn/disclosure/listed/notice/index.html",
+        {
+            "seDate": [start_date, end_date],
+            "stock": [symbol],
+            "channelCode": ["listedNotice_disc"],
+            "pageSize": limit,
+            "pageNum": 1,
+        },
+    )
+    items = []
+    for row in (payload.get("data") or [])[:limit]:
+        title = clean_value(row.get("title"))
+        path = clean_value(row.get("attachPath"))
+        codes = row.get("secCode") or []
+        names = row.get("secName") or []
+        published_at = clean_value(row.get("publishTime"))
+        items.append(
+            {
+                "announcement_id": clean_value(row.get("annId") or row.get("id")),
+                "symbol": str(codes[0]) if codes else symbol,
+                "name": clean_value(names[0]) if names else None,
+                "published_at": published_at,
+                "title": title,
+                "category": None,
+                "event_tags": announcement_event_tags(title),
+                "event_date": published_at.split(" ", 1)[0] if published_at else None,
+                "event_date_type": "announcement_publication_date",
+                "url": f"https://disc.static.szse.cn{path}" if path else None,
+                "official_source": "Shenzhen Stock Exchange",
+            }
+        )
+    return items
+
+
+def get_announcement_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
+    if security["security_type"] in {"etf", "lof"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Company announcements are only available for ordinary listed shares.",
+        )
+    end = datetime.now(MARKET_TIMEZONE).date()
+    start = end - timedelta(days=days)
+    if security["exchange"] == "BSE":
+        return {
+            "symbol": symbol,
+            "exchange": "BSE",
+            "period": {"start": start.isoformat(), "end": end.isoformat()},
+            "count": 0,
+            "items": [],
+            "data_status": "unavailable",
+            "source": [],
+            "source_errors": [
+                {
+                    "source": "Beijing Stock Exchange",
+                    "error_type": "official_source_blocked",
+                    "message": "The BSE public announcement page currently returns HTTP 403 to the service environment.",
+                }
+            ],
+            "queried_at": now_iso(),
+            "note": "No third-party announcement source is substituted for the blocked official BSE route.",
+        }
+    loader = get_sse_announcements if security["exchange"] == "SSE" else get_szse_announcements
+    items = loader(symbol, start.isoformat(), end.isoformat(), limit)
+    return {
+        "symbol": symbol,
+        "exchange": security["exchange"],
+        "period": {"start": start.isoformat(), "end": end.isoformat()},
+        "count": len(items),
+        "items": items,
+        "data_status": "full_data" if items else "no_data",
+        "source": [f"official_{security['exchange'].lower()}_announcements"],
+        "source_errors": [],
+        "queried_at": now_iso(),
+        "note": "Event tags are mechanical title matches. Event dates are publication dates unless explicitly stated otherwise.",
+    }
+
+
+def default_benchmark_identifier(symbol: str) -> str:
+    security = security_metadata(symbol)
+    if security["security_type"] in {"etf", "lof"}:
+        return "index:000300"
+    return {
+        "SSE": "index:000001",
+        "SZSE": "index:399001",
+        "BSE": "index:899050",
+    }[security["exchange"]]
+
+
+def day_range_position_pct(quote: dict[str, Any]) -> float | None:
+    price = to_number(quote.get("price"))
+    high = to_number(quote.get("high"))
+    low = to_number(quote.get("low"))
+    if price is None or high is None or low is None or high <= low:
+        return None
+    return round((price - low) / (high - low) * 100, 2)
+
+
+def get_relative_strength_data(
+    symbol: str,
+    benchmark_symbol: str | None,
+    peer_symbols: list[str] | None,
+) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    benchmark = (benchmark_symbol or default_benchmark_identifier(symbol)).strip()
+    peers = peer_symbols or []
+    requested = list(dict.fromkeys([symbol, benchmark, *peers]))
+    if len(requested) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Target, benchmark, and peers support at most 20 identifiers.",
+        )
+    payload = get_batch_quote_data(requested)
+    quotes = {
+        item.get("identifier", item.get("symbol")): item for item in payload["results"]
+    }
+    target = quotes.get(symbol)
+    if target is None:
+        raise HTTPException(
+            status_code=502,
+            detail="The target quote was unavailable in the batch snapshot.",
+        )
+    benchmark_quote = quotes.get(benchmark)
+    target_change = to_number(target.get("change_pct"))
+    benchmark_change = (
+        to_number(benchmark_quote.get("change_pct")) if benchmark_quote else None
+    )
+    peer_quotes = [quotes[peer] for peer in peers if peer in quotes]
+    peer_changes = [
+        value
+        for item in peer_quotes
+        if (value := to_number(item.get("change_pct"))) is not None
+    ]
+    peer_average = round(sum(peer_changes) / len(peer_changes), 3) if peer_changes else None
+    relative_to_benchmark = (
+        round(target_change - benchmark_change, 3)
+        if target_change is not None and benchmark_change is not None
+        else None
+    )
+    relative_to_peers = (
+        round(target_change - peer_average, 3)
+        if target_change is not None and peer_average is not None
+        else None
+    )
+    return {
+        "symbol": symbol,
+        "target": target,
+        "benchmark_identifier": benchmark,
+        "benchmark": benchmark_quote,
+        "peer_count": len(peer_quotes),
+        "peers": peer_quotes,
+        "target_change_pct": target_change,
+        "benchmark_change_pct": benchmark_change,
+        "relative_to_benchmark_pct_points": relative_to_benchmark,
+        "peer_average_change_pct": peer_average,
+        "relative_to_peer_average_pct_points": relative_to_peers,
+        "day_range_position_pct": day_range_position_pct(target),
+        "relative_status": (
+            "outperforming_benchmark"
+            if relative_to_benchmark is not None and relative_to_benchmark > 0
+            else "underperforming_benchmark"
+            if relative_to_benchmark is not None and relative_to_benchmark < 0
+            else "matching_or_unavailable"
+        ),
+        "market_time": payload.get("market_time"),
+        "source": payload.get("source", []),
+        "source_errors": payload.get("source_errors", []),
+        "queried_at": now_iso(),
+        "note": "Relative strength is the current percentage-point difference, not a prediction or trading recommendation.",
+    }
+
+
+def scan_intraday_anomalies_data(
+    symbols: list[str],
+    benchmark_symbol: str | None,
+    change_pct_min: float,
+    volume_ratio_min: float,
+    turnover_rate_min: float,
+    gap_pct_min: float,
+    near_extreme_pct: float,
+    relative_strength_min: float,
+    include_untriggered: bool,
+) -> dict[str, Any]:
+    benchmark = benchmark_symbol.strip() if benchmark_symbol else None
+    requested = list(dict.fromkeys([*symbols, *([benchmark] if benchmark else [])]))
+    if not requested or len(requested) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="symbols plus benchmark must contain 1 to 20 identifiers.",
+        )
+    thresholds = (
+        change_pct_min,
+        volume_ratio_min,
+        turnover_rate_min,
+        gap_pct_min,
+        near_extreme_pct,
+        relative_strength_min,
+    )
+    if any(value < 0 for value in thresholds):
+        raise HTTPException(
+            status_code=400,
+            detail="Anomaly thresholds must be non-negative.",
+        )
+    payload = get_batch_quote_data(requested)
+    quotes = {
+        item.get("identifier", item.get("symbol")): item for item in payload["results"]
+    }
+    benchmark_quote = quotes.get(benchmark) if benchmark else None
+    benchmark_change = (
+        to_number(benchmark_quote.get("change_pct")) if benchmark_quote else None
+    )
+    results = []
+    for identifier in symbols:
+        quote = quotes.get(identifier)
+        if quote is None:
+            continue
+        change_pct = to_number(quote.get("change_pct"))
+        volume_ratio = to_number(quote.get("volume_ratio"))
+        turnover_rate = to_number(quote.get("turnover_rate"))
+        gap_pct = percentage_change(
+            to_number(quote.get("open")),
+            to_number(quote.get("previous_close")),
+        )
+        relative = (
+            round(change_pct - benchmark_change, 3)
+            if change_pct is not None and benchmark_change is not None
+            else None
+        )
+        price = to_number(quote.get("price"))
+        high = to_number(quote.get("high"))
+        low = to_number(quote.get("low"))
+        distance_to_high = (
+            round((high - price) / high * 100, 3)
+            if price is not None and high not in (None, 0)
+            else None
+        )
+        distance_to_low = (
+            round((price - low) / low * 100, 3)
+            if price is not None and low not in (None, 0)
+            else None
+        )
+        triggers: list[dict[str, Any]] = []
+
+        def add_trigger(
+            condition: bool,
+            trigger_type: str,
+            value: Any,
+            threshold: Any,
+        ) -> None:
+            if condition:
+                triggers.append(
+                    {"type": trigger_type, "value": value, "threshold": threshold}
+                )
+
+        add_trigger(
+            change_pct is not None and abs(change_pct) >= change_pct_min,
+            "large_daily_move",
+            change_pct,
+            change_pct_min,
+        )
+        add_trigger(
+            volume_ratio is not None and volume_ratio >= volume_ratio_min,
+            "high_daily_volume_ratio",
+            volume_ratio,
+            volume_ratio_min,
+        )
+        add_trigger(
+            turnover_rate is not None and turnover_rate >= turnover_rate_min,
+            "high_turnover_rate",
+            turnover_rate,
+            turnover_rate_min,
+        )
+        add_trigger(
+            gap_pct is not None and abs(gap_pct) >= gap_pct_min,
+            "opening_gap",
+            gap_pct,
+            gap_pct_min,
+        )
+        add_trigger(
+            distance_to_high is not None and distance_to_high <= near_extreme_pct,
+            "near_intraday_high",
+            distance_to_high,
+            near_extreme_pct,
+        )
+        add_trigger(
+            distance_to_low is not None and distance_to_low <= near_extreme_pct,
+            "near_intraday_low",
+            distance_to_low,
+            near_extreme_pct,
+        )
+        add_trigger(
+            relative is not None and abs(relative) >= relative_strength_min,
+            "benchmark_relative_move",
+            relative,
+            relative_strength_min,
+        )
+        if triggers or include_untriggered:
+            results.append(
+                {
+                    "identifier": identifier,
+                    "symbol": quote.get("symbol"),
+                    "name": quote.get("name"),
+                    "change_pct": change_pct,
+                    "volume_ratio": volume_ratio,
+                    "turnover_rate": turnover_rate,
+                    "opening_gap_pct": gap_pct,
+                    "relative_to_benchmark_pct_points": relative,
+                    "day_range_position_pct": day_range_position_pct(quote),
+                    "trigger_count": len(triggers),
+                    "triggers": triggers,
+                }
+            )
+    results.sort(
+        key=lambda item: (
+            item["trigger_count"],
+            abs(item.get("change_pct") or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "requested_count": len(symbols),
+        "evaluated_count": len([symbol for symbol in symbols if symbol in quotes]),
+        "triggered_count": len(
+            [item for item in results if item["trigger_count"] > 0]
+        ),
+        "benchmark_identifier": benchmark,
+        "benchmark": benchmark_quote,
+        "thresholds": {
+            "change_pct_min": change_pct_min,
+            "volume_ratio_min": volume_ratio_min,
+            "turnover_rate_min": turnover_rate_min,
+            "gap_pct_min": gap_pct_min,
+            "near_extreme_pct": near_extreme_pct,
+            "relative_strength_min": relative_strength_min,
+        },
+        "results": results,
+        "market_time": payload.get("market_time"),
+        "source": payload.get("source", []),
+        "source_errors": payload.get("source_errors", []),
+        "queried_at": now_iso(),
+        "note": "Triggers are caller-controlled mechanical conditions. Daily volume ratio is not a five-minute volume surge signal.",
     }
 
 
@@ -3596,6 +4066,114 @@ def get_a_share_news(symbol: str, limit: int = 5) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_news", {"symbol": symbol, "limit": normalized_limit}, 120,
         lambda: get_news_data(symbol, normalized_limit), symbol,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_announcements",
+    title="Get official A-share company announcements",
+    description=(
+        "Get recent official company announcements from the Shanghai or Shenzhen Stock Exchange, "
+        "with mechanical event tags and original PDF links."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_announcements(
+    symbol: str,
+    days: int = 30,
+    limit: int = 10,
+) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="symbol is required."),
+        )
+    normalized_days = max(1, min(days, 365))
+    normalized_limit = max(1, min(limit, 25))
+    return run_cached_tool(
+        "get_a_share_announcements",
+        {"symbol": symbol, "days": normalized_days, "limit": normalized_limit},
+        300,
+        lambda: get_announcement_data(symbol, normalized_days, normalized_limit),
+        symbol,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_relative_strength",
+    title="Compare A-share relative strength",
+    description=(
+        "Compare one A-share or exchange-listed fund with an index benchmark and optional peers "
+        "using one public batch snapshot."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_relative_strength(
+    symbol: str,
+    benchmark_symbol: str | None = None,
+    peer_symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="symbol is required."),
+        )
+    parameters = {
+        "symbol": symbol,
+        "benchmark_symbol": benchmark_symbol,
+        "peer_symbols": peer_symbols or [],
+    }
+    return run_cached_tool(
+        "get_a_share_relative_strength",
+        parameters,
+        2,
+        lambda: get_relative_strength_data(
+            symbol,
+            benchmark_symbol,
+            peer_symbols,
+        ),
+        symbol,
+    )
+
+
+@mcp.tool(
+    name="scan_a_share_intraday_anomalies",
+    title="Scan mechanical A-share snapshot anomalies",
+    description=(
+        "Scan up to 20 A-share, ETF, LOF, or explicit index identifiers for caller-controlled "
+        "daily move, volume ratio, turnover, opening-gap, day-range, and benchmark-relative conditions."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def scan_a_share_intraday_anomalies(
+    symbols: list[str],
+    benchmark_symbol: str | None = None,
+    change_pct_min: float = 3.0,
+    volume_ratio_min: float = 2.0,
+    turnover_rate_min: float = 5.0,
+    gap_pct_min: float = 2.0,
+    near_extreme_pct: float = 0.3,
+    relative_strength_min: float = 2.0,
+    include_untriggered: bool = False,
+) -> dict[str, Any]:
+    parameters = {
+        "symbols": symbols,
+        "benchmark_symbol": benchmark_symbol,
+        "change_pct_min": change_pct_min,
+        "volume_ratio_min": volume_ratio_min,
+        "turnover_rate_min": turnover_rate_min,
+        "gap_pct_min": gap_pct_min,
+        "near_extreme_pct": near_extreme_pct,
+        "relative_strength_min": relative_strength_min,
+        "include_untriggered": include_untriggered,
+    }
+    return run_cached_tool(
+        "scan_a_share_intraday_anomalies",
+        parameters,
+        2,
+        lambda: scan_intraday_anomalies_data(**parameters),
     )
 
 
