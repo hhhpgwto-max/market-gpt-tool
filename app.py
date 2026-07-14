@@ -2527,17 +2527,77 @@ def parse_yyyymmdd(value: Any) -> str | None:
         return None
 
 
+def consume_background_future(future: Any) -> None:
+    try:
+        future.exception()
+    except Exception:
+        return
+
+
 def get_security_reference_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     fields = "f57,f58,f43,f47,f48,f60,f124,f189,f292,f84,f85,f127,f128"
-    payload = read_public_json(
-        "https://push2.eastmoney.com/api/qt/stock/get"
-        f"?secid={eastmoney_secid(symbol)}&fields={fields}",
-        "https://quote.eastmoney.com/",
+    query = urlencode({"secid": eastmoney_secid(symbol), "fields": fields})
+    hosts = (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
     )
-    data = payload.get("data") or {}
-    if not data:
-        raise HTTPException(status_code=404, detail=f"Security reference not found: {symbol}")
+    executor = ThreadPoolExecutor(max_workers=len(hosts))
+    futures = {
+        executor.submit(
+            read_public_json,
+            f"https://{host}/api/qt/stock/get?{query}",
+            "https://quote.eastmoney.com/",
+            3,
+            1,
+        ): host
+        for host in hosts
+    }
+    pending = set(futures)
+    data: dict[str, Any] = {}
+    selected_host: str | None = None
+    errors: list[str] = []
+    deadline = perf_counter() + 4
+    try:
+        while pending and not data:
+            remaining = deadline - perf_counter()
+            if remaining <= 0:
+                break
+            completed, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not completed:
+                break
+            for future in completed:
+                host = futures[future]
+                try:
+                    candidate = future.result().get("data") or {}
+                    if not candidate.get("f57"):
+                        raise HTTPException(
+                            status_code=502,
+                            detail="security reference response contained no symbol",
+                        )
+                    data = candidate
+                    selected_host = host
+                    break
+                except HTTPException as exc:
+                    errors.append(f"{host}: {exc.detail}")
+                except Exception as exc:  # pragma: no cover - defensive source boundary
+                    errors.append(f"{host}: {exc}")
+        for future in pending:
+            future.add_done_callback(consume_background_future)
+            future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if not data or not selected_host:
+        raise HTTPException(
+            status_code=502,
+            detail="Security reference unavailable from all public hosts: "
+            + "; ".join(errors),
+        )
     return {
         "symbol": clean_value(data.get("f57")) or symbol,
         "name": clean_value(data.get("f58")),
@@ -2547,7 +2607,8 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
         "region": clean_value(data.get("f128")),
         "total_shares": to_number(data.get("f84")),
         "circulating_shares": to_number(data.get("f85")),
-        "source": "eastmoney_security_reference",
+        "source": f"eastmoney_security_reference:{selected_host}",
+        "source_errors": errors,
         "queried_at": now_iso(),
     }
 
@@ -2680,7 +2741,7 @@ def build_security_status_data(
             )
             if source
         ],
-        "source_errors": source_errors or [],
+        "source_errors": [*(source_errors or []), *(reference.get("source_errors") or [])],
         "queried_at": now_iso(),
         "data_status": "full_data" if quote_payload and reference else "partial_data",
         "note": "This tool reports observable status facts and standard rule references. It does not infer whether a security should be traded.",
