@@ -2550,7 +2550,7 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
             f"https://{host}/api/qt/stock/get?{query}",
             "https://quote.eastmoney.com/",
             3,
-            1,
+            2,
         ): host
         for host in hosts
     }
@@ -2558,7 +2558,7 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
     selected_host: str | None = None
     errors: list[str] = []
-    deadline = perf_counter() + 4
+    deadline = perf_counter() + 6
     try:
         while pending and not data:
             remaining = deadline - perf_counter()
@@ -2588,6 +2588,9 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
                 except Exception as exc:  # pragma: no cover - defensive source boundary
                     errors.append(f"{host}: {exc}")
         for future in pending:
+            errors.append(
+                f"{futures[future]}: security reference request exceeded the 6 second budget"
+            )
             future.add_done_callback(consume_background_future)
             future.cancel()
     finally:
@@ -2611,6 +2614,32 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
         "source_errors": errors,
         "queried_at": now_iso(),
     }
+
+
+def get_resilient_security_reference_data(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    key = cache_key("security_reference_internal", {"symbol": symbol})
+    try:
+        data, _ = get_cached_tool_data(
+            key,
+            21600,
+            lambda: get_security_reference_data(symbol),
+        )
+        return data
+    except HTTPException as exc:
+        stale = get_cached_tool_snapshot(key, 604800)
+        if stale is None:
+            raise
+        data, cache = stale
+        data.setdefault("source_errors", []).append(
+            f"live_refresh: {exc.detail}; using cached slow-changing security reference"
+        )
+        data["cache_hit"] = True
+        data["cache_age_seconds"] = cache["cache_age_seconds"]
+        data["reference_stale_reason"] = (
+            "live_sources_failed_using_slow_changing_reference_cache"
+        )
+        return data
 
 
 def collect_components(
@@ -2757,7 +2786,7 @@ def get_security_status_data(symbol: str) -> dict[str, Any]:
     security = security_metadata(symbol)
     loaders: dict[str, Any] = {
         "quote": lambda: get_quote_data(symbol),
-        "security_reference": lambda: get_security_reference_data(symbol),
+        "security_reference": lambda: get_resilient_security_reference_data(symbol),
     }
     if security["security_type"] not in {"etf", "lof"}:
         loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 20)
@@ -2806,7 +2835,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "quote": lambda: get_quote_data(symbol),
         "intraday": lambda: get_intraday_data(symbol, 60),
         "historical_context": lambda: get_historical_context_data(symbol),
-        "security_reference": lambda: get_security_reference_data(symbol),
+        "security_reference": lambda: get_resilient_security_reference_data(symbol),
         "relative_strength": lambda: get_relative_strength_data(symbol, benchmark, None),
         "market_overview": lambda: get_market_overview_data(5),
     }
