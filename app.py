@@ -5,7 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from math import ceil
+from math import ceil, sqrt
 from threading import Lock
 from time import perf_counter
 from typing import Any
@@ -27,7 +27,8 @@ APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
-    "anomaly scans, relative strength, sector rankings, and operational data-route health. "
+    "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
+    "sector rankings, and operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
     "All data is informational only and is not investment advice."
@@ -63,7 +64,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.7.0",
+    version="0.8.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -1358,6 +1359,8 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
     return {
         "symbol": symbol,
         "period": period,
+        "adjustment": "forward_adjusted",
+        "adjustment_source_parameter": "eastmoney_fqt_1",
         "count": len(items),
         "items": items,
         "source": "eastmoney",
@@ -1422,6 +1425,8 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "period": period,
+        "adjustment": "forward_adjusted",
+        "adjustment_source_parameter": "tencent_qfq",
         "count": len(items),
         "items": items,
         "source": "tencent",
@@ -2355,6 +2360,477 @@ def get_announcement_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
         "source_errors": [],
         "queried_at": now_iso(),
         "note": "Event tags are mechanical title matches. Event dates are publication dates unless explicitly stated otherwise.",
+    }
+
+
+HISTORICAL_CONTEXT_WINDOWS = (20, 60, 120, 250)
+CORPORATE_ACTION_EVENT_TAGS = {
+    "dividend",
+    "buyback",
+    "shareholder_change",
+    "unlock",
+    "suspension_resume",
+    "major_transaction",
+    "financing",
+}
+
+
+def mean_or_none(values: list[float]) -> float | None:
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def percentile_rank(value: float | None, values: list[float]) -> float | None:
+    if value is None or not values:
+        return None
+    return round(sum(item <= value for item in values) / len(values) * 100, 2)
+
+
+def annualized_volatility_pct(closes: list[float]) -> float | None:
+    returns = [
+        (current - previous) / previous
+        for previous, current in zip(closes, closes[1:])
+        if previous != 0
+    ]
+    if len(returns) < 2:
+        return None
+    average = sum(returns) / len(returns)
+    variance = sum((value - average) ** 2 for value in returns) / (len(returns) - 1)
+    return round(sqrt(variance) * sqrt(252) * 100, 4)
+
+
+def maximum_drawdown_pct(closes: list[float]) -> float | None:
+    if not closes:
+        return None
+    peak = closes[0]
+    drawdown = 0.0
+    for close in closes:
+        peak = max(peak, close)
+        if peak:
+            drawdown = min(drawdown, (close - peak) / peak * 100)
+    return round(drawdown, 4)
+
+
+def historical_window_metrics(
+    items: list[dict[str, Any]], window: int
+) -> dict[str, Any]:
+    window_items = items[-window:]
+    closes = [
+        value
+        for item in window_items
+        if (value := to_number(item.get("close"))) is not None
+    ]
+    highs = [
+        value
+        for item in window_items
+        if (value := to_number(item.get("high"))) is not None
+    ]
+    lows = [
+        value
+        for item in window_items
+        if (value := to_number(item.get("low"))) is not None
+    ]
+    latest = window_items[-1] if window_items else {}
+    latest_close = to_number(latest.get("close"))
+    comparison_close = (
+        to_number(items[-(window + 1)].get("close"))
+        if len(items) >= window + 1
+        else None
+    )
+    metrics: dict[str, Any] = {
+        "requested_sessions": window,
+        "available_sessions": len(window_items),
+        "window_complete": len(items) >= window + 1,
+        "start_date": clean_value(window_items[0].get("date")) if window_items else None,
+        "end_date": clean_value(latest.get("date")),
+        "return_pct": percentage_change(latest_close, comparison_close),
+        "annualized_volatility_pct": annualized_volatility_pct(closes),
+        "maximum_drawdown_pct": maximum_drawdown_pct(closes),
+        "high": max(highs) if highs else None,
+        "low": min(lows) if lows else None,
+        "distance_from_high_pct": percentage_change(
+            latest_close, max(highs) if highs else None
+        ),
+        "distance_from_low_pct": percentage_change(
+            latest_close, min(lows) if lows else None
+        ),
+    }
+    for field in ("turnover", "volume", "turnover_rate", "amplitude"):
+        values = [
+            value
+            for item in window_items
+            if (value := to_number(item.get(field))) is not None
+        ]
+        latest_value = to_number(latest.get(field))
+        prior_values = values[:-1] if len(values) > 1 else []
+        prior_average = mean_or_none(prior_values)
+        metrics[field] = {
+            "latest": latest_value,
+            "prior_sessions_average": prior_average,
+            "latest_vs_prior_average_ratio": (
+                round(latest_value / prior_average, 4)
+                if latest_value is not None and prior_average not in (None, 0)
+                else None
+            ),
+            "percentile_rank_in_window": percentile_rank(latest_value, values),
+            "available_observations": len(values),
+        }
+    return metrics
+
+
+def get_historical_context_data(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    payload = get_kline_data(symbol, "daily", 260)
+    items = payload["items"]
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Historical context not found: {symbol}")
+    latest = items[-1]
+    latest_date = clean_value(latest.get("date"))
+    is_incomplete_session = (
+        latest_date == datetime.now(MARKET_TIMEZONE).date().isoformat()
+        and market_status_at() == "open"
+    )
+    windows = {
+        str(window): historical_window_metrics(items, window)
+        for window in HISTORICAL_CONTEXT_WINDOWS
+    }
+    return {
+        "symbol": symbol,
+        "security_type": payload.get("security_type"),
+        "exchange": payload.get("exchange"),
+        "period": "daily",
+        "adjustment": payload.get("adjustment", "forward_adjusted"),
+        "adjustment_source_parameter": payload.get("adjustment_source_parameter"),
+        "latest_trade_date": latest_date,
+        "latest_close": to_number(latest.get("close")),
+        "latest_session_may_be_incomplete": is_incomplete_session,
+        "source_sessions": len(items),
+        "windows": windows,
+        "source": payload.get("source"),
+        "source_errors": payload.get("source_errors", []),
+        "queried_at": now_iso(),
+        "data_status": (
+            "full_data"
+            if all(item["window_complete"] for item in windows.values())
+            else "partial_data"
+        ),
+        "note": "Historical values are mechanical forward-adjusted facts. Percentiles describe location within each window and are not scores or recommendations.",
+    }
+
+
+def parse_yyyymmdd(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{8}", text):
+        return None
+    try:
+        return datetime.strptime(text, "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def get_security_reference_data(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    fields = "f57,f58,f43,f47,f48,f60,f124,f189,f292,f84,f85,f127,f128"
+    payload = read_public_json(
+        "https://push2.eastmoney.com/api/qt/stock/get"
+        f"?secid={eastmoney_secid(symbol)}&fields={fields}",
+        "https://quote.eastmoney.com/",
+    )
+    data = payload.get("data") or {}
+    if not data:
+        raise HTTPException(status_code=404, detail=f"Security reference not found: {symbol}")
+    return {
+        "symbol": clean_value(data.get("f57")) or symbol,
+        "name": clean_value(data.get("f58")),
+        "listing_date": parse_yyyymmdd(data.get("f189")),
+        "source_security_status_code": clean_value(data.get("f292")),
+        "industry": clean_value(data.get("f127")),
+        "region": clean_value(data.get("f128")),
+        "total_shares": to_number(data.get("f84")),
+        "circulating_shares": to_number(data.get("f85")),
+        "source": "eastmoney_security_reference",
+        "queried_at": now_iso(),
+    }
+
+
+def collect_components(
+    loaders: dict[str, Any], response_budget_seconds: float
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    def timed_load(loader: Any) -> tuple[Any, int]:
+        started = perf_counter()
+        return loader(), int((perf_counter() - started) * 1000)
+
+    executor = ThreadPoolExecutor(max_workers=len(loaders))
+    futures = {executor.submit(timed_load, loader): name for name, loader in loaders.items()}
+    done, pending = wait(futures, timeout=response_budget_seconds)
+    results: dict[str, Any] = {}
+    statuses: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    for future in done:
+        name = futures[future]
+        try:
+            result, latency_ms = future.result()
+            results[name] = result
+            statuses[name] = {"status": "available", "latency_ms": latency_ms}
+        except HTTPException as exc:
+            statuses[name] = {"status": "unavailable", "latency_ms": None}
+            errors.append(
+                {
+                    "source": name,
+                    "error_type": classify_error_type(exc.detail, exc.status_code),
+                    "message": str(exc.detail),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive component boundary
+            statuses[name] = {"status": "unavailable", "latency_ms": None}
+            errors.append(
+                {"source": name, "error_type": "unexpected_error", "message": str(exc)}
+            )
+    for future in pending:
+        name = futures[future]
+        future.cancel()
+        statuses[name] = {
+            "status": "unavailable_within_response_budget",
+            "latency_ms": None,
+        }
+        errors.append(
+            {
+                "source": name,
+                "error_type": "timeout",
+                "message": f"Component exceeded the {response_budget_seconds:g} second response budget.",
+            }
+        )
+    executor.shutdown(wait=False, cancel_futures=True)
+    return results, statuses, errors
+
+
+def build_security_status_data(
+    symbol: str,
+    quote_payload: dict[str, Any] | None,
+    reference: dict[str, Any] | None,
+    announcements: dict[str, Any] | None,
+    component_status: dict[str, Any] | None = None,
+    source_errors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    security = security_metadata(symbol)
+    quote = (quote_payload or {}).get("quote") or {}
+    reference = reference or {}
+    name = quote.get("name") or reference.get("name")
+    listing_date = reference.get("listing_date")
+    listing_age_days = None
+    if listing_date:
+        listing_age_days = (
+            datetime.now(MARKET_TIMEZONE).date()
+            - datetime.fromisoformat(listing_date).date()
+        ).days
+    announcement_items = (announcements or {}).get("items") or []
+    corporate_actions = [
+        item
+        for item in announcement_items
+        if has_corporate_action_tag(item.get("event_tags"))
+    ]
+    is_st = is_st_security(name)
+    standard_limit = price_limit_pct(symbol, is_st)
+    return {
+        "symbol": symbol,
+        "name": name,
+        "security_type": security["security_type"],
+        "exchange": security["exchange"],
+        "industry": reference.get("industry"),
+        "region": reference.get("region"),
+        "listing_date": listing_date,
+        "listing_age_calendar_days": listing_age_days,
+        "is_st_name_flag": is_st,
+        "is_delisting_arrangement_name_flag": "退" in str(name or ""),
+        "current_quote_observation": {
+            "status": "quote_available" if quote.get("price") is not None else "unavailable",
+            "price": quote.get("price"),
+            "trade_date": quote.get("trade_date"),
+            "quote_time": quote.get("quote_time"),
+            "volume": quote.get("volume"),
+            "source_updated_at": quote.get("source_updated_at"),
+        },
+        "suspension_status": "not_confirmed_by_current_data_contract",
+        "recent_suspension_resume_announcements": [
+            item
+            for item in announcement_items
+            if "suspension_resume" in (item.get("event_tags") or [])
+        ],
+        "source_security_status_code": reference.get("source_security_status_code"),
+        "source_security_status_code_interpretation": "raw_source_code_not_mapped_to_an_official_exchange_status",
+        "price_limit_reference": {
+            "standard_daily_limit_pct": standard_limit,
+            "scope": "mechanical_standard_rule_from_security_code_and_ST_name_flag",
+            "exceptions": "IPO initial no-limit sessions, relisting, resumed trading, and product-specific rules require separate official confirmation.",
+        },
+        "price_history_adjustment": {
+            "mode": "forward_adjusted",
+            "eastmoney_parameter": "fqt=1",
+            "tencent_parameter": "qfq",
+            "intraday_adjustment": "not_applicable_to_same-day_minutes",
+        },
+        "recent_corporate_action_announcements": corporate_actions,
+        "corporate_action_date_scope": "announcement_publication_dates_only_unless_the_title_explicitly_states_an_effective_date",
+        "component_status": component_status or {},
+        "source": [
+            source
+            for source in (
+                (quote_payload or {}).get("source"),
+                reference.get("source"),
+                *((announcements or {}).get("source") or []),
+            )
+            if source
+        ],
+        "source_errors": source_errors or [],
+        "queried_at": now_iso(),
+        "data_status": "full_data" if quote_payload and reference else "partial_data",
+        "note": "This tool reports observable status facts and standard rule references. It does not infer whether a security should be traded.",
+    }
+
+
+def has_corporate_action_tag(tags: Any) -> bool:
+    return bool(CORPORATE_ACTION_EVENT_TAGS & set(tags or []))
+
+
+def get_security_status_data(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
+    loaders: dict[str, Any] = {
+        "quote": lambda: get_quote_data(symbol),
+        "security_reference": lambda: get_security_reference_data(symbol),
+    }
+    if security["security_type"] not in {"etf", "lof"}:
+        loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 20)
+    results, statuses, errors = collect_components(loaders, 8)
+    if not results.get("quote") and not results.get("security_reference"):
+        raise HTTPException(status_code=502, detail="Security status sources were unavailable.")
+    return build_security_status_data(
+        symbol,
+        results.get("quote"),
+        results.get("security_reference"),
+        results.get("official_announcements"),
+        statuses,
+        errors,
+    )
+
+
+def compact_intraday_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload.get(key)
+        for key in (
+            "symbol",
+            "name",
+            "security_type",
+            "exchange",
+            "previous_close",
+            "open",
+            "high",
+            "low",
+            "count",
+            "latest_market_time",
+            "market_time",
+            "mechanical_indicators",
+            "source",
+            "source_errors",
+        )
+    } | {"latest_minutes": (payload.get("items") or [])[-10:]}
+
+
+def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict[str, Any]:
+    started_at = perf_counter()
+    started_iso = now_iso()
+    symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
+    benchmark = benchmark_symbol or default_benchmark_identifier(symbol)
+    loaders: dict[str, Any] = {
+        "quote": lambda: get_quote_data(symbol),
+        "intraday": lambda: get_intraday_data(symbol, 60),
+        "historical_context": lambda: get_historical_context_data(symbol),
+        "security_reference": lambda: get_security_reference_data(symbol),
+        "relative_strength": lambda: get_relative_strength_data(symbol, benchmark, None),
+        "market_overview": lambda: get_market_overview_data(5),
+    }
+    if security["security_type"] not in {"etf", "lof"}:
+        loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 10)
+        loaders["financials"] = lambda: get_financial_data(symbol, 4)
+    results, statuses, errors = collect_components(loaders, 12)
+    if security["security_type"] in {"etf", "lof"}:
+        statuses["official_announcements"] = {
+            "status": "not_applicable_to_exchange_listed_fund",
+            "latency_ms": None,
+        }
+        statuses["financials"] = {
+            "status": "not_applicable_to_exchange_listed_fund",
+            "latency_ms": None,
+        }
+    quote_payload = results.get("quote")
+    security_status = build_security_status_data(
+        symbol,
+        quote_payload,
+        results.get("security_reference"),
+        results.get("official_announcements"),
+        {
+            key: statuses.get(key)
+            for key in ("quote", "security_reference", "official_announcements")
+            if key in statuses
+        },
+        [error for error in errors if error["source"] in {"quote", "security_reference", "official_announcements"}],
+    )
+    completed_iso = now_iso()
+    snapshot_id = (
+        f"{symbol}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
+    decision_inputs = {
+        "quote": quote_payload,
+        "intraday": (
+            compact_intraday_context(results["intraday"])
+            if "intraday" in results
+            else None
+        ),
+        "historical_context": results.get("historical_context"),
+        "security_status": security_status,
+        "relative_strength": results.get("relative_strength"),
+        "official_announcements": results.get("official_announcements"),
+        "financials": results.get("financials"),
+        "market_overview": results.get("market_overview"),
+    }
+    applicable_component_names = set(decision_inputs)
+    if security["security_type"] in {"etf", "lof"}:
+        applicable_component_names -= {"official_announcements", "financials"}
+    available_count = sum(
+        decision_inputs[name] is not None for name in applicable_component_names
+    )
+    requested_count = len(applicable_component_names)
+    return {
+        "snapshot_id": snapshot_id,
+        "symbol": symbol,
+        "benchmark_identifier": benchmark,
+        "snapshot_started_at": started_iso,
+        "snapshot_completed_at": completed_iso,
+        "snapshot_span_ms": int((perf_counter() - started_at) * 1000),
+        "component_status": statuses,
+        "available_component_count": available_count,
+        "requested_component_count": requested_count,
+        "applicable_components": sorted(applicable_component_names),
+        "decision_inputs": decision_inputs,
+        "excluded_components": {
+            "news": "excluded_pending_relevance_deduplication_and_source_quality_upgrade"
+        },
+        "source": sorted(
+            {
+                str(source)
+                for value in results.values()
+                if isinstance(value, dict)
+                for source in normalize_sources(value.get("source"))
+            }
+        ),
+        "source_errors": errors,
+        "queried_at": completed_iso,
+        "data_status": (
+            "full_data"
+            if available_count == requested_count and not errors
+            else "partial_data"
+        ),
+        "note": "Evidence packet only. It contains facts, comparisons, timestamps, provenance, and missing-data reasons; GPT remains responsible for interpretation and judgement.",
     }
 
 
@@ -4072,6 +4548,10 @@ def get_a_share_kline(
             "security_type": payload.get("security_type"),
             "exchange": payload.get("exchange"),
             "period": payload["period"],
+            "adjustment": payload.get("adjustment"),
+            "adjustment_source_parameter": payload.get(
+                "adjustment_source_parameter"
+            ),
             "count": payload["count"],
             "items": [
                 {field: clean_value(item.get(field)) for field in KLINE_RESPONSE_FIELDS}
@@ -4252,6 +4732,89 @@ def get_a_share_announcements(
         {"symbol": symbol, "days": normalized_days, "limit": normalized_limit},
         300,
         lambda: get_announcement_data(symbol, normalized_days, normalized_limit),
+        symbol,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_historical_context",
+    title="Get mechanical A-share historical context",
+    description=(
+        "Get forward-adjusted 20, 60, 120, and 250-session returns, volatility, drawdown, "
+        "range, turnover, volume, turnover-rate, and amplitude context without scores or recommendations."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_historical_context(symbol: str) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="symbol is required."),
+        )
+    return run_cached_tool(
+        "get_a_share_historical_context",
+        {"symbol": symbol},
+        300,
+        lambda: get_historical_context_data(symbol),
+        symbol,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_security_status",
+    title="Get A-share adjustment and security-status facts",
+    description=(
+        "Get price-history adjustment, listing, ST-name, standard price-limit reference, current quote observation, "
+        "and recent official corporate-action announcement facts without inferring a trading decision."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_security_status(symbol: str) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="symbol is required."),
+        )
+    return run_cached_tool(
+        "get_a_share_security_status",
+        {"symbol": symbol},
+        60,
+        lambda: get_security_status_data(symbol),
+        symbol,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_decision_context",
+    title="Get an evidence packet for GPT judgement",
+    description=(
+        "Concurrently gather quote, compact intraday structure, historical context, security status, relative strength, "
+        "official announcements, financials, and market overview. Returns evidence and missing-data reasons only; "
+        "GPT remains responsible for judgement."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_decision_context(
+    symbol: str,
+    benchmark_symbol: str | None = None,
+) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="symbol is required."),
+        )
+    parameters = {
+        "symbol": symbol,
+        "benchmark_symbol": benchmark_symbol,
+    }
+    return run_cached_tool(
+        "get_a_share_decision_context",
+        parameters,
+        5,
+        lambda: get_decision_context_data(symbol, benchmark_symbol),
         symbol,
     )
 
