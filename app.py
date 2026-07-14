@@ -5,6 +5,9 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+from html import unescape
 from math import ceil, sqrt
 from threading import Event, Lock
 from time import perf_counter
@@ -12,6 +15,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree  # nosec B405
 
 import efinance as ef
 import pandas as pd
@@ -23,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "parallel_fallback_singleflight_stale_cache_v2"
+ROUTING_REVISION = "relevant_multi_source_news_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -32,6 +36,9 @@ MCP_INSTRUCTIONS = (
     "sector rankings, and operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
+    "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
+    "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
+    "for current company events. News results are evidence with provenance, not positive/negative judgements. "
     "All data is informational only and is not investment advice."
 )
 
@@ -65,7 +72,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.8.0",
+    version="0.9.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -2273,16 +2280,58 @@ def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
 def strip_html(value: Any) -> str | None:
     if value in (None, ""):
         return None
-    return re.sub(r"<[^>]+>", "", str(value)).replace("\r", " ").replace("\n", " ").strip()
+    return unescape(re.sub(r"<[^>]+>", "", str(value))).replace("\r", " ").replace("\n", " ").strip()
 
 
-def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
-    symbol = normalize_symbol(symbol)
-    security = security_metadata(symbol)
+ESTABLISHED_NEWS_SOURCE_MARKERS = (
+    "新华社",
+    "央视新闻",
+    "中国证券报",
+    "上海证券报",
+    "证券时报",
+    "财联社",
+    "第一财经",
+    "每日经济新闻",
+    "澎湃新闻",
+    "界面新闻",
+    "中国基金报",
+    "经济观察报",
+    "21世纪经济报道",
+)
+
+OFFICIAL_NEWS_SOURCE_MARKERS = (
+    "国务院",
+    "中国证监会",
+    "国家统计局",
+    "上海证券交易所",
+    "深圳证券交易所",
+    "北京证券交易所",
+)
+
+EXCLUDED_CURRENT_NEWS_SOURCE_MARKERS = (
+    "wikipedia",
+    "维基百科",
+    "百度百科",
+    "互动百科",
+    "arxiv",
+)
+
+ROUTINE_MARKET_TABLE_TITLE_MARKERS = (
+    "股票行情快报",
+    "资金流出榜",
+    "资金流入榜",
+    "主力动向",
+    "特大单净流",
+    "融资客青睐",
+    "大宗交易超",
+)
+
+
+def get_eastmoney_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
     callback = "marketNewsCallback"
     parameters = {
         "uid": "",
-        "keyword": symbol,
+        "keyword": keyword,
         "type": ["cmsArticleWebOld"],
         "client": "web",
         "clientType": "web",
@@ -2292,7 +2341,7 @@ def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
                 "searchScope": "default",
                 "sort": "default",
                 "pageIndex": 1,
-                "pageSize": limit,
+                "pageSize": min(max(limit, 10), 30),
                 "preTag": "<em>",
                 "postTag": "</em>",
             }
@@ -2307,28 +2356,339 @@ def get_news_data(symbol: str, limit: int) -> dict[str, Any]:
     )
     payload = read_public_jsonp(
         f"https://search-api-web.eastmoney.com/search/jsonp?{query}",
-        f"https://so.eastmoney.com/news/s?keyword={symbol}",
+        f"https://so.eastmoney.com/news/s?{urlencode({'keyword': keyword})}",
     )
     articles = (payload.get("result") or {}).get("cmsArticleWebOld") or []
-    items = [
+    return [
         {
-            "published_at": clean_value(article.get("date")),
+            "published_at": format_market_time(article.get("date")),
             "title": strip_html(article.get("title")),
             "summary": strip_html(article.get("content")),
             "source": clean_value(article.get("mediaName")),
+            "publisher_homepage": None,
             "url": clean_value(article.get("url")),
+            "link_type": "eastmoney_reprint_or_hosted_copy",
+            "retrieval_provider": "eastmoney_news_search",
+            "matched_query": keyword,
+            "event_date": None,
+            "event_date_status": "not_verified_from_search_snippet",
         }
         for article in articles[:limit]
+        if article.get("title") and article.get("url")
     ]
+
+
+def get_google_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
+    query = urlencode(
+        {
+            "q": keyword,
+            "hl": "zh-CN",
+            "gl": "CN",
+            "ceid": "CN:zh-Hans",
+        }
+    )
+    url = f"https://news.google.com/rss/search?{query}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        },
+    )
+    started_at = perf_counter()
+    try:
+        # The URL host is fixed and is not derived from user input.
+        with urlopen(request, timeout=5) as response:  # nosec B310
+            payload = response.read()
+        unsafe_xml_declaration = (
+            b"<!DOCTYPE" in payload.upper() or b"<!ENTITY" in payload.upper()
+        )
+        if len(payload) > 2_000_000 or unsafe_xml_declaration:
+            raise ValueError("Google News RSS XML exceeded safety limits.")
+        # DTD/entity declarations are rejected above before parsing the fixed-host RSS.
+        root = ElementTree.fromstring(payload)  # nosec B314
+        record_source_health("google_news", True, int((perf_counter() - started_at) * 1000))
+    except (OSError, URLError, ValueError, ElementTree.ParseError) as exc:
+        record_source_health(
+            "google_news", False, int((perf_counter() - started_at) * 1000), str(exc)
+        )
+        raise HTTPException(status_code=502, detail=f"Google News RSS unavailable: {exc}") from exc
+
+    items = []
+    for item in root.findall(".//item")[:limit]:
+        source_element = item.find("source")
+        publisher = clean_value(source_element.text if source_element is not None else None)
+        title = strip_html(item.findtext("title"))
+        if title and publisher and title.endswith(f" - {publisher}"):
+            title = title[: -(len(str(publisher)) + 3)].strip()
+        published_at = clean_value(item.findtext("pubDate"))
+        try:
+            published_at = (
+                parsedate_to_datetime(str(published_at))
+                .astimezone(MARKET_TIMEZONE)
+                .isoformat()
+            )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        url_value = clean_value(item.findtext("link"))
+        if not title or not url_value:
+            continue
+        items.append(
+            {
+                "published_at": published_at,
+                "title": title,
+                "summary": None,
+                "source": publisher,
+                "publisher_homepage": clean_value(
+                    source_element.get("url") if source_element is not None else None
+                ),
+                "url": url_value,
+                "link_type": "google_news_redirect_to_publisher",
+                "retrieval_provider": "google_news_rss",
+                "matched_query": keyword,
+                "event_date": None,
+                "event_date_status": "not_verified_from_rss_title",
+            }
+        )
+    return items
+
+
+def normalized_industry_news_term(value: Any) -> str | None:
+    text = str(value or "").strip()
+    text = re.sub(r"[ⅠⅡⅢⅣIV]+$", "", text).strip()
+    return text or None
+
+
+def news_source_tier(item: dict[str, Any]) -> str:
+    source_text = " ".join(
+        str(value or "")
+        for value in (item.get("source"), item.get("publisher_homepage"))
+    ).lower()
+    if any(marker.lower() in source_text for marker in OFFICIAL_NEWS_SOURCE_MARKERS):
+        return "official_or_regulatory"
+    if any(marker.lower() in source_text for marker in ESTABLISHED_NEWS_SOURCE_MARKERS):
+        return "established_financial_media"
+    return "general_news_source"
+
+
+def news_relevance(
+    item: dict[str, Any],
+    symbol: str,
+    company_name: str | None,
+    industry: str | None,
+    include_industry_context: bool,
+) -> tuple[str | None, int, list[str]]:
+    title = str(item.get("title") or "")
+    summary = str(item.get("summary") or "")
+    title_lower = title.lower()
+    combined_lower = f"{title} {summary}".lower()
+    source_text = f"{item.get('source') or ''} {item.get('publisher_homepage') or ''}".lower()
+    if any(marker.lower() in source_text for marker in EXCLUDED_CURRENT_NEWS_SOURCE_MARKERS):
+        return None, 0, ["excluded_reference_or_academic_source"]
+    if any(marker in title for marker in ROUTINE_MARKET_TABLE_TITLE_MARKERS):
+        return None, 0, ["excluded_routine_market_snapshot_or_table"]
+
+    reasons = []
+    score = 0
+    name_lower = str(company_name or "").lower()
+    if name_lower and re.search(
+        rf"(?:\d+(?:\.\d+)?\s*个|相当于|堪比|市值.{{0,8}}(?:超|超过|追平)).{{0,8}}{re.escape(name_lower)}",
+        title_lower,
+    ):
+        return None, 0, ["excluded_company_used_only_as_comparison"]
+    if name_lower and len(title_lower) > 60 and title_lower.find(name_lower) > 35:
+        return None, 0, ["excluded_company_mentioned_late_in_roundup_title"]
+    if name_lower and name_lower in title_lower:
+        score += 10
+        reasons.append("company_name_in_title")
+    elif name_lower and name_lower in combined_lower:
+        score += 6
+        reasons.append("company_name_in_summary")
+    if symbol in title:
+        score += 8
+        reasons.append("stock_code_in_title")
+    elif symbol in summary:
+        score += 2
+        reasons.append("stock_code_in_summary")
+
+    if (name_lower and name_lower in combined_lower) or symbol in title:
+        return "company", score, reasons
+
+    industry_lower = str(industry or "").lower()
+    if include_industry_context and industry_lower and industry_lower in combined_lower:
+        reasons.append("industry_term_present")
+        return "industry_context", max(score, 3), reasons
+    return None, score, reasons
+
+
+def normalized_news_title(value: Any) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def news_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=MARKET_TIMEZONE)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def get_news_data(
+    symbol: str,
+    limit: int,
+    days: int = 30,
+    include_industry_context: bool = False,
+) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
+    source_errors = []
+    try:
+        reference = get_resilient_security_reference_data(symbol)
+    except HTTPException as exc:
+        source_errors.append(f"security_reference: {exc.detail}")
+        reference = {}
+    company_name = clean_value(reference.get("name"))
+    industry = normalized_industry_news_term(reference.get("industry"))
+    if not company_name:
+        try:
+            quote, quote_source, quote_errors = get_fastest_public_quote(symbol)
+            company_name = clean_value(quote.get("name"))
+            source_errors.extend(quote_errors)
+            reference["source"] = quote_source
+        except HTTPException as exc:
+            source_errors.append(f"company_name_fallback: {exc.detail}")
+
+    jobs: list[tuple[str, Any]] = [(symbol, get_eastmoney_news_items)]
+    if company_name:
+        jobs.extend(
+            [
+                (str(company_name), get_eastmoney_news_items),
+                (f'"{company_name}" 股票', get_google_news_items),
+            ]
+        )
+    if include_industry_context and industry:
+        jobs.append((f'"{industry}" 行业', get_google_news_items))
+
+    candidates: list[dict[str, Any]] = []
+    provider_status: dict[str, dict[str, Any]] = {}
+    per_query_limit = min(max(limit * 3, 12), 30)
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {
+            executor.submit(loader, keyword, per_query_limit): (keyword, loader.__name__)
+            for keyword, loader in jobs
+        }
+        for future in as_completed(futures):
+            keyword, loader_name = futures[future]
+            status_key = f"{loader_name}:{keyword}"
+            try:
+                rows = future.result()
+                candidates.extend(rows)
+                provider_status[status_key] = {"status": "available", "count": len(rows)}
+            except HTTPException as exc:
+                provider_status[status_key] = {"status": "unavailable", "count": 0}
+                source_errors.append(f"{status_key}: {exc.detail}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    relevant = []
+    excluded_count = 0
+    for item in candidates:
+        published = news_datetime(item.get("published_at"))
+        if published is not None and published < cutoff:
+            excluded_count += 1
+            continue
+        scope, score, reasons = news_relevance(
+            item, symbol, str(company_name or "") or None, industry, include_industry_context
+        )
+        if scope is None:
+            excluded_count += 1
+            continue
+        item["relevance_scope"] = scope
+        item["relevance_score"] = score
+        item["relevance_reasons"] = reasons
+        item["source_tier"] = news_source_tier(item)
+        relevant.append(item)
+
+    tier_rank = {
+        "official_or_regulatory": 3,
+        "established_financial_media": 2,
+        "general_news_source": 1,
+    }
+    relevant.sort(
+        key=lambda item: (
+            item.get("relevance_score", 0),
+            tier_rank.get(str(item.get("source_tier")), 0),
+            (news_datetime(item.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
+        ),
+        reverse=True,
+    )
+
+    deduplicated = []
+    title_keys: list[str] = []
+    duplicate_count = 0
+    for item in relevant:
+        title_key = normalized_news_title(item.get("title"))
+        if not title_key:
+            excluded_count += 1
+            continue
+        if any(SequenceMatcher(None, title_key, existing).ratio() >= 0.86 for existing in title_keys):
+            duplicate_count += 1
+            continue
+        title_keys.append(title_key)
+        deduplicated.append(item)
+
+    if include_industry_context:
+        company_items = [
+            item for item in deduplicated if item["relevance_scope"] == "company"
+        ]
+        industry_items = [
+            item for item in deduplicated if item["relevance_scope"] == "industry_context"
+        ]
+        industry_slots = min(len(industry_items), max(1, min(2, limit // 4)))
+        selected_items = [
+            *company_items[: max(0, limit - industry_slots)],
+            *industry_items[:industry_slots],
+        ]
+    else:
+        selected_items = deduplicated[:limit]
+
+    providers = sorted(
+        {
+            str(item.get("retrieval_provider"))
+            for item in selected_items
+            if item.get("retrieval_provider")
+        }
+    )
     return {
         "symbol": symbol,
+        "name": company_name,
+        "industry": industry,
         "security_type": security["security_type"],
         "exchange": security["exchange"],
-        "count": len(items),
-        "items": items,
-        "source": "eastmoney",
+        "period_days": days,
+        "include_industry_context": include_industry_context,
+        "count": len(selected_items),
+        "items": selected_items,
+        "candidate_count": len(candidates),
+        "excluded_count": excluded_count,
+        "duplicate_count": duplicate_count,
+        "provider_status": provider_status,
+        "source": providers,
+        "source_errors": source_errors,
         "queried_at": now_iso(),
-        "note": "News search may include broader articles that mention the stock code.",
+        "selection_policy": (
+            "Company results require the company name in title/summary or the stock code in the title. "
+            "Industry-only results are returned separately only when include_industry_context is true. "
+            "Near-duplicate titles and encyclopedia/academic-reference sources are excluded mechanically."
+        ),
+        "time_scope": (
+            "published_at is the article publication time. event_date remains null unless it can be "
+            "verified separately; publication time must not be treated as event time."
+        ),
+        "note": "Evidence retrieval only. Source tier and relevance fields are mechanical metadata, not truth, importance, sentiment, or trading judgements.",
     }
 
 
@@ -2966,6 +3326,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "security_reference": lambda: get_resilient_security_reference_data(symbol),
         "relative_strength": lambda: get_relative_strength_data(symbol, benchmark, None),
         "market_overview": lambda: get_market_overview_data(5),
+        "news": lambda: get_news_data(symbol, 8, 30, False),
     }
     if security["security_type"] not in {"etf", "lof"}:
         loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 10)
@@ -3010,6 +3371,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "official_announcements": results.get("official_announcements"),
         "financials": results.get("financials"),
         "market_overview": results.get("market_overview"),
+        "news": results.get("news"),
     }
     applicable_component_names = set(decision_inputs)
     if security["security_type"] in {"etf", "lof"}:
@@ -3030,9 +3392,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "requested_component_count": requested_count,
         "applicable_components": sorted(applicable_component_names),
         "decision_inputs": decision_inputs,
-        "excluded_components": {
-            "news": "excluded_pending_relevance_deduplication_and_source_quality_upgrade"
-        },
+        "excluded_components": {},
         "source": sorted(
             {
                 str(source)
@@ -4914,18 +5274,41 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
 
 @mcp.tool(
     name="get_a_share_news",
-    title="Get A-share news",
-    description="Get up to 10 recent public news articles that mention one A-share stock code.",
+    title="Get relevant multi-source A-share news",
+    description=(
+        "Search recent public company news by stock code and verified company name across multiple news indexes. "
+        "Returns mechanically filtered, deduplicated evidence with publisher, publication time, relevance reasons, "
+        "source tier, link type, and source failures. Use this before broad web search for current company events. "
+        "Set include_industry_context only when broader industry context is requested. It does not judge sentiment, "
+        "importance, truth, or trading impact."
+    ),
     annotations=READ_ONLY_TOOL,
 )
-def get_a_share_news(symbol: str, limit: int = 5) -> dict[str, Any]:
+def get_a_share_news(
+    symbol: str,
+    limit: int = 5,
+    days: int = 30,
+    include_industry_context: bool = False,
+) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
         return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
     normalized_limit = max(1, min(limit, 10))
+    normalized_days = max(1, min(days, 90))
     return run_cached_tool(
-        "get_a_share_news", {"symbol": symbol, "limit": normalized_limit}, 120,
-        lambda: get_news_data(symbol, normalized_limit), symbol,
+        "get_a_share_news",
+        {
+            "symbol": symbol,
+            "limit": normalized_limit,
+            "days": normalized_days,
+            "include_industry_context": include_industry_context,
+        },
+        300,
+        lambda: get_news_data(
+            symbol, normalized_limit, normalized_days, include_industry_context
+        ),
+        symbol,
+        max_stale_age_seconds=3600,
     )
 
 

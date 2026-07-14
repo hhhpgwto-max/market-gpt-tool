@@ -182,12 +182,19 @@ def fake_get_financial_data(symbol: str, limit: int) -> dict:
     }
 
 
-def fake_get_news_data(symbol: str, limit: int) -> dict:
+def fake_get_news_data(
+    symbol: str,
+    limit: int,
+    days: int = 30,
+    include_industry_context: bool = False,
+) -> dict:
     return {
         "symbol": symbol,
         "count": limit,
         "items": [{"title": "Test news", "url": "https://example.com/news"}],
         "source": "test",
+        "period_days": days,
+        "include_industry_context": include_industry_context,
         "time": "2026-07-10T00:00:00+00:00",
         "note": "For information only. Not investment advice.",
     }
@@ -245,15 +252,13 @@ def fake_get_decision_context_data(
         "snapshot_id": f"{symbol}-test",
         "symbol": symbol,
         "benchmark_identifier": benchmark_symbol or "index:000001",
-        "available_component_count": 8,
-        "requested_component_count": 8,
+        "available_component_count": 9,
+        "requested_component_count": 9,
         "decision_inputs": {
             "quote": {"symbol": symbol},
             "historical_context": fake_get_historical_context_data(symbol),
         },
-        "excluded_components": {
-            "news": "excluded_pending_relevance_deduplication_and_source_quality_upgrade"
-        },
+        "excluded_components": {},
         "source": ["test"],
         "source_errors": [],
         "data_status": "full_data",
@@ -1319,7 +1324,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v2"
+    assert health["routing_revision"] == "relevant_multi_source_news_v1"
 
     market_app.TOOL_CACHE.clear()
     concurrent_calls = 0
@@ -1494,6 +1499,139 @@ def test_historical_context_and_security_status_facts() -> None:
         market_app.read_public_json = original_json
 
 
+def test_news_relevance_deduplication_and_source_metadata() -> None:
+    original_reference = market_app.get_resilient_security_reference_data
+    original_eastmoney = market_app.get_eastmoney_news_items
+    original_google = market_app.get_google_news_items
+    published_at = market_app.now_iso()
+    try:
+        market_app.get_resilient_security_reference_data = lambda _symbol: {
+            "symbol": "600519",
+            "name": "贵州茅台",
+            "industry": "白酒Ⅱ",
+            "source": "test_reference",
+            "source_errors": [],
+        }
+
+        def item(
+            title: str,
+            summary: str | None,
+            source: str,
+            url: str,
+            provider: str,
+            keyword: str,
+            homepage: str | None = None,
+        ) -> dict:
+            return {
+                "published_at": published_at,
+                "title": title,
+                "summary": summary,
+                "source": source,
+                "publisher_homepage": homepage,
+                "url": url,
+                "link_type": "test_link",
+                "retrieval_provider": provider,
+                "matched_query": keyword,
+                "event_date": None,
+                "event_date_status": "not_verified_from_test_result",
+            }
+
+        def eastmoney_items(keyword: str, _limit: int) -> list[dict]:
+            if keyword == "600519":
+                return [
+                    item(
+                        "贵州茅台发布新品",
+                        "贵州茅台（600519）发布新品。",
+                        "证券时报网",
+                        "https://example.com/direct",
+                        "eastmoney_news_search",
+                        keyword,
+                    ),
+                    item(
+                        "股票行情快报：47股资金流向一览",
+                        "表格末尾出现贵州茅台（600519）。",
+                        "普通网站",
+                        "https://example.com/noise",
+                        "eastmoney_news_search",
+                        keyword,
+                    ),
+                ]
+            return [
+                item(
+                    "贵州茅台发布新品！",
+                    "同一事件的重复稿件。",
+                    "普通网站",
+                    "https://example.com/duplicate",
+                    "eastmoney_news_search",
+                    keyword,
+                )
+            ]
+
+        def google_items(keyword: str, _limit: int) -> list[dict]:
+            if "行业" in keyword:
+                return [
+                    item(
+                        "白酒行业发布新的公开统计数据",
+                        None,
+                        "新华社",
+                        "https://news.google.com/industry",
+                        "google_news_rss",
+                        keyword,
+                        "https://www.news.cn",
+                    )
+                ]
+            return [
+                item(
+                    "贵州茅台回应市场关注事项",
+                    None,
+                    "第一财经",
+                    "https://news.google.com/company",
+                    "google_news_rss",
+                    keyword,
+                    "https://www.yicai.com",
+                ),
+                item(
+                    "贵州茅台研究论文",
+                    None,
+                    "arXiv",
+                    "https://news.google.com/paper",
+                    "google_news_rss",
+                    keyword,
+                    "https://arxiv.org",
+                ),
+                item(
+                    "中际旭创市值超贵州茅台，资金从消费流向AI",
+                    None,
+                    "普通网站",
+                    "https://news.google.com/comparison",
+                    "google_news_rss",
+                    keyword,
+                    "https://example.com",
+                ),
+            ]
+
+        market_app.get_eastmoney_news_items = eastmoney_items
+        market_app.get_google_news_items = google_items
+        result = market_app.get_news_data("600519", 10, 30, True)
+
+        assert result["name"] == "贵州茅台"
+        assert result["industry"] == "白酒"
+        assert result["duplicate_count"] == 1
+        assert result["excluded_count"] == 3
+        assert {row["relevance_scope"] for row in result["items"]} == {
+            "company",
+            "industry_context",
+        }
+        assert all(row["event_date"] is None for row in result["items"])
+        assert all("arxiv" not in str(row["source"]).lower() for row in result["items"])
+        assert "google_news_rss" in result["source"]
+        assert "eastmoney_news_search" in result["source"]
+    finally:
+        market_app.get_resilient_security_reference_data = original_reference
+        market_app.get_eastmoney_news_items = original_eastmoney
+        market_app.get_google_news_items = original_google
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
@@ -1510,6 +1648,7 @@ def main() -> None:
     test_fast_market_aggregate()
     test_intraday_and_index_fallback_parsers()
     test_announcements_relative_strength_and_anomaly_scan()
+    test_news_relevance_deduplication_and_source_metadata()
     test_reliability_envelope_cache_and_health()
     test_historical_context_and_security_status_facts()
     market_app.TOOL_CACHE.clear()
@@ -1539,7 +1678,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "parallel_fallback_singleflight_stale_cache_v2"
+        assert health.json()["routing_revision"] == "relevant_multi_source_news_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
