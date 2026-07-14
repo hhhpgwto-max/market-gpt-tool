@@ -189,6 +189,55 @@ def fake_get_news_data(symbol: str, limit: int) -> dict:
     }
 
 
+def fake_get_announcement_data(symbol: str, days: int, limit: int) -> dict:
+    return {
+        "symbol": symbol,
+        "exchange": "SSE",
+        "period": {"start": "2026-07-01", "end": "2026-07-10"},
+        "count": 1,
+        "items": [
+            {
+                "title": "Test official announcement",
+                "event_tags": ["other"],
+                "url": "https://static.sse.com.cn/test.pdf",
+            }
+        ][:limit],
+        "source": ["official_sse_announcements"],
+        "source_errors": [],
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_get_relative_strength_data(
+    symbol: str,
+    benchmark_symbol: str | None,
+    peer_symbols: list[str] | None,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "benchmark_identifier": benchmark_symbol or "index:000001",
+        "peer_count": len(peer_symbols or []),
+        "relative_to_benchmark_pct_points": 1.5,
+        "relative_status": "outperforming_benchmark",
+        "source": ["test"],
+        "source_errors": [],
+        "market_time": "2026-07-10T15:00:00+08:00",
+    }
+
+
+def fake_scan_intraday_anomalies_data(**parameters: object) -> dict:
+    symbols = parameters["symbols"]
+    return {
+        "requested_count": len(symbols),
+        "evaluated_count": len(symbols),
+        "triggered_count": 1,
+        "results": [{"symbol": symbols[0], "trigger_count": 1}],
+        "source": ["test"],
+        "source_errors": [],
+        "market_time": "2026-07-10T15:00:00+08:00",
+    }
+
+
 def fake_get_market_overview_data(limit: int) -> dict:
     return {
         "indices": [{"name": "Test Index", "price": 100}],
@@ -481,6 +530,7 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
                 "diff": [
                     {
                         "f12": "512760",
+                        "f13": 1,
                         "f14": "Test ETF",
                         "f2": 1.23,
                         "f3": 2.5,
@@ -508,6 +558,18 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         assert batch["results"][0]["volume_unit"] == "share"
         assert batch["errors"][0]["code"] == "invalid_symbol"
         assert market_app.batch_security_metadata("index:000300")["security_type"] == "index"
+
+        market_app.get_eastmoney_batch_quote_rows = lambda _securities: (
+            [
+                {"f12": "000001", "f13": 0, "f14": "Ping An Bank", "f2": 10},
+                {"f12": "000001", "f13": 1, "f14": "SSE Index", "f2": 3900},
+            ],
+            "test-host",
+        )
+        collision = market_app.get_batch_quote_data(["000001", "index:000001"])
+        assert collision["count"] == 2
+        assert collision["results"][0]["name"] == "Ping An Bank"
+        assert collision["results"][1]["name"] == "SSE Index"
 
         base_minute = market_app.datetime(2026, 7, 10, 9, 30)
         items = [
@@ -877,6 +939,139 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_all_realtime_quotes = original_all_realtime_quotes
 
 
+def test_announcements_relative_strength_and_anomaly_scan() -> None:
+    original_json = market_app.read_public_json
+    original_post = market_app.read_public_json_post
+    original_batch = market_app.get_batch_quote_data
+    try:
+        market_app.read_public_json = lambda *_args, **_kwargs: {
+            "result": [
+                [
+                    {
+                        "ORG_BULLETIN_ID": "sse-1",
+                        "ORG_FILE_TYPE": 0,
+                        "SECURITY_CODE": "600000",
+                        "SECURITY_NAME": "浦发银行",
+                        "SSEDATE": "2026-07-10",
+                        "TITLE": "2025年年度权益分派实施公告",
+                        "BULLETIN_TYPE_DESC": "利润分配",
+                        "URL": "/disclosure/test.pdf",
+                    },
+                    {
+                        "ORG_BULLETIN_ID": "sse-1",
+                        "ORG_FILE_TYPE": 1,
+                        "TITLE": "Legal attachment",
+                        "URL": "/disclosure/attachment.pdf",
+                    },
+                ]
+            ]
+        }
+        sse = market_app.get_sse_announcements(
+            "600000", "2026-07-01", "2026-07-14", 10
+        )
+        assert len(sse) == 1
+        assert sse[0]["event_tags"] == ["dividend"]
+        assert sse[0]["url"] == "https://static.sse.com.cn/disclosure/test.pdf"
+
+        market_app.read_public_json_post = lambda *_args, **_kwargs: {
+            "data": [
+                {
+                    "annId": 1,
+                    "title": "平安银行：董事会决议公告",
+                    "publishTime": "2026-07-03 00:00:00",
+                    "attachPath": "/disc/test.pdf",
+                    "secCode": ["000001"],
+                    "secName": ["平安银行"],
+                }
+            ]
+        }
+        szse = market_app.get_szse_announcements(
+            "000001", "2026-07-01", "2026-07-14", 10
+        )
+        assert szse[0]["event_tags"] == ["governance"]
+        assert szse[0]["official_source"] == "Shenzhen Stock Exchange"
+
+        assert market_app.security_metadata("920068")["exchange"] == "BSE"
+        bse = market_app.get_announcement_data("920068", 30, 10)
+        assert bse["data_status"] == "unavailable"
+        assert bse["source_errors"][0]["error_type"] == "official_source_blocked"
+
+        def batch_snapshot(identifiers: list[str]) -> dict:
+            rows = {
+                "600519": {
+                    "identifier": "600519",
+                    "symbol": "600519",
+                    "name": "Target",
+                    "price": 105,
+                    "change_pct": 5.0,
+                    "open": 103,
+                    "previous_close": 100,
+                    "high": 105,
+                    "low": 99,
+                    "volume_ratio": 3.0,
+                    "turnover_rate": 6.0,
+                },
+                "index:000001": {
+                    "identifier": "index:000001",
+                    "symbol": "000001",
+                    "name": "SSE Index",
+                    "price": 3900,
+                    "change_pct": 1.0,
+                    "high": 3920,
+                    "low": 3850,
+                },
+                "600000": {
+                    "identifier": "600000",
+                    "symbol": "600000",
+                    "name": "Peer",
+                    "price": 10,
+                    "change_pct": 2.0,
+                    "high": 10.1,
+                    "low": 9.8,
+                },
+            }
+            results = [rows[item] for item in identifiers if item in rows]
+            return {
+                "results": results,
+                "source": ["test_batch"],
+                "source_errors": [],
+                "market_time": "2026-07-14T10:00:00+08:00",
+            }
+
+        market_app.get_batch_quote_data = batch_snapshot
+        relative = market_app.get_relative_strength_data(
+            "600519", "index:000001", ["600000"]
+        )
+        assert relative["relative_to_benchmark_pct_points"] == 4.0
+        assert relative["relative_to_peer_average_pct_points"] == 3.0
+        assert relative["relative_status"] == "outperforming_benchmark"
+
+        scan = market_app.scan_intraday_anomalies_data(
+            symbols=["600519"],
+            benchmark_symbol="index:000001",
+            change_pct_min=3.0,
+            volume_ratio_min=2.0,
+            turnover_rate_min=5.0,
+            gap_pct_min=2.0,
+            near_extreme_pct=0.3,
+            relative_strength_min=2.0,
+            include_untriggered=False,
+        )
+        trigger_types = {item["type"] for item in scan["results"][0]["triggers"]}
+        assert {
+            "large_daily_move",
+            "high_daily_volume_ratio",
+            "high_turnover_rate",
+            "opening_gap",
+            "near_intraday_high",
+            "benchmark_relative_move",
+        } <= trigger_types
+    finally:
+        market_app.read_public_json = original_json
+        market_app.read_public_json_post = original_post
+        market_app.get_batch_quote_data = original_batch
+
+
 def test_reliability_envelope_cache_and_health() -> None:
     market_app.TOOL_CACHE.clear()
     market_app.SOURCE_HEALTH.clear()
@@ -934,6 +1129,7 @@ def main() -> None:
     test_sina_market_pagination_and_breadth_fallback()
     test_fast_market_aggregate()
     test_intraday_and_index_fallback_parsers()
+    test_announcements_relative_strength_and_anomaly_scan()
     test_reliability_envelope_cache_and_health()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
@@ -946,6 +1142,9 @@ def main() -> None:
     market_app.get_fund_flow_data = fake_get_fund_flow_data
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_news_data = fake_get_news_data
+    market_app.get_announcement_data = fake_get_announcement_data
+    market_app.get_relative_strength_data = fake_get_relative_strength_data
+    market_app.scan_intraday_anomalies_data = fake_scan_intraday_anomalies_data
     market_app.get_market_overview_data = fake_get_market_overview_data
     market_app.get_sector_rankings_data = fake_get_sector_rankings_data
     headers = {
@@ -1002,6 +1201,9 @@ def main() -> None:
             "get_a_share_fund_flow",
             "get_a_share_financials",
             "get_a_share_news",
+            "get_a_share_announcements",
+            "get_a_share_relative_strength",
+            "scan_a_share_intraday_anomalies",
             "get_a_share_sector_rankings",
             "get_a_share_market_overview",
             "get_market_data_health",
@@ -1061,6 +1263,17 @@ def main() -> None:
             (13, "get_a_share_sector_rankings", {"sector_type": "industry"}),
             (14, "get_a_share_market_overview", {}),
             (15, "get_market_data_health", {}),
+            (16, "get_a_share_announcements", {"symbol": "600519"}),
+            (
+                17,
+                "get_a_share_relative_strength",
+                {"symbol": "600519", "peer_symbols": ["600000"]},
+            ),
+            (
+                18,
+                "scan_a_share_intraday_anomalies",
+                {"symbols": ["600519"], "benchmark_symbol": "index:000001"},
+            ),
         ):
             response = client.post(
                 "/mcp",
