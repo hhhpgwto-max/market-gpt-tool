@@ -1228,6 +1228,7 @@ def test_reliability_envelope_cache_and_health() -> None:
 
 def test_historical_context_and_security_status_facts() -> None:
     original_kline = market_app.get_kline_data
+    original_json = market_app.read_public_json
     try:
         base = market_app.datetime(2025, 1, 1)
         items = [
@@ -1296,8 +1297,27 @@ def test_historical_context_and_security_status_facts() -> None:
         assert status["price_history_adjustment"]["mode"] == "forward_adjusted"
         assert len(status["recent_corporate_action_announcements"]) == 1
         assert status["suspension_status"] == "not_confirmed_by_current_data_contract"
+
+        def reference_hosts(url: str, *_: object) -> dict:
+            if url.startswith("https://push2.eastmoney.com/"):
+                raise market_app.HTTPException(status_code=502, detail="primary blocked")
+            return {
+                "data": {
+                    "f57": "600519",
+                    "f58": "Test Stock",
+                    "f189": 20010827,
+                    "f292": 5,
+                    "f127": "Test Industry",
+                }
+            }
+
+        market_app.read_public_json = reference_hosts
+        reference_result = market_app.get_security_reference_data("600519")
+        assert reference_result["listing_date"] == "2001-08-27"
+        assert reference_result["source"].startswith("eastmoney_security_reference:")
     finally:
         market_app.get_kline_data = original_kline
+        market_app.read_public_json = original_json
 
 
 def main() -> None:
