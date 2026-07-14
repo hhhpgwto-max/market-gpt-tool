@@ -27,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "relevant_multi_source_news_v1"
+ROUTING_REVISION = "limit_activity_and_index_identity_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -39,6 +39,8 @@ MCP_INSTRUCTIONS = (
     "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
     "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
     "for current company events. News results are evidence with provenance, not positive/negative judgements. "
+    "Use get_a_share_limit_activity for public limit-up, limit-down, open-board, and consecutive-board facts. "
+    "Do not convert those mechanical counts into sentiment or trading labels unless the user explicitly interprets them. "
     "All data is informational only and is not investment advice."
 )
 
@@ -254,6 +256,18 @@ INDEX_SECID_BY_SYMBOL = {
     "000922": "1.000922",
     "899050": "0.899050",
 }
+INDEX_IDENTITY = {
+    "000001": {"expected_name": "SSE Composite", "exchange": "SSE", "index_role": "primary"},
+    "399001": {"expected_name": "Shenzhen Component", "exchange": "SZSE", "index_role": "primary"},
+    "399006": {"expected_name": "ChiNext", "exchange": "SZSE", "index_role": "primary"},
+    "000688": {"expected_name": "STAR 50", "exchange": "SSE", "index_role": "style"},
+    "000300": {"expected_name": "CSI 300", "exchange": "SSE", "index_role": "style"},
+    "000905": {"expected_name": "CSI 500", "exchange": "SSE", "index_role": "style"},
+    "399852": {"expected_name": "CSI 1000", "exchange": "SZSE", "index_role": "style"},
+    "932000": {"expected_name": "CSI 2000", "exchange": "SSE", "index_role": "style"},
+    "000016": {"expected_name": "SSE 50", "exchange": "SSE", "index_role": "style"},
+    "000922": {"expected_name": "CSI Dividend", "exchange": "SSE", "index_role": "style"},
+}
 SECTOR_TYPE_CONFIG = {
     "industry": "m:90+t:2",
     "concept": "m:90+t:3",
@@ -375,6 +389,19 @@ def batch_security_metadata(identifier: Any) -> dict[str, str]:
 
     security = security_metadata(raw_identifier)
     return {"identifier": raw_identifier, **security, "eastmoney_secid": eastmoney_secid(raw_identifier)}
+
+
+def enrich_index_identity(index: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(index.get("symbol") or "")
+    identity = INDEX_IDENTITY.get(symbol, {})
+    return {
+        **index,
+        "identifier": f"index:{symbol}" if symbol else None,
+        "eastmoney_secid": INDEX_SECID_BY_SYMBOL.get(symbol),
+        "exchange": identity.get("exchange"),
+        "index_role": identity.get("index_role"),
+        "expected_name": identity.get("expected_name"),
+    }
 
 
 def now_iso() -> str:
@@ -3701,7 +3728,7 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
     if not index_rows:
         raise HTTPException(status_code=502, detail="Eastmoney returned no major-index rows.")
     return [
-        {
+        enrich_index_identity({
             "symbol": clean_value(row.get("f12")),
             "name": clean_value(row.get("f14")),
             "price": to_number(row.get("f2")),
@@ -3716,7 +3743,7 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
             "market_time": market_time_from_source_update(
                 format_unix_market_time(row.get("f124"))
             ),
-        }
+        })
         for row in index_rows
     ]
 
@@ -3735,7 +3762,7 @@ def get_tencent_indices() -> list[dict[str, Any]]:
         if len(values) < 33:
             continue
         indices.append(
-            {
+            enrich_index_identity({
                 "symbol": clean_value(values[2]),
                 "name": clean_value(values[1]),
                 "price": to_number(values[3]),
@@ -3749,7 +3776,7 @@ def get_tencent_indices() -> list[dict[str, Any]]:
                 "market_time": market_time_from_source_update(
                     format_market_time(values[30])
                 ),
-            }
+            })
         )
     if not indices:
         raise HTTPException(status_code=502, detail="Unexpected Tencent index response.")
@@ -3770,7 +3797,7 @@ def get_sina_indices() -> list[dict[str, Any]]:
         if len(values) < 4 or not values[0]:
             continue
         indices.append(
-            {
+            enrich_index_identity({
                 "symbol": match.group(1),
                 "name": clean_value(values[0]),
                 "price": to_number(values[1]),
@@ -3781,7 +3808,7 @@ def get_sina_indices() -> list[dict[str, Any]]:
                 "low": None,
                 "previous_close": None,
                 "market_time": None,
-            }
+            })
         )
     if not indices:
         raise HTTPException(status_code=502, detail="Unexpected Sina index response.")
@@ -4360,6 +4387,278 @@ def market_turnover_summary(rows: list[dict[str, Any]], market_time: str | None)
     }
 
 
+LIMIT_POOL_CONFIG = {
+    "limit_up": ("getTopicZTPool", "fbt:asc"),
+    "open_board": ("getTopicZBPool", "fbt:asc"),
+    "limit_down": ("getTopicDTPool", "fund:asc"),
+}
+
+
+def eastmoney_pool_price(value: Any) -> float | None:
+    number = to_number(value)
+    return round(number / 1000, 3) if number is not None else None
+
+
+def format_pool_time(trade_date: str, value: Any) -> str | None:
+    if value in (None, "", 0, "0"):
+        return None
+    digits = re.sub(r"\D", "", str(value)).zfill(6)[-6:]
+    if not re.fullmatch(r"\d{6}", digits):
+        return None
+    try:
+        timestamp = datetime.strptime(f"{trade_date}{digits}", "%Y%m%d%H%M%S").replace(
+            tzinfo=MARKET_TIMEZONE
+        )
+    except ValueError:
+        return None
+    return timestamp.isoformat()
+
+
+def fetch_eastmoney_limit_pool(pool_type: str, trade_date: str) -> dict[str, Any]:
+    endpoint, sort = LIMIT_POOL_CONFIG[pool_type]
+    query = urlencode(
+        {
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "dpt": "wz.ztzt",
+            "Pageindex": 0,
+            "pagesize": 200,
+            "sort": sort,
+            "date": trade_date,
+        }
+    )
+    payload = read_public_json(
+        f"https://push2ex.eastmoney.com/{endpoint}?{query}",
+        "https://quote.eastmoney.com/ztb/",
+        timeout=5,
+        attempts=1,
+    )
+    data = payload.get("data") or {}
+    qdate = str(data.get("qdate") or "")
+    if not re.fullmatch(r"\d{8}", qdate):
+        raise HTTPException(status_code=404, detail=f"No {pool_type} pool for {trade_date}.")
+    return {
+        "pool_type": pool_type,
+        "trade_date": qdate,
+        "source_count": _to_int(data.get("tc")),
+        "rows": data.get("pool") or [],
+    }
+
+
+def parse_limit_pool_item(
+    pool_type: str, row: dict[str, Any], trade_date: str
+) -> dict[str, Any] | None:
+    symbol = str(row.get("c") or "").zfill(6)
+    if not SYMBOL_PATTERN.fullmatch(symbol):
+        return None
+    common = {
+        "symbol": symbol,
+        "name": clean_value(row.get("n")),
+        "exchange": exchange_for_symbol(symbol),
+        "pool_type": pool_type,
+        "price": eastmoney_pool_price(row.get("p")),
+        "change_pct": to_number(row.get("zdp")),
+        "turnover": to_number(row.get("amount")),
+        "turnover_unit": "CNY",
+        "circulating_market_value": to_number(row.get("ltsz")),
+        "turnover_rate": to_number(row.get("hs")),
+        "industry": clean_value(row.get("hybk")),
+    }
+    if pool_type == "limit_up":
+        recent_stats = row.get("zttj") if isinstance(row.get("zttj"), dict) else {}
+        return {
+            **common,
+            "consecutive_limit_up": _to_int(row.get("lbc")),
+            "recent_limit_up_days": _to_int(recent_stats.get("days")),
+            "recent_limit_up_count": _to_int(recent_stats.get("ct")),
+            "first_seal_time": format_pool_time(trade_date, row.get("fbt")),
+            "last_seal_time": format_pool_time(trade_date, row.get("lbt")),
+            "seal_fund": to_number(row.get("fund")),
+            "open_board_count": _to_int(row.get("zbc")),
+        }
+    if pool_type == "open_board":
+        return {
+            **common,
+            "limit_up_price": eastmoney_pool_price(row.get("ztp")),
+            "first_seal_time": format_pool_time(trade_date, row.get("fbt")),
+            "open_board_count": _to_int(row.get("zbc")),
+            "amplitude_pct": to_number(row.get("zf")),
+            "consecutive_limit_up": _to_int((row.get("zttj") or {}).get("ct")),
+        }
+    return {
+        **common,
+        "consecutive_limit_down_days": _to_int(row.get("days")),
+        "last_limit_down_time": format_pool_time(trade_date, row.get("lbt")),
+        "open_count": _to_int(row.get("oc")),
+        "sealed_order_amount": to_number(row.get("fba") or row.get("fund")),
+    }
+
+
+def limit_activity_statistics(
+    limit_up_items: list[dict[str, Any]],
+    open_board_items: list[dict[str, Any]],
+    limit_down_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limit_up_count = len(limit_up_items)
+    open_board_count = len(open_board_items)
+    limit_down_count = len(limit_down_items)
+    attempts = limit_up_count + open_board_count
+    consecutive = [
+        item for item in limit_up_items if (item.get("consecutive_limit_up") or 0) >= 2
+    ]
+    board_distribution: dict[str, int] = {}
+    for item in limit_up_items:
+        boards = item.get("consecutive_limit_up") or 1
+        key = "4_or_more" if boards >= 4 else str(boards)
+        board_distribution[key] = board_distribution.get(key, 0) + 1
+    return {
+        "limit_up_count": limit_up_count,
+        "limit_down_count": limit_down_count,
+        "open_board_count": open_board_count,
+        "seal_success_rate_pct": round(limit_up_count / attempts * 100, 2)
+        if attempts
+        else None,
+        "consecutive_limit_up_count": len(consecutive),
+        "max_consecutive_limit_up": max(
+            (item.get("consecutive_limit_up") or 1 for item in limit_up_items),
+            default=None,
+        ),
+        "limit_up_board_distribution": board_distribution,
+        "st_limit_up_count": sum(
+            is_st_security(item.get("name")) for item in limit_up_items
+        ),
+        "st_limit_down_count": sum(
+            is_st_security(item.get("name")) for item in limit_down_items
+        ),
+        "total_seal_fund": sum(
+            to_number(item.get("seal_fund")) or 0 for item in limit_up_items
+        ),
+        "currency_unit": "CNY",
+    }
+
+
+def limit_activity_by_exchange(
+    limit_up_items: list[dict[str, Any]],
+    open_board_items: list[dict[str, Any]],
+    limit_down_items: list[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    result = {
+        exchange: {
+            "limit_up_count": 0,
+            "limit_down_count": 0,
+            "open_board_count": 0,
+            "consecutive_limit_up_count": 0,
+            "st_limit_up_count": 0,
+            "st_limit_down_count": 0,
+        }
+        for exchange in ("SSE", "SZSE", "BSE")
+    }
+    for key, items in (
+        ("limit_up_count", limit_up_items),
+        ("open_board_count", open_board_items),
+        ("limit_down_count", limit_down_items),
+    ):
+        for item in items:
+            exchange = item.get("exchange")
+            if exchange in result:
+                result[exchange][key] += 1
+    for item in limit_up_items:
+        exchange = item.get("exchange")
+        if exchange in result and (item.get("consecutive_limit_up") or 0) >= 2:
+            result[exchange]["consecutive_limit_up_count"] += 1
+        if exchange in result and is_st_security(item.get("name")):
+            result[exchange]["st_limit_up_count"] += 1
+    for item in limit_down_items:
+        exchange = item.get("exchange")
+        if exchange in result and is_st_security(item.get("name")):
+            result[exchange]["st_limit_down_count"] += 1
+    return result
+
+
+def get_limit_activity_data(limit: int) -> dict[str, Any]:
+    last_errors: list[str] = []
+    pool_results: dict[str, dict[str, Any]] = {}
+    requested_date = None
+    for offset in range(8):
+        candidate = datetime.now(MARKET_TIMEZONE).date() - timedelta(days=offset)
+        if candidate.weekday() >= 5:
+            continue
+        requested_date = candidate.strftime("%Y%m%d")
+        executor = ThreadPoolExecutor(max_workers=3)
+        futures = {
+            executor.submit(fetch_eastmoney_limit_pool, pool_type, requested_date): pool_type
+            for pool_type in LIMIT_POOL_CONFIG
+        }
+        pool_results = {}
+        errors = []
+        for future in as_completed(futures):
+            pool_type = futures[future]
+            try:
+                pool_results[pool_type] = future.result()
+            except HTTPException as exc:
+                errors.append(f"{pool_type}: {exc.detail}")
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{pool_type}: {exc}")
+        executor.shutdown(wait=False, cancel_futures=True)
+        qdates = {result["trade_date"] for result in pool_results.values()}
+        if qdates:
+            last_errors = errors
+            break
+        last_errors.extend(errors)
+    if not pool_results:
+        raise HTTPException(
+            status_code=502,
+            detail="Eastmoney limit-activity pools unavailable: " + "; ".join(last_errors),
+        )
+
+    trade_date = max(result["trade_date"] for result in pool_results.values())
+    parsed: dict[str, list[dict[str, Any]]] = {}
+    source_counts: dict[str, int | None] = {}
+    for pool_type in LIMIT_POOL_CONFIG:
+        result = pool_results.get(pool_type) or {}
+        source_counts[pool_type] = result.get("source_count")
+        parsed[pool_type] = [
+            item
+            for row in result.get("rows", [])
+            if (item := parse_limit_pool_item(pool_type, row, trade_date)) is not None
+        ]
+
+    parsed["limit_up"].sort(
+        key=lambda item: (item.get("consecutive_limit_up") or 0, item.get("seal_fund") or 0),
+        reverse=True,
+    )
+    parsed["open_board"].sort(
+        key=lambda item: (item.get("open_board_count") or 0, item.get("turnover") or 0),
+        reverse=True,
+    )
+    parsed["limit_down"].sort(
+        key=lambda item: (
+            item.get("consecutive_limit_down_days") or 0,
+            item.get("sealed_order_amount") or 0,
+        ),
+        reverse=True,
+    )
+    statistics = limit_activity_statistics(
+        parsed["limit_up"], parsed["open_board"], parsed["limit_down"]
+    )
+    return {
+        "trade_date": datetime.strptime(trade_date, "%Y%m%d").date().isoformat(),
+        "requested_date": requested_date,
+        "statistics": statistics,
+        "by_exchange": limit_activity_by_exchange(
+            parsed["limit_up"], parsed["open_board"], parsed["limit_down"]
+        ),
+        "source_counts": source_counts,
+        "limit_up_items": parsed["limit_up"][:limit],
+        "open_board_items": parsed["open_board"][:limit],
+        "limit_down_items": parsed["limit_down"][:limit],
+        "source": ["eastmoney_limit_up_pool", "eastmoney_open_board_pool", "eastmoney_limit_down_pool"],
+        "source_errors": last_errors,
+        "data_status": "full_data" if len(pool_results) == 3 and not last_errors else "partial_data",
+        "queried_at": now_iso(),
+        "note": "Mechanical public limit-pool facts only. Counts, seal rate, and board height are not sentiment labels or trading signals.",
+    }
+
+
 def latest_market_time(indices: list[dict[str, Any]]) -> str | None:
     timestamps = [
         timestamp
@@ -4714,6 +5013,12 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             "max_stale_age": 180,
             "loader": get_overview_breadth_component,
         },
+        "limit_activity": {
+            "key": cache_key("overview_component_limit_activity", {}),
+            "ttl": 30,
+            "max_stale_age": 3600,
+            "loader": lambda: get_limit_activity_data(10),
+        },
     }
 
     executor = ThreadPoolExecutor(max_workers=len(component_specs))
@@ -4783,6 +5088,24 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     breadth_component = component_results.get("market_breadth") or {}
     breadth = breadth_component.get("breadth")
     turnover = breadth_component.get("turnover")
+    limit_component = component_results.get("limit_activity") or {}
+    limit_activity_stats = limit_component.get("statistics")
+    if breadth and limit_activity_stats:
+        all_counts = breadth.get("all_market") or {}
+        for key in (
+            "limit_up_count",
+            "limit_down_count",
+            "open_board_count",
+            "consecutive_limit_up_count",
+            "st_limit_up_count",
+            "st_limit_down_count",
+        ):
+            all_counts[key] = limit_activity_stats.get(key)
+        for exchange, exchange_counts in (limit_component.get("by_exchange") or {}).items():
+            breadth_exchange = (breadth.get("by_exchange") or {}).get(exchange)
+            if breadth_exchange:
+                breadth_exchange.update(exchange_counts)
+        breadth["consecutive_limit_up_status"] = "available_from_public_limit_up_pool"
     market_time = latest_market_time(indices) or breadth_component.get("market_time")
     if turnover and market_time:
         elapsed = trading_minutes_elapsed(market_time)
@@ -4802,11 +5125,14 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     source_errors.extend(index_component.get("source_errors", []))
     source_errors.extend(board_component.get("source_errors", []))
     source_errors.extend(breadth_component.get("source_errors", []))
+    source_errors.extend(limit_component.get("source_errors", []))
     sources = [f"indices:{index_source}"]
     if boards:
         sources.append(f"industry_boards:{board_source}")
     if breadth:
         sources.append(f"market_breadth:{breadth_component.get('source', 'unavailable')}")
+    if limit_activity_stats:
+        sources.append("limit_activity:eastmoney_public_pools")
 
     primary_indices = [
         index for index in indices if index.get("symbol") in PRIMARY_INDEX_SYMBOLS
@@ -4818,6 +5144,16 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     missing_style_index_symbols = sorted(
         (OVERVIEW_INDEX_SYMBOLS - PRIMARY_INDEX_SYMBOLS) - returned_index_symbols
     )
+    style_index_catalog = [
+        {
+            "symbol": symbol,
+            "identifier": f"index:{symbol}",
+            "eastmoney_secid": INDEX_SECID_BY_SYMBOL.get(symbol),
+            **INDEX_IDENTITY[symbol],
+            "available_in_current_snapshot": symbol in returned_index_symbols,
+        }
+        for symbol in sorted(OVERVIEW_INDEX_SYMBOLS - PRIMARY_INDEX_SYMBOLS)
+    ]
     all_market_breadth = breadth.get("all_market") if breadth else None
     breadth_detail_fields = (
         "rise_over_3_count",
@@ -4837,7 +5173,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             if not all_market_breadth or all_market_breadth.get(key) is None
         ]
     )
-    limit_stats = (
+    limit_stats = limit_activity_stats or (
         {
             key: all_market_breadth.get(key)
             for key in (
@@ -4852,6 +5188,26 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         if all_market_breadth
         else None
     )
+    market_activity_facts = None
+    if limit_activity_stats:
+        rise_count = (all_market_breadth or {}).get("rise_count")
+        fall_count = (all_market_breadth or {}).get("fall_count")
+        market_activity_facts = {
+            **limit_activity_stats,
+            "rise_count": rise_count,
+            "fall_count": fall_count,
+            "rise_to_fall_ratio": round(rise_count / fall_count, 4)
+            if rise_count is not None and fall_count
+            else None,
+            "limit_up_to_limit_down_ratio": round(
+                limit_activity_stats["limit_up_count"]
+                / limit_activity_stats["limit_down_count"],
+                4,
+            )
+            if limit_activity_stats.get("limit_down_count")
+            else None,
+            "scope": "Mechanical market activity facts; no bullish, bearish, hot, cold, or trading judgement is assigned.",
+        }
 
     return {
         "market_status": market_status_at(),
@@ -4859,6 +5215,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "market_time": market_time,
         "indices": primary_indices,
         "style_indices": style_indices,
+        "style_index_catalog": style_index_catalog,
         "style_indices_status": (
             "full_data"
             if not missing_style_index_symbols
@@ -4881,6 +5238,12 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "unavailable_breadth_detail_fields": unavailable_breadth_detail_fields,
         "turnover": turnover,
         "limit_stats": limit_stats,
+        "limit_stats_status": (
+            limit_component.get("data_status", "available")
+            if limit_activity_stats
+            else "unavailable"
+        ),
+        "market_activity_facts": market_activity_facts,
         "component_status": component_status,
         "response_budget_ms": int(response_budget_seconds * 1000),
         "source": sources,
@@ -4893,10 +5256,11 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             if breadth
             and turnover
             and boards
+            and limit_activity_stats
             and str(breadth_component.get("coverage_status") or "").startswith("complete")
             else "partial_data"
         ),
-        "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a nine-second budget. Exchange aggregates stay fast and do not pretend to include security-level price-band or limit statistics.",
+        "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a nine-second budget. Limit activity comes from separate public pools. Prior-day same-minute turnover remains unavailable intraday because no reliable historical market-wide minute series was found.",
     }
 
 
@@ -5538,6 +5902,27 @@ def get_a_share_sector_rankings(
             sector_type, level, sort_by, normalized_limit,
         ),
         max_stale_age_seconds=300,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_limit_activity",
+    title="Get A-share limit activity facts",
+    description=(
+        "Get public limit-up, limit-down, open-board, seal-rate, consecutive-board, board-height, "
+        "exchange breakdown, and selected security details for the latest available trading day. "
+        "Returns mechanical facts only and does not label sentiment or infer trading impact."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_limit_activity(limit: int = 20) -> dict[str, Any]:
+    normalized_limit = max(1, min(limit, 50))
+    return run_cached_tool(
+        "get_a_share_limit_activity",
+        {"limit": normalized_limit},
+        30,
+        lambda: get_limit_activity_data(normalized_limit),
+        max_stale_age_seconds=3600,
     )
 
 
