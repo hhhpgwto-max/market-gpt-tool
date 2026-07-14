@@ -124,6 +124,8 @@ def fake_get_kline_data(symbol: str, period: str, limit: int) -> dict:
     return {
         "symbol": symbol,
         "period": period,
+        "adjustment": "forward_adjusted",
+        "adjustment_source_parameter": "test_qfq",
         "count": limit,
         "items": [
             {
@@ -205,6 +207,54 @@ def fake_get_announcement_data(symbol: str, days: int, limit: int) -> dict:
         "source": ["official_sse_announcements"],
         "source_errors": [],
         "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_get_historical_context_data(symbol: str) -> dict:
+    return {
+        "symbol": symbol,
+        "adjustment": "forward_adjusted",
+        "source_sessions": 260,
+        "windows": {
+            str(window): {"requested_sessions": window, "window_complete": True}
+            for window in (20, 60, 120, 250)
+        },
+        "source": "test",
+        "source_errors": [],
+        "latest_trade_date": "2026-07-10",
+    }
+
+
+def fake_get_security_status_data(symbol: str) -> dict:
+    return {
+        "symbol": symbol,
+        "security_type": "a_share",
+        "listing_date": "2001-08-27",
+        "price_history_adjustment": {"mode": "forward_adjusted"},
+        "source": ["test"],
+        "source_errors": [],
+    }
+
+
+def fake_get_decision_context_data(
+    symbol: str, benchmark_symbol: str | None
+) -> dict:
+    return {
+        "snapshot_id": f"{symbol}-test",
+        "symbol": symbol,
+        "benchmark_identifier": benchmark_symbol or "index:000001",
+        "available_component_count": 8,
+        "requested_component_count": 8,
+        "decision_inputs": {
+            "quote": {"symbol": symbol},
+            "historical_context": fake_get_historical_context_data(symbol),
+        },
+        "excluded_components": {
+            "news": "excluded_pending_relevance_deduplication_and_source_quality_upgrade"
+        },
+        "source": ["test"],
+        "source_errors": [],
+        "data_status": "full_data",
     }
 
 
@@ -1176,6 +1226,80 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert error["source_errors"][0]["error_type"] == "invalid_symbol"
 
 
+def test_historical_context_and_security_status_facts() -> None:
+    original_kline = market_app.get_kline_data
+    try:
+        base = market_app.datetime(2025, 1, 1)
+        items = [
+            {
+                "date": (base + market_app.timedelta(days=index)).date().isoformat(),
+                "open": 10.0 + index / 100,
+                "close": 10.0 + index / 100,
+                "high": 10.2 + index / 100,
+                "low": 9.8 + index / 100,
+                "volume": 1000.0 + index,
+                "turnover": 10000.0 + index * 10,
+                "turnover_rate": 1.0 + index / 1000,
+                "amplitude": 2.0 + index / 1000,
+            }
+            for index in range(260)
+        ]
+        market_app.get_kline_data = lambda *_: {
+            "symbol": "600519",
+            "security_type": "a_share",
+            "exchange": "SSE",
+            "adjustment": "forward_adjusted",
+            "adjustment_source_parameter": "test_qfq",
+            "items": items,
+            "source": "test",
+            "source_errors": [],
+        }
+        historical = market_app.get_historical_context_data("600519")
+        assert historical["adjustment"] == "forward_adjusted"
+        assert list(historical["windows"]) == ["20", "60", "120", "250"]
+        assert all(
+            window["window_complete"] for window in historical["windows"].values()
+        )
+        assert historical["windows"]["250"]["available_sessions"] == 250
+        assert (
+            historical["windows"]["20"]["turnover"][
+                "percentile_rank_in_window"
+            ]
+            == 100.0
+        )
+
+        quote = fake_get_quote_data("600519")
+        quote["quote"]["name"] = "*ST Test"
+        reference = {
+            "name": "*ST Test",
+            "listing_date": "2001-08-27",
+            "source_security_status_code": 5,
+            "source": "test_reference",
+        }
+        announcements = {
+            "items": [
+                {
+                    "title": "Test dividend",
+                    "event_tags": ["dividend"],
+                    "event_date": "2026-07-10",
+                },
+                {"title": "Other", "event_tags": ["other"]},
+            ],
+            "source": ["official_sse_announcements"],
+        }
+        status = market_app.build_security_status_data(
+            "600519", quote, reference, announcements
+        )
+        assert status["security_type"] == "a_share"
+        assert status["is_st_name_flag"] is True
+        assert status["price_limit_reference"]["standard_daily_limit_pct"] == 5.0
+        assert status["price_history_adjustment"]["mode"] == "forward_adjusted"
+        assert len(status["recent_corporate_action_announcements"]) == 1
+        assert status["suspension_status"] == "not_confirmed_by_current_data_contract"
+    finally:
+        market_app.get_kline_data = original_kline
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_search_source_parser()
@@ -1193,6 +1317,7 @@ def main() -> None:
     test_intraday_and_index_fallback_parsers()
     test_announcements_relative_strength_and_anomaly_scan()
     test_reliability_envelope_cache_and_health()
+    test_historical_context_and_security_status_facts()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
@@ -1205,6 +1330,9 @@ def main() -> None:
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_news_data = fake_get_news_data
     market_app.get_announcement_data = fake_get_announcement_data
+    market_app.get_historical_context_data = fake_get_historical_context_data
+    market_app.get_security_status_data = fake_get_security_status_data
+    market_app.get_decision_context_data = fake_get_decision_context_data
     market_app.get_relative_strength_data = fake_get_relative_strength_data
     market_app.scan_intraday_anomalies_data = fake_scan_intraday_anomalies_data
     market_app.get_market_overview_data = fake_get_market_overview_data
@@ -1264,6 +1392,9 @@ def main() -> None:
             "get_a_share_financials",
             "get_a_share_news",
             "get_a_share_announcements",
+            "get_a_share_historical_context",
+            "get_a_share_security_status",
+            "get_a_share_decision_context",
             "get_a_share_relative_strength",
             "scan_a_share_intraday_anomalies",
             "get_a_share_sector_rankings",
@@ -1335,6 +1466,13 @@ def main() -> None:
                 18,
                 "scan_a_share_intraday_anomalies",
                 {"symbols": ["600519"], "benchmark_symbol": "index:000001"},
+            ),
+            (19, "get_a_share_historical_context", {"symbol": "600519"}),
+            (20, "get_a_share_security_status", {"symbol": "600519"}),
+            (
+                21,
+                "get_a_share_decision_context",
+                {"symbol": "600519", "benchmark_symbol": "index:000001"},
             ),
         ):
             response = client.post(
