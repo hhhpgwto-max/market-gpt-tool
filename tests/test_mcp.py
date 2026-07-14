@@ -368,10 +368,27 @@ def test_kline_source_parsers() -> None:
                     market_app.get_fallback_kline, "600519", "daily", 101, 1
                 )
                 assert eastmoney_started.wait(0.5)
+                assert future.done() is False
+                release_eastmoney.set()
                 fallback = future.result(timeout=0.5)
                 assert fallback["source"] == "tencent"
         finally:
             release_eastmoney.set()
+
+        eastmoney_full = {
+            **tencent,
+            "source": "eastmoney",
+            "items": [{**tencent["items"][0], "turnover": 123456.0}],
+        }
+
+        def slightly_slower_eastmoney(*_: object) -> dict:
+            sleep(0.05)
+            return eastmoney_full
+
+        market_app.get_eastmoney_kline = slightly_slower_eastmoney
+        preferred = market_app.get_fallback_kline("600519", "daily", 101, 1)
+        assert preferred["source"] == "eastmoney"
+        assert preferred["items"][0]["turnover"] == 123456.0
     finally:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney

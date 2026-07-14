@@ -563,6 +563,57 @@ def race_public_sources(
     )
 
 
+def prefer_primary_public_source(
+    primary: tuple[str, Any], fallback: tuple[str, Any], timeout_seconds: float
+) -> tuple[Any, str, list[str]]:
+    """Prefetch a fallback concurrently without discarding a healthy richer primary."""
+    primary_source, primary_getter = primary
+    fallback_source, fallback_getter = fallback
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(primary_getter): primary_source,
+        PUBLIC_SOURCE_EXECUTOR.submit(fallback_getter): fallback_source,
+    }
+    pending = set(futures)
+    errors: list[str] = []
+    status_codes: list[int] = []
+    fallback_payload: Any = None
+    deadline = perf_counter() + timeout_seconds
+    while pending:
+        remaining = deadline - perf_counter()
+        if remaining <= 0:
+            break
+        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in sorted(completed, key=lambda item: futures[item] != primary_source):
+            source = futures[future]
+            try:
+                payload = future.result()
+                if source == primary_source:
+                    return payload, source, errors
+                fallback_payload = payload
+            except HTTPException as exc:
+                errors.append(f"{source}: {exc.detail}")
+                status_codes.append(exc.status_code)
+            except Exception as exc:  # pragma: no cover - defensive source boundary
+                errors.append(f"{source}: {exc}")
+                status_codes.append(502)
+        primary_pending = any(futures[future] == primary_source for future in pending)
+        if fallback_payload is not None and not primary_pending:
+            return fallback_payload, fallback_source, errors
+    for future in pending:
+        future.cancel()
+        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        status_codes.append(502)
+    if fallback_payload is not None:
+        return fallback_payload, fallback_source, errors
+    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    raise HTTPException(
+        status_code=status_code,
+        detail="; ".join(errors) or "Both preferred and fallback sources are unavailable.",
+    )
+
+
 def normalize_sources(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1517,12 +1568,10 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
 
 
 def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
-    payload, _, errors = race_public_sources(
-        (
-            ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
-            ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
-        ),
-        5,
+    payload, _, errors = prefer_primary_public_source(
+        ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
+        ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
+        3.5,
     )
     payload["source_errors"] = errors
     return payload
@@ -2161,52 +2210,13 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
-    source_getters = (
+    payload, _, errors = prefer_primary_public_source(
         ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
         ("sina", lambda: get_sina_fund_flow(symbol, limit)),
+        3.5,
     )
-    futures = {
-        PUBLIC_SOURCE_EXECUTOR.submit(getter): source for source, getter in source_getters
-    }
-    pending = set(futures)
-    errors: list[str] = []
-    status_codes: list[int] = []
-    sina_fallback: dict[str, Any] | None = None
-    deadline = perf_counter() + 3.5
-    while pending:
-        remaining = deadline - perf_counter()
-        if remaining <= 0:
-            break
-        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-        if not completed:
-            break
-        for future in sorted(completed, key=lambda item: futures[item] != "eastmoney"):
-            source = futures[future]
-            try:
-                payload = future.result()
-                if source == "eastmoney":
-                    payload["source_errors"] = errors
-                    return payload
-                sina_fallback = payload
-            except HTTPException as exc:
-                errors.append(f"{source}: {exc.detail}")
-                status_codes.append(exc.status_code)
-            except Exception as exc:  # pragma: no cover - defensive source boundary
-                errors.append(f"{source}: {exc}")
-                status_codes.append(502)
-        eastmoney_pending = any(futures[future] == "eastmoney" for future in pending)
-        if sina_fallback is not None and not eastmoney_pending:
-            sina_fallback["source_errors"] = errors
-            return sina_fallback
-    for future in pending:
-        future.cancel()
-        errors.append(f"{futures[future]}: request exceeded the 3.5 second budget")
-        status_codes.append(502)
-    if sina_fallback is not None:
-        sina_fallback["source_errors"] = errors
-        return sina_fallback
-    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
-    raise HTTPException(status_code=status_code, detail="; ".join(errors))
+    payload["source_errors"] = errors
+    return payload
 
 
 def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
