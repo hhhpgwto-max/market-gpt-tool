@@ -2496,7 +2496,13 @@ def news_relevance(
         title_lower,
     ):
         return None, 0, ["excluded_company_used_only_as_comparison"]
-    if name_lower and len(title_lower) > 60 and title_lower.find(name_lower) > 35:
+    name_position = title_lower.find(name_lower) if name_lower else -1
+    late_roundup_mention = (
+        "etf" in title_lower and name_position > 20
+    ) or (
+        len(title_lower) > 50 and name_position > 30
+    )
+    if late_roundup_mention:
         return None, 0, ["excluded_company_mentioned_late_in_roundup_title"]
     if name_lower and name_lower in title_lower:
         score += 10

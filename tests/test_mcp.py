@@ -1608,6 +1608,15 @@ def test_news_relevance_deduplication_and_source_metadata() -> None:
                     keyword,
                     "https://example.com",
                 ),
+                item(
+                    "大跌之下，红利质量ETF出现抢分红行情，登记日在即，贵州茅台逆市红盘",
+                    None,
+                    "普通网站",
+                    "https://news.google.com/roundup",
+                    "google_news_rss",
+                    keyword,
+                    "https://example.com",
+                ),
             ]
 
         market_app.get_eastmoney_news_items = eastmoney_items
@@ -1617,7 +1626,7 @@ def test_news_relevance_deduplication_and_source_metadata() -> None:
         assert result["name"] == "贵州茅台"
         assert result["industry"] == "白酒"
         assert result["duplicate_count"] == 1
-        assert result["excluded_count"] == 3
+        assert result["excluded_count"] == 4
         assert {row["relevance_scope"] for row in result["items"]} == {
             "company",
             "industry_context",
