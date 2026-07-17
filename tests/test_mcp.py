@@ -511,6 +511,7 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
     try:
         def fake_reader(url: str, *_: object, **__: object) -> dict:
             requested_urls.append(url)
+            sleep(0.12)
             if "/kline/mkline" in url:
                 return {
                     "data": {
@@ -539,9 +540,11 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
             }
 
         market_app.read_public_json = fake_reader
+        started = market_app.perf_counter()
         result = market_app.get_tencent_kline(
             "600519", "5m", 1, "2026-07-10", "2026-07-10", "forward"
         )
+        assert market_app.perf_counter() - started < 0.2
         assert result["source"] == "tencent"
         assert result["adjustment"] == "forward_adjusted"
         assert result["adjustment_source_parameter"] == "tencent_mkline_plus_qfq_daily_factor"
