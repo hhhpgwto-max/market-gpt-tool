@@ -28,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "ipo_fast_fallback_v1"
+ROUTING_REVISION = "decision_follow_up_tools_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -43,6 +43,8 @@ MCP_INSTRUCTIONS = (
     "Use get_a_share_market_snapshot when market overview, a target security, and peers must be captured in one "
     "bounded request with explicit timestamp differences and source conflicts. Historical as-of reconstruction is "
     "not available unless the tool explicitly says so. "
+    "When get_a_share_decision_context returns recommended_follow_up_tools, use those exact tool names and "
+    "arguments to refill relevant components that missed the packet response budget before answering. "
     "Use get_ipo_subscription_status for current IPO schedules, subscription codes, dates, issuer limits, and "
     "exchange rules. Never infer the user's account market value, board permissions, application, or winning status. "
     "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
@@ -4203,6 +4205,63 @@ def compact_intraday_context(payload: dict[str, Any]) -> dict[str, Any]:
     } | {"latest_minutes": (payload.get("items") or [])[-10:]}
 
 
+def decision_context_follow_up_tools(
+    symbol: str,
+    benchmark: str,
+    component_status: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    specifications = (
+        ("quote", "get_a_share_quote", {"symbol": symbol}),
+        ("intraday", "get_a_share_intraday", {"symbol": symbol, "limit": 60}),
+        (
+            "historical_context",
+            "get_a_share_historical_context",
+            {"symbol": symbol},
+        ),
+        (
+            "security_reference",
+            "get_a_share_security_status",
+            {"symbol": symbol},
+        ),
+        (
+            "relative_strength",
+            "get_a_share_relative_strength",
+            {"symbol": symbol, "benchmark_symbol": benchmark},
+        ),
+        ("market_overview", "get_a_share_market_overview", {"limit": 5}),
+        (
+            "news",
+            "get_a_share_news",
+            {
+                "symbol": symbol,
+                "limit": 8,
+                "days": 30,
+                "include_industry_context": False,
+            },
+        ),
+        (
+            "official_announcements",
+            "get_a_share_announcements",
+            {"symbol": symbol, "days": 180, "limit": 10},
+        ),
+        ("financials", "get_a_share_financials", {"symbol": symbol, "limit": 4}),
+    )
+    recommendations = []
+    for component, tool, arguments in specifications:
+        status = str((component_status.get(component) or {}).get("status") or "")
+        if status not in {"unavailable", "unavailable_within_response_budget"}:
+            continue
+        recommendations.append(
+            {
+                "missing_component": component,
+                "tool": tool,
+                "arguments": arguments,
+                "reason": status,
+            }
+        )
+    return recommendations
+
+
 def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict[str, Any]:
     started_at = perf_counter()
     started_iso = now_iso()
@@ -4270,6 +4329,9 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         decision_inputs[name] is not None for name in applicable_component_names
     )
     requested_count = len(applicable_component_names)
+    recommended_follow_ups = decision_context_follow_up_tools(
+        symbol, benchmark, statuses
+    )
     return {
         "snapshot_id": snapshot_id,
         "symbol": symbol,
@@ -4281,6 +4343,13 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "available_component_count": available_count,
         "requested_component_count": requested_count,
         "applicable_components": sorted(applicable_component_names),
+        "recommended_follow_up_tools": recommended_follow_ups,
+        "follow_up_note": (
+            "Call only the listed read-only tools to refill components that were unavailable in this packet. "
+            "An unavailable packet component means not returned within this request, not that the underlying data does not exist."
+            if recommended_follow_ups
+            else None
+        ),
         "decision_inputs": decision_inputs,
         "excluded_components": {},
         "source": sorted(
@@ -8568,6 +8637,7 @@ def get_a_share_security_status(symbol: str) -> dict[str, Any]:
     description=(
         "Concurrently gather quote, compact intraday structure, historical context, security status, relative strength, "
         "official announcements, financials, and market overview. Returns evidence and missing-data reasons only; "
+        "when a component misses the response budget it also returns exact recommended follow-up tool calls. "
         "GPT remains responsible for judgement."
     ),
     annotations=READ_ONLY_TOOL,

@@ -1775,7 +1775,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "ipo_fast_fallback_v1"
+    assert health["routing_revision"] == "decision_follow_up_tools_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2267,6 +2267,46 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         market_app.get_fast_portfolio_security_reference = original_reference
 
 
+def test_decision_context_follow_up_recommendations() -> None:
+    recommendations = market_app.decision_context_follow_up_tools(
+        "600519",
+        "index:000001",
+        {
+            "quote": {"status": "available", "latency_ms": 10},
+            "intraday": {"status": "stale_cache", "latency_ms": 1},
+            "historical_context": {
+                "status": "unavailable_within_response_budget",
+                "latency_ms": None,
+            },
+            "official_announcements": {
+                "status": "unavailable",
+                "latency_ms": None,
+            },
+            "news": {
+                "status": "unavailable_within_response_budget",
+                "latency_ms": None,
+            },
+        },
+    )
+    assert [item["missing_component"] for item in recommendations] == [
+        "historical_context",
+        "news",
+        "official_announcements",
+    ]
+    assert recommendations[0] == {
+        "missing_component": "historical_context",
+        "tool": "get_a_share_historical_context",
+        "arguments": {"symbol": "600519"},
+        "reason": "unavailable_within_response_budget",
+    }
+    assert recommendations[1]["arguments"] == {
+        "symbol": "600519",
+        "limit": 8,
+        "days": 30,
+        "include_industry_context": False,
+    }
+
+
 def test_ipo_subscription_status_contract() -> None:
     original_json = market_app.read_public_json
     captured: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
@@ -2519,6 +2559,7 @@ def main() -> None:
     test_historical_context_and_security_status_facts()
     test_rotation_overnight_and_event_helpers()
     test_fund_and_portfolio_exposure_calculations()
+    test_decision_context_follow_up_recommendations()
     test_ipo_subscription_status_contract()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
@@ -2555,7 +2596,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "ipo_fast_fallback_v1"
+        assert health.json()["routing_revision"] == "decision_follow_up_tools_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
