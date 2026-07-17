@@ -1775,7 +1775,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "ipo_subscription_status_v1"
+    assert health["routing_revision"] == "ipo_fast_fallback_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2270,6 +2270,21 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
 def test_ipo_subscription_status_contract() -> None:
     original_json = market_app.read_public_json
     captured: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    fast_cache_key = market_app.cache_key(
+        "ipo_recent_calendar_component", {"limit": 100}
+    )
+    market_app.TOOL_CACHE.pop(fast_cache_key, None)
+
+    normalized_fast_row = market_app.normalize_fast_ipo_row(
+        {
+            "SECURITY_CODE": "301707",
+            "SECURITY_NAME": "Test IPO",
+            "APPLY_NUM_UPPER": 5500,
+            "SELECT_LISTING_DATE": "2026-08-05 00:00:00",
+        }
+    )
+    assert normalized_fast_row["ONLINE_APPLY_UPPER"] == 5500
+    assert normalized_fast_row["LISTING_DATE"] == "2026-08-05 00:00:00"
 
     def fake_ipo_json(url: str, *args: object, **kwargs: object) -> dict:
         captured.append((url, args, kwargs))
@@ -2309,16 +2324,16 @@ def test_ipo_subscription_status_contract() -> None:
         assert item["maximum_subscription_market_value_requirement_cny"] == 55000
         assert item["pending_fields"] == ["issue_price", "listing_date"]
         assert result["data_status"] == "partial_data"
-        assert "SECURITY_CODE" in captured[0][0]
-        assert "301707" in captured[0][0]
-        assert captured[0][2] == {"timeout": 5, "attempts": 2}
+        assert captured[0][0].startswith(market_app.IPO_CALENDAR_FAST_API)
+        assert captured[0][2] == {"timeout": 2, "attempts": 1}
+        assert result["source"] == ["eastmoney_datapc_ipo_calendar"]
 
         market_app.read_public_json = lambda *_args, **_kwargs: {
             "success": True,
             "result": ["malformed"],
         }
         try:
-            market_app.get_eastmoney_ipo_calendar_rows("301707", 10)
+            market_app.get_datacenter_ipo_calendar_rows("301707", 10)
         except market_app.HTTPException as exc:
             assert exc.status_code == 502
         else:
@@ -2346,12 +2361,13 @@ def test_ipo_subscription_status_contract() -> None:
             }
 
         market_app.read_public_json = fake_name_json
+        market_app.TOOL_CACHE.pop(fast_cache_key, None)
         name_match = market_app.get_ipo_subscription_status_data(
             "TestIPO", 30, 7, 10, "summary"
         )
         assert name_match["items"][0]["security_name"] == "TestIPO"
-        assert "SECURITY_NAME_ABBR" in name_urls[0]
-        assert "TestIPO" in name_urls[0]
+        assert name_urls[0].startswith(market_app.IPO_CALENDAR_FAST_API)
+        assert name_match["source"] == ["eastmoney_datapc_ipo_calendar"]
 
         today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
 
@@ -2378,6 +2394,7 @@ def test_ipo_subscription_status_contract() -> None:
             }
 
         market_app.read_public_json = fake_calendar_json
+        market_app.TOOL_CACHE.pop(fast_cache_key, None)
         calendar = market_app.get_ipo_subscription_status_data(
             None, 1, 1, 10, "summary"
         )
@@ -2407,11 +2424,18 @@ def test_ipo_subscription_status_contract() -> None:
             }
 
         market_app.read_public_json = fake_subscription_code_json
+        market_app.TOOL_CACHE.pop(fast_cache_key, None)
         subscription_code_match = market_app.get_ipo_subscription_status_data(
             "732407", 30, 7, 10, "summary"
         )
         assert subscription_code_match["items"][0]["security_code"] == "603407"
         assert subscription_code_match["items"][0]["subscription_code"] == "732407"
+        assert subscription_code_match["source"] == [
+            "eastmoney_datacenter_ipo_calendar"
+        ]
+        assert subscription_code_match["source_errors"][0]["source"] == (
+            "eastmoney_datapc_ipo_calendar"
+        )
 
         bse = market_app.build_ipo_subscription_item(
             {
@@ -2467,6 +2491,7 @@ def test_ipo_subscription_status_contract() -> None:
             raise AssertionError("Unsafe IPO query characters should be rejected.")
     finally:
         market_app.read_public_json = original_json
+        market_app.TOOL_CACHE.pop(fast_cache_key, None)
 
 
 def main() -> None:
@@ -2530,7 +2555,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "ipo_subscription_status_v1"
+        assert health.json()["routing_revision"] == "ipo_fast_fallback_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
