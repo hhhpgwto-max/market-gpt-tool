@@ -122,7 +122,7 @@ def fake_search_stock_data(keyword: str, limit: int) -> dict:
     }
 
 
-def fake_get_kline_data(symbol: str, period: str, limit: int) -> dict:
+def fake_get_kline_data(symbol: str, period: str, limit: int, **_: object) -> dict:
     return {
         "symbol": symbol,
         "period": period,
@@ -304,6 +304,39 @@ def fake_get_market_overview_data(limit: int) -> dict:
     }
 
 
+def fake_get_market_snapshot_data(
+    symbol: str | None,
+    peer_symbols: list[str] | None,
+    as_of: str | None,
+    sector_limit: int,
+    detail_level: str,
+) -> dict:
+    return {
+        "snapshot_id": "market-snapshot-test",
+        "requested_as_of": as_of,
+        "symbol": symbol,
+        "requested_identifiers": [symbol, *(peer_symbols or [])] if symbol else peer_symbols or [],
+        "market_time": "2026-07-10T15:00:00+08:00",
+        "market_time_range": {
+            "earliest": "2026-07-10T15:00:00+08:00",
+            "latest": "2026-07-10T15:00:00+08:00",
+        },
+        "source_time_difference_seconds": 0,
+        "source_difference_pct": 0,
+        "recommended_source": ["test"],
+        "target_quote": {"symbol": symbol, "price": 123.45} if symbol else None,
+        "peer_quotes": [],
+        "market_overview": fake_get_market_overview_data(sector_limit),
+        "component_status": {"market_overview": {"status": "available", "latency_ms": 1}},
+        "source": ["test"],
+        "source_errors": [],
+        "conflicts": [],
+        "missing_fields": [],
+        "detail_level": detail_level,
+        "data_status": "full_data",
+    }
+
+
 def fake_get_limit_activity_data(limit: int) -> dict:
     return {
         "trade_date": "2026-07-10",
@@ -340,7 +373,7 @@ def test_kline_source_parsers() -> None:
     original_eastmoney = market_app.get_eastmoney_kline
     original_tencent = market_app.get_tencent_kline
     try:
-        market_app.read_public_json = lambda *_: {
+        market_app.read_public_json = lambda *_, **__: {
             "data": {
                 "klines": [
                     "2026-07-10,120.0,123.45,124.0,119.5,1000,123456,3.5,1.2,1.45,0.6"
@@ -355,7 +388,7 @@ def test_kline_source_parsers() -> None:
         assert eastmoney["items"][0]["volume_unit"] == "share"
         assert eastmoney["items"][0]["turnover_unit"] == "CNY"
 
-        market_app.read_public_json = lambda *_: {
+        market_app.read_public_json = lambda *_, **__: {
             "data": {
                 "sh600519": {
                     "qfqday": [["2026-07-10", "120.0", "123.45", "124.0", "119.5", "1000"]]
@@ -416,6 +449,132 @@ def test_kline_source_parsers() -> None:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney
         market_app.get_tencent_kline = original_tencent
+
+
+def test_kline_range_and_pagination() -> None:
+    original_reader = market_app.read_public_json
+    requested_urls: list[str] = []
+    try:
+        def fake_reader(url: str, *_: object, **__: object) -> dict:
+            requested_urls.append(url)
+            return {
+                "data": {
+                    "klines": [
+                        "2026-07-08,100,101,102,99,10,1000,3,1,1,0.1",
+                        "2026-07-09,101,102,103,100,20,2000,3,1,1,0.2",
+                        "2026-07-10,102,103,104,101,30,3000,3,1,1,0.3",
+                    ]
+                }
+            }
+
+        market_app.read_public_json = fake_reader
+        first = market_app.get_eastmoney_kline(
+            "600519", "daily", 101, 2, "2026-07-01", "2026-07-10", "backward"
+        )
+        assert [item["date"] for item in first["items"]] == ["2026-07-09", "2026-07-10"]
+        assert first["has_more"] is True
+        assert first["next_page_token"]
+        assert first["adjustment"] == "backward_adjusted"
+        assert "fqt=2" in requested_urls[0]
+        assert "beg=20260701" in requested_urls[0]
+        assert "end=20260710" in requested_urls[0]
+
+        second = market_app.get_eastmoney_kline(
+            "600519",
+            "daily",
+            101,
+            2,
+            "2026-07-01",
+            "2026-07-10",
+            "backward",
+            first["next_page_token"],
+        )
+        assert [item["date"] for item in second["items"]] == ["2026-07-08"]
+        assert second["has_more"] is False
+
+        minute = market_app.get_eastmoney_kline(
+            "600519", "1m", 1, 2, "2026-07-01", "2026-07-10"
+        )
+        assert minute["coverage_status"] == "partial_public_source_history"
+        assert "historical_1m_before_available_public_range" in minute["missing_fields"]
+    finally:
+        market_app.read_public_json = original_reader
+
+
+def test_tencent_minute_kline_adjustment_fallback() -> None:
+    original_reader = market_app.read_public_json
+    try:
+        def fake_reader(url: str, *_: object, **__: object) -> dict:
+            if "/kline/mkline" in url:
+                return {
+                    "data": {
+                        "sh600519": {
+                            "m5": [
+                                ["202607100935", "100", "101", "102", "99", "10", "", ""],
+                                ["202607100940", "101", "102", "103", "100", "20", "", ""],
+                            ]
+                        }
+                    }
+                }
+            if "/fqkline/get" in url:
+                return {
+                    "data": {
+                        "sh600519": {
+                            "qfqday": [["2026-07-10", "50", "51", "52", "49", "30"]]
+                        }
+                    }
+                }
+            return {
+                "data": {
+                    "sh600519": {
+                        "day": [["2026-07-10", "100", "102", "104", "98", "30"]]
+                    }
+                }
+            }
+
+        market_app.read_public_json = fake_reader
+        result = market_app.get_tencent_kline(
+            "600519", "5m", 2, "2026-07-10", "2026-07-10", "forward"
+        )
+        assert result["source"] == "tencent"
+        assert result["adjustment"] == "forward_adjusted"
+        assert result["adjustment_source_parameter"] == "tencent_mkline_plus_qfq_daily_factor"
+        assert result["items"][0]["open"] == 50.0
+        assert result["items"][0]["close"] == 50.5
+        assert result["items"][0]["volume"] == 1000.0
+        assert result["missing_fields"] == ["turnover", "turnover_rate", "amplitude"]
+    finally:
+        market_app.read_public_json = original_reader
+
+
+def test_synchronized_market_snapshot_contract() -> None:
+    original_overview = market_app.get_market_overview_data
+    original_batch = market_app.get_batch_quote_data
+    original_quote = market_app.get_quote_data
+    try:
+        market_app.get_market_overview_data = fake_get_market_overview_data
+        market_app.get_batch_quote_data = fake_get_batch_quote_data
+        market_app.get_quote_data = fake_get_quote_data
+        snapshot = market_app.get_market_snapshot_data(
+            "600519", [], None, 5, "summary"
+        )
+        assert snapshot["snapshot_id"].startswith("market-snapshot-")
+        assert snapshot["market_time_range"]["latest"] == "2026-07-10T15:00:00+08:00"
+        assert snapshot["source_difference_pct"] > 0
+        assert snapshot["conflicts"][0]["type"] == "target_price_difference"
+        assert snapshot["recommended_source"] == ["test"]
+        assert snapshot["data_status"] == "partial_data"
+
+        try:
+            market_app.normalize_snapshot_as_of("2000-01-01T10:30:00+08:00")
+            raise AssertionError("Historical as_of should be rejected")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 400
+            assert "historical" in str(exc.detail).lower()
+    finally:
+        market_app.get_market_overview_data = original_overview
+        market_app.get_batch_quote_data = original_batch
+        market_app.get_quote_data = original_quote
 
 
 def test_search_source_parser() -> None:
@@ -1431,7 +1590,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "limit_activity_and_index_identity_v1"
+    assert health["routing_revision"] == "historical_bars_and_synchronized_snapshot_v1"
 
     market_app.TOOL_CACHE.clear()
     concurrent_calls = 0
@@ -1750,6 +1909,9 @@ def test_news_relevance_deduplication_and_source_metadata() -> None:
 
 def main() -> None:
     test_kline_source_parsers()
+    test_kline_range_and_pagination()
+    test_tencent_minute_kline_adjustment_fallback()
+    test_synchronized_market_snapshot_contract()
     test_search_source_parser()
     test_etf_market_routing_and_search()
     test_quote_unit_normalization()
@@ -1786,6 +1948,7 @@ def main() -> None:
     market_app.get_relative_strength_data = fake_get_relative_strength_data
     market_app.scan_intraday_anomalies_data = fake_scan_intraday_anomalies_data
     market_app.get_market_overview_data = fake_get_market_overview_data
+    market_app.get_market_snapshot_data = fake_get_market_snapshot_data
     market_app.get_limit_activity_data = fake_get_limit_activity_data
     market_app.get_sector_rankings_data = fake_get_sector_rankings_data
     headers = {
@@ -1796,7 +1959,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "limit_activity_and_index_identity_v1"
+        assert health.json()["routing_revision"] == "historical_bars_and_synchronized_snapshot_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -1851,6 +2014,7 @@ def main() -> None:
             "scan_a_share_intraday_anomalies",
             "get_a_share_sector_rankings",
             "get_a_share_limit_activity",
+            "get_a_share_market_snapshot",
             "get_a_share_market_overview",
             "get_market_data_health",
         }
@@ -1908,23 +2072,24 @@ def main() -> None:
             (12, "get_a_share_news", {"symbol": "600519"}),
             (13, "get_a_share_sector_rankings", {"sector_type": "industry"}),
             (14, "get_a_share_limit_activity", {}),
-            (15, "get_a_share_market_overview", {}),
-            (16, "get_market_data_health", {}),
-            (17, "get_a_share_announcements", {"symbol": "600519"}),
+            (15, "get_a_share_market_snapshot", {"symbol": "600519"}),
+            (16, "get_a_share_market_overview", {}),
+            (17, "get_market_data_health", {}),
+            (18, "get_a_share_announcements", {"symbol": "600519"}),
             (
-                17,
+                19,
                 "get_a_share_relative_strength",
                 {"symbol": "600519", "peer_symbols": ["600000"]},
             ),
             (
-                18,
+                20,
                 "scan_a_share_intraday_anomalies",
                 {"symbols": ["600519"], "benchmark_symbol": "index:000001"},
             ),
-            (19, "get_a_share_historical_context", {"symbol": "600519"}),
-            (20, "get_a_share_security_status", {"symbol": "600519"}),
+            (21, "get_a_share_historical_context", {"symbol": "600519"}),
+            (22, "get_a_share_security_status", {"symbol": "600519"}),
             (
-                21,
+                23,
                 "get_a_share_decision_context",
                 {"symbol": "600519", "benchmark_symbol": "index:000001"},
             ),
