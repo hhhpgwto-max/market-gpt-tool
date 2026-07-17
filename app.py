@@ -28,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "ipo_subscription_status_v1"
+ROUTING_REVISION = "ipo_fast_fallback_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -6077,6 +6077,7 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
 
 
 IPO_CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+IPO_CALENDAR_FAST_API = "https://datapc.eastmoney.com/da/purchase/list2"
 IPO_RULE_SOURCES = {
     "sse": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/issue/c/c_20250515_10778982.shtml",
     "szse": "https://www.szse.cn/ipo/guide/rule/P020190228664910292959.pdf",
@@ -6116,7 +6117,66 @@ def ipo_calendar_date(value: Any) -> str | None:
         return None
 
 
-def get_eastmoney_ipo_calendar_rows(
+def normalize_fast_ipo_row(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    security_code = str(row.get("SECURITY_CODE") or "")
+    trade_market = str(row.get("TRADE_MARKET") or "")
+    if security_code.startswith("688"):
+        board = "科创板"
+    elif security_code.startswith(("300", "301")):
+        board = "创业板"
+    elif int(to_number(row.get("IS_BEIJING")) or 0) == 1:
+        board = "北交所"
+    else:
+        board = ""
+    normalized["SECURITY_NAME_ABBR"] = row.get("SECURITY_NAME_ABBR") or row.get(
+        "SECURITY_NAME"
+    )
+    normalized["MARKET"] = " ".join(value for value in (trade_market, board) if value)
+    normalized["LISTING_DATE"] = row.get("LISTING_DATE") or row.get(
+        "SELECT_LISTING_DATE"
+    )
+    return normalized
+
+
+def ipo_row_matches_query(row: dict[str, Any], query: str) -> bool:
+    return query in {
+        str(row.get("SECURITY_CODE") or "").strip(),
+        str(row.get("APPLY_CODE") or "").strip(),
+        str(row.get("SECURITY_NAME_ABBR") or "").strip(),
+        str(row.get("SECURITY_NAME") or "").strip(),
+    }
+
+
+def get_fast_ipo_calendar_rows(fetch_limit: int) -> list[dict[str, Any]]:
+    normalized_limit = max(20, min(fetch_limit, 100))
+    key = cache_key("ipo_recent_calendar_component", {"limit": normalized_limit})
+
+    def load() -> dict[str, Any]:
+        payload = read_public_json(
+            f"{IPO_CALENDAR_FAST_API}?{urlencode({'stat': 0, 'st': 'APPLY_DATE', 'sr': -1, 'p': 1, 'ps': normalized_limit})}",
+            "https://datapc.eastmoney.com/da/Purchase/Index?color=w",
+            timeout=2,
+            attempts=1,
+        )
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            raise HTTPException(status_code=502, detail="Unexpected fast IPO calendar response.")
+        result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise HTTPException(status_code=502, detail="Unexpected fast IPO calendar response.")
+        return {
+            "rows": [
+                normalize_fast_ipo_row(row)
+                for row in result["data"]
+                if isinstance(row, dict)
+            ]
+        }
+
+    component, _ = get_cached_tool_data(key, 60, load)
+    return component["rows"]
+
+
+def get_datacenter_ipo_calendar_rows(
     symbol_or_name: str | None, fetch_limit: int
 ) -> list[dict[str, Any]]:
     query = normalize_ipo_query(symbol_or_name)
@@ -6136,8 +6196,8 @@ def get_eastmoney_ipo_calendar_rows(
         payload = read_public_json(
             f"{IPO_CALENDAR_API}?{urlencode(parameters)}",
             "https://data.eastmoney.com/xg/xg/default.html",
-            timeout=5,
-            attempts=2,
+            timeout=3,
+            attempts=1,
         )
         if not isinstance(payload, dict):
             raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
@@ -6159,6 +6219,41 @@ def get_eastmoney_ipo_calendar_rows(
     if not isinstance(rows, list):
         raise HTTPException(status_code=502, detail="IPO calendar rows had an unexpected format.")
     return [row for row in rows if isinstance(row, dict)]
+
+
+def get_ipo_calendar_route(
+    symbol_or_name: str | None, fetch_limit: int
+) -> dict[str, Any]:
+    query = normalize_ipo_query(symbol_or_name)
+    source_errors: list[str] = []
+    try:
+        recent_rows = get_fast_ipo_calendar_rows(100)
+        matched_rows = (
+            [row for row in recent_rows if ipo_row_matches_query(row, query)]
+            if query
+            else recent_rows[:fetch_limit]
+        )
+        if matched_rows or query is None:
+            return {
+                "rows": matched_rows[:fetch_limit],
+                "source": "eastmoney_datapc_ipo_calendar",
+                "source_errors": [],
+            }
+    except HTTPException as exc:
+        source_errors.append(f"eastmoney_datapc_ipo_calendar: {exc.detail}")
+
+    rows = get_datacenter_ipo_calendar_rows(query, fetch_limit)
+    return {
+        "rows": rows,
+        "source": "eastmoney_datacenter_ipo_calendar",
+        "source_errors": source_errors,
+    }
+
+
+def get_eastmoney_ipo_calendar_rows(
+    symbol_or_name: str | None, fetch_limit: int
+) -> list[dict[str, Any]]:
+    return get_ipo_calendar_route(symbol_or_name, fetch_limit)["rows"]
 
 
 def ipo_subscription_stage(row: dict[str, Any], today: str) -> str:
@@ -6291,7 +6386,8 @@ def get_ipo_subscription_status_data(
     detail_level: str,
 ) -> dict[str, Any]:
     query = normalize_ipo_query(symbol_or_name)
-    rows = get_eastmoney_ipo_calendar_rows(query, 100 if query is None else limit)
+    route = get_ipo_calendar_route(query, 100 if query is None else limit)
+    rows = route["rows"]
     today = datetime.now(MARKET_TIMEZONE).date()
     range_start = (today - timedelta(days=days_back)).isoformat()
     range_end = (today + timedelta(days=days_ahead)).isoformat()
@@ -6326,9 +6422,9 @@ def get_ipo_subscription_status_data(
         "items": items,
         "personalized_eligibility": "not_available_without_brokerage_account_market_value_and_board_permissions",
         "rule_source_urls": sorted({item["eligibility_rules"]["official_rule_url"] for item in items}),
-        "source": ["eastmoney_public_ipo_calendar"],
+        "source": [route["source"]],
         "source_updated_at": source_update_dates[-1] if source_update_dates else None,
-        "source_errors": [],
+        "source_errors": normalize_source_errors(route.get("source_errors")),
         "missing_fields": pending_fields,
         "detail_level": detail_level,
         "data_status": "partial_data" if pending_fields else "full_data",
