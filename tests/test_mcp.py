@@ -372,6 +372,7 @@ def test_kline_source_parsers() -> None:
     original_reader = market_app.read_public_json
     original_eastmoney = market_app.get_eastmoney_kline
     original_tencent = market_app.get_tencent_kline
+    market_app.PREFERRED_ROUTE_HEALTH.clear()
     try:
         market_app.read_public_json = lambda *_, **__: {
             "data": {
@@ -431,6 +432,7 @@ def test_kline_source_parsers() -> None:
         finally:
             release_eastmoney.set()
 
+        market_app.PREFERRED_ROUTE_HEALTH.clear()
         eastmoney_full = {
             **tencent,
             "source": "eastmoney",
@@ -449,6 +451,7 @@ def test_kline_source_parsers() -> None:
         market_app.read_public_json = original_reader
         market_app.get_eastmoney_kline = original_eastmoney
         market_app.get_tencent_kline = original_tencent
+        market_app.PREFERRED_ROUTE_HEALTH.clear()
 
 
 def test_kline_range_and_pagination() -> None:
@@ -1577,6 +1580,7 @@ def test_announcements_relative_strength_and_anomaly_scan() -> None:
 def test_reliability_envelope_cache_and_health() -> None:
     market_app.TOOL_CACHE.clear()
     market_app.SOURCE_HEALTH.clear()
+    market_app.PREFERRED_ROUTE_HEALTH.clear()
     calls = 0
 
     def loader() -> dict:
@@ -1632,21 +1636,30 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["routing_revision"] == "adaptive_fallback_bounded_cache_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
-    market_app.SOURCE_HEALTH.clear()
-    market_app.record_source_health("eastmoney", False, 50, "temporary failure one")
-    market_app.record_source_health("eastmoney", False, 50, "temporary failure two")
+    market_app.PREFERRED_ROUTE_HEALTH.clear()
+    market_app.record_preferred_route_health(
+        "kline:eastmoney", False, "temporary failure one"
+    )
+    market_app.record_preferred_route_health(
+        "kline:eastmoney", False, "temporary failure two"
+    )
     adaptive_started = market_app.perf_counter()
     adaptive_payload, adaptive_source, adaptive_errors = (
         market_app.prefer_primary_public_source(
             ("eastmoney", lambda: (sleep(0.25), {"source": "eastmoney"})[1]),
             ("tencent", lambda: {"source": "tencent"}),
             1,
+            "kline:eastmoney",
         )
     )
     assert market_app.perf_counter() - adaptive_started < 0.15
     assert adaptive_payload["source"] == "tencent"
     assert adaptive_source == "tencent"
     assert any("adaptive fast fallback" in error for error in adaptive_errors)
+    adaptive_health = market_app.get_market_data_health_data()
+    assert adaptive_health["kline_route"]["eastmoney_circuit"][
+        "adaptive_fast_fallback"
+    ] is True
 
     original_cache_limit = market_app.TOOL_CACHE_MAX_ENTRIES
     market_app.TOOL_CACHE.clear()

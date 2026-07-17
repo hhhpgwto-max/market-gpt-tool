@@ -322,6 +322,8 @@ TOOL_CACHE_INFLIGHT: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_MAX_ENTRIES = 512
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
+PREFERRED_ROUTE_HEALTH: dict[str, dict[str, Any]] = {}
+PREFERRED_ROUTE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 SINA_AUX_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
@@ -616,6 +618,51 @@ def source_is_temporarily_degraded(
     return (datetime.now(timezone.utc) - error_time).total_seconds() <= cooldown_seconds
 
 
+def record_preferred_route_health(
+    route: str, success: bool, error: str | None = None
+) -> None:
+    with PREFERRED_ROUTE_HEALTH_LOCK:
+        state = PREFERRED_ROUTE_HEALTH.setdefault(
+            route,
+            {
+                "attempt_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "consecutive_failures": 0,
+                "last_success_at": None,
+                "last_error_at": None,
+                "last_error": None,
+            },
+        )
+        state["attempt_count"] += 1
+        if success:
+            state["success_count"] += 1
+            state["consecutive_failures"] = 0
+            state["last_success_at"] = now_iso()
+        else:
+            state["failure_count"] += 1
+            state["consecutive_failures"] += 1
+            state["last_error_at"] = now_iso()
+            state["last_error"] = error
+
+
+def preferred_route_is_temporarily_degraded(
+    route: str, min_consecutive_failures: int = 2, cooldown_seconds: int = 90
+) -> bool:
+    with PREFERRED_ROUTE_HEALTH_LOCK:
+        state = deepcopy(PREFERRED_ROUTE_HEALTH.get(route))
+    if not state or state.get("consecutive_failures", 0) < min_consecutive_failures:
+        return False
+    last_error_at = state.get("last_error_at")
+    if not last_error_at:
+        return False
+    try:
+        error_time = datetime.fromisoformat(str(last_error_at))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - error_time).total_seconds() <= cooldown_seconds
+
+
 def classify_error_type(message: Any, status_code: int | None = None) -> str:
     text = str(message).lower()
     if status_code == 404 or "not found" in text or "not_found" in text:
@@ -674,7 +721,10 @@ def race_public_sources(
 
 
 def prefer_primary_public_source(
-    primary: tuple[str, Any], fallback: tuple[str, Any], timeout_seconds: float
+    primary: tuple[str, Any],
+    fallback: tuple[str, Any],
+    timeout_seconds: float,
+    degradation_route: str | None = None,
 ) -> tuple[Any, str, list[str]]:
     """Prefetch a fallback concurrently without discarding a healthy richer primary."""
     primary_source, primary_getter = primary
@@ -709,10 +759,15 @@ def prefer_primary_public_source(
                 errors.append(f"{source}: {exc}")
                 status_codes.append(502)
         primary_pending = any(futures[future] == primary_source for future in pending)
+        route_degraded = (
+            preferred_route_is_temporarily_degraded(degradation_route)
+            if degradation_route
+            else source_is_temporarily_degraded(primary_source)
+        )
         if (
             fallback_payload is not None
             and primary_pending
-            and source_is_temporarily_degraded(primary_source)
+            and route_degraded
         ):
             for future in pending:
                 if futures[future] == primary_source:
@@ -2090,9 +2145,16 @@ def get_fallback_kline(
         payload["source_errors"] = []
         return payload
     def eastmoney_loader() -> dict[str, Any]:
-        return get_eastmoney_kline(
-            symbol, period, klt, limit, start_date, end_date, adjust, page_token
-        )
+        try:
+            payload = get_eastmoney_kline(
+                symbol, period, klt, limit, start_date, end_date, adjust, page_token
+            )
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            record_preferred_route_health("kline:eastmoney", False, str(detail))
+            raise
+        record_preferred_route_health("kline:eastmoney", True)
+        return payload
 
     def tencent_loader() -> dict[str, Any]:
         return get_tencent_kline(
@@ -2113,6 +2175,7 @@ def get_fallback_kline(
         primary,
         secondary,
         7.0 if period in {"1m", "5m", "15m", "30m", "60m"} else 3.5,
+        "kline:eastmoney",
     )
     payload["source_errors"] = errors
     return payload
@@ -2760,10 +2823,21 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
 
 
 def get_fund_flow_data(symbol: str, limit: int) -> dict[str, Any]:
+    def eastmoney_loader() -> dict[str, Any]:
+        try:
+            payload = get_eastmoney_fund_flow(symbol, limit)
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            record_preferred_route_health("fund_flow:eastmoney", False, str(detail))
+            raise
+        record_preferred_route_health("fund_flow:eastmoney", True)
+        return payload
+
     payload, _, errors = prefer_primary_public_source(
-        ("eastmoney", lambda: get_eastmoney_fund_flow(symbol, limit)),
+        ("eastmoney", eastmoney_loader),
         ("sina", lambda: get_sina_fund_flow(symbol, limit)),
         5.5,
+        "fund_flow:eastmoney",
     )
     payload["source_errors"] = errors
     return payload
@@ -6028,6 +6102,8 @@ def get_market_snapshot_data(
 def get_market_data_health_data() -> dict[str, Any]:
     with SOURCE_HEALTH_LOCK:
         observed = deepcopy(SOURCE_HEALTH)
+    with PREFERRED_ROUTE_HEALTH_LOCK:
+        preferred_routes = deepcopy(PREFERRED_ROUTE_HEALTH)
 
     sources = []
     for source in ("eastmoney", "tencent", "sina"):
@@ -6083,6 +6159,15 @@ def get_market_data_health_data() -> dict[str, Any]:
             "status": "configured",
             "providers": ["eastmoney", "tencent"],
             "strategy": "preferred_source_with_adaptive_fast_fallback_and_shared_source_payload_cache",
+            "eastmoney_circuit": {
+                **preferred_routes.get(
+                    "kline:eastmoney",
+                    {"attempt_count": 0, "consecutive_failures": 0},
+                ),
+                "adaptive_fast_fallback": preferred_route_is_temporarily_degraded(
+                    "kline:eastmoney"
+                ),
+            },
         },
         "market_overview_route": {
             "status": "configured",
