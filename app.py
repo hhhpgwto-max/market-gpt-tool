@@ -326,6 +326,7 @@ PREFERRED_ROUTE_HEALTH: dict[str, dict[str, Any]] = {}
 PREFERRED_ROUTE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 SINA_AUX_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+TENCENT_KLINE_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -1917,11 +1918,9 @@ def get_tencent_minute_kline(
     }[period]
     market_code = market_symbol(symbol)
     query = urlencode({"param": f"{market_code},{tencent_period},,640"})
-    payload, _ = get_cached_tool_data(
-        cache_key(
-            "tencent_minute_kline_source",
-            {"symbol": symbol, "period": period},
-        ),
+    source_future = TENCENT_KLINE_EXECUTOR.submit(
+        get_cached_tool_data,
+        cache_key("tencent_minute_kline_source", {"symbol": symbol, "period": period}),
         15,
         lambda: read_public_json(
             f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?{query}",
@@ -1930,12 +1929,16 @@ def get_tencent_minute_kline(
             attempts=2,
         ),
     )
+    factors_future = TENCENT_KLINE_EXECUTOR.submit(
+        get_tencent_minute_adjustment_factors, symbol, adjust
+    )
+    payload, _ = source_future.result()
+    factors = factors_future.result()
     rows = ((payload.get("data") or {}).get(market_code) or {}).get(tencent_period) or []
     if not rows:
         raise HTTPException(
             status_code=404, detail=f"Minute Kline data not found from Tencent: {symbol}"
         )
-    factors = get_tencent_minute_adjustment_factors(symbol, adjust)
     items = []
     previous_close = None
     missing_factor_dates = set()
