@@ -3591,7 +3591,7 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
         ),
     }
     results, component_status, source_errors = collect_components(
-        loaders, 10, COMPOSITE_TOOL_EXECUTOR
+        loaders, 7, COMPOSITE_TOOL_EXECUTOR
     )
     if not results.get("official_announcements") and not results.get("news"):
         raise HTTPException(status_code=502, detail="Both official announcements and news timeline sources failed.")
@@ -4691,18 +4691,24 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
         }
     )
     errors = []
-    for host in (
+    futures = {
+        PUBLIC_SOURCE_EXECUTOR.submit(
+            read_public_json,
+            f"https://{host}/api/qt/clist/get?{query}",
+            "https://quote.eastmoney.com/",
+            3,
+            2,
+        ): host
+        for host in (
         "push2.eastmoney.com",
         "push2delay.eastmoney.com",
         "82.push2.eastmoney.com",
-    ):
+        )
+    }
+    for future in as_completed(futures):
+        host = futures[future]
         try:
-            payload = read_public_json(
-                f"https://{host}/api/qt/clist/get?{query}",
-                "https://quote.eastmoney.com/",
-                3,
-                1,
-            )
+            payload = future.result()
             rows = ((payload.get("data") or {}).get("diff")) or []
             if not rows:
                 raise HTTPException(
@@ -4764,6 +4770,11 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
                     }
                 )
             if boards:
+                for pending in futures:
+                    if pending is future:
+                        continue
+                    pending.add_done_callback(consume_background_future)
+                    pending.cancel()
                 return boards
             errors.append(f"{host}: no usable industry-board rows")
         except HTTPException as exc:

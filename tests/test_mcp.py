@@ -838,10 +838,13 @@ def test_industry_board_parser() -> None:
 
         market_app.read_public_json = read_with_host_fallback
         boards = market_app.get_eastmoney_industry_boards(5)
-        assert "push2.eastmoney.com" in calls[0][0]
-        assert "push2delay.eastmoney.com" in calls[1][0]
-        assert calls[0][1][-2:] == (3, 1)
-        assert calls[1][1][-2:] == (3, 1)
+        called_hosts = {url.split("/", 3)[2] for url, _ in calls}
+        assert called_hosts == {
+            "push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+            "82.push2.eastmoney.com",
+        }
+        assert all(arguments[-2:] == (3, 2) for _, arguments in calls)
         assert boards[0]["symbol"] == "BK0001"
         assert boards[0]["sector_type"] == "industry"
         assert boards[0]["industry_name"] == "Test Industry"
