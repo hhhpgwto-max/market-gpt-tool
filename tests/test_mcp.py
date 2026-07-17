@@ -182,6 +182,49 @@ def fake_get_financial_data(symbol: str, limit: int) -> dict:
     }
 
 
+def fake_get_fund_exposure_data(
+    fund_code: str, holdings_limit: int, detail_level: str
+) -> dict:
+    return {
+        "fund_code": fund_code,
+        "fund_name": "Test Fund",
+        "top_holdings": [
+            {
+                "symbol": "600519",
+                "name": "Test Stock",
+                "weight_pct": 10.0,
+                "provider_industry_name": "Manufacturing",
+            }
+        ][:holdings_limit],
+        "industry_distribution": [{"industry_name": "Manufacturing", "weight_pct": 80.0}],
+        "asset_allocation": {"stock_pct": 90.0, "bond_pct": 0.0, "cash_pct": 10.0, "other_pct": 0.0, "fund_pct": 0.0},
+        "holdings_disclosure_date": "2026-03-31",
+        "detail_level": detail_level,
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_get_portfolio_exposure_data(
+    positions: list[dict], normalize_weights: bool, holdings_limit: int, detail_level: str
+) -> dict:
+    return {
+        "input_position_count": len(positions),
+        "weights_normalized": normalize_weights,
+        "holdings_limit": holdings_limit,
+        "detail_level": detail_level,
+        "asset_allocation": {"stock_pct": 100.0},
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
 def fake_get_news_data(
     symbol: str,
     limit: int,
@@ -1678,7 +1721,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "rotation_overnight_event_timeline_v1"
+    assert health["routing_revision"] == "fund_and_portfolio_exposure_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2071,6 +2114,105 @@ def test_rotation_overnight_and_event_helpers() -> None:
     assert market_app.event_titles_match("公司回购股份方案", "关于公司回购股份方案的公告") is True
 
 
+def test_fund_and_portfolio_exposure_calculations() -> None:
+    normalized, input_total = market_app.normalized_portfolio_positions(
+        [
+            {"identifier": "512760", "weight_pct": 60},
+            {"identifier": "600519", "weight_pct": 40},
+        ],
+        False,
+    )
+    assert input_total == 100
+    assert normalized[0]["asset_type"] == "fund"
+    assert normalized[1]["asset_type"] == "stock"
+
+    original_component = market_app.get_eastmoney_fund_component
+    market_app.get_eastmoney_fund_component = lambda _code, endpoint: (
+        {
+            "Datas": {
+                "fundStocks": [
+                    {
+                        "GPDM": "00700",
+                        "GPJC": "Tencent",
+                        "JZBL": "5",
+                        "TEXCH": "116",
+                    }
+                ]
+            },
+            "Expansion": "2026-03-31",
+        }
+        if endpoint == "FundMNInverstPosition"
+        else {"Datas": [{"GP": "5", "FSRQ": "2026-03-31"}]}
+        if endpoint == "FundMNAssetAllocationNew"
+        else {"Datas": {}}
+        if endpoint == "FundMNNBasicInformation"
+        else {"Datas": []}
+    )
+    try:
+        foreign = market_app.get_fund_exposure_data("008888", 10, "raw")
+        assert foreign["top_holdings"][0]["identifier"] == "116:00700"
+        assert foreign["top_holdings"][0]["symbol"] is None
+        assert foreign["top_holdings"][0]["provider_security_code"] == "00700"
+    finally:
+        market_app.get_eastmoney_fund_component = original_component
+
+    original_fund = market_app.get_fund_exposure_data
+    original_reference = market_app.get_resilient_security_reference_data
+    market_app.get_fund_exposure_data = fake_get_fund_exposure_data
+    market_app.get_resilient_security_reference_data = lambda symbol: {
+        "symbol": symbol,
+        "name": "Test Stock",
+        "industry": "Manufacturing",
+        "source": ["test"],
+        "source_errors": [],
+    }
+    try:
+        result = market_app.get_portfolio_exposure_data(
+            [
+                {"identifier": "512760", "weight_pct": 60},
+                {"identifier": "600519", "weight_pct": 40},
+            ],
+            False,
+            10,
+            "raw",
+        )
+        assert result["asset_allocation"]["stock_pct"] == 94.0
+        assert result["asset_allocation"]["cash_pct"] == 6.0
+        assert result["underlying_exposure"][0]["symbol"] == "600519"
+        assert result["underlying_exposure"][0]["exposure_pct"] == 46.0
+        assert result["overlapping_underlyings"][0]["source_position_count"] == 2
+        assert result["industry_exposure"][0]["exposure_pct"] == 46.0
+        assert result["fund_reported_industry_exposure"][0]["exposure_pct"] == 48.0
+
+        def partial_fund(code: str, limit: int, level: str) -> dict:
+            payload = fake_get_fund_exposure_data(code, limit, level)
+            payload["data_status"] = "partial_data"
+            payload["missing_fields"] = ["industry_distribution"]
+            payload["source_errors"] = [
+                {
+                    "source": "child_test",
+                    "error_type": "upstream_failure",
+                    "message": "partial child",
+                }
+            ]
+            return payload
+
+        market_app.get_fund_exposure_data = partial_fund
+        partial = market_app.get_portfolio_exposure_data(
+            [{"identifier": "512760", "weight_pct": 100}],
+            False,
+            10,
+            "summary",
+        )
+        assert partial["data_status"] == "partial_data"
+        assert partial["partial_child_components"] == ["fund:512760"]
+        assert "fund:512760:industry_distribution" in partial["missing_fields"]
+        assert partial["source_errors"][0]["source"] == "fund:512760/child_test"
+    finally:
+        market_app.get_fund_exposure_data = original_fund
+        market_app.get_resilient_security_reference_data = original_reference
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_kline_range_and_pagination()
@@ -2095,6 +2237,7 @@ def main() -> None:
     test_reliability_envelope_cache_and_health()
     test_historical_context_and_security_status_facts()
     test_rotation_overnight_and_event_helpers()
+    test_fund_and_portfolio_exposure_calculations()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
@@ -2105,6 +2248,8 @@ def main() -> None:
     market_app.filter_a_share_securities_data = fake_filter_a_share_securities_data
     market_app.get_fund_flow_data = fake_get_fund_flow_data
     market_app.get_financial_data = fake_get_financial_data
+    market_app.get_fund_exposure_data = fake_get_fund_exposure_data
+    market_app.get_portfolio_exposure_data = fake_get_portfolio_exposure_data
     market_app.get_news_data = fake_get_news_data
     market_app.get_announcement_data = fake_get_announcement_data
     market_app.get_event_timeline_data = fake_get_event_timeline_data
@@ -2127,7 +2272,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "rotation_overnight_event_timeline_v1"
+        assert health.json()["routing_revision"] == "fund_and_portfolio_exposure_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -2173,6 +2318,8 @@ def main() -> None:
             "filter_a_share_securities",
             "get_a_share_fund_flow",
             "get_a_share_financials",
+            "get_fund_exposure",
+            "get_portfolio_exposure",
             "get_a_share_news",
             "get_a_share_announcements",
             "get_a_share_event_timeline",
@@ -2267,6 +2414,17 @@ def main() -> None:
             (24, "get_a_share_event_timeline", {"symbol": "600519"}),
             (25, "get_a_share_sector_rotation", {"sector_type": "industry"}),
             (26, "get_overnight_risk_packet", {}),
+            (27, "get_fund_exposure", {"fund_code": "512760"}),
+            (
+                28,
+                "get_portfolio_exposure",
+                {
+                    "positions": [
+                        {"identifier": "512760", "weight_pct": 60},
+                        {"identifier": "600519", "weight_pct": 40},
+                    ]
+                },
+            ),
         ):
             response = client.post(
                 "/mcp",

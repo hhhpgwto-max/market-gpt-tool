@@ -28,13 +28,14 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "rotation_overnight_event_timeline_v1"
+ROUTING_REVISION = "fund_and_portfolio_exposure_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
     "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
-    "sector rankings and rotation history, overnight cross-market observations, company event timelines, and "
+    "sector rankings and rotation history, overnight cross-market observations, company event timelines, fund "
+    "look-through holdings, portfolio exposure aggregation, and "
     "operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for date-ranged or paginated price history. "
@@ -79,7 +80,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.11.0",
+    version="0.12.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -5897,6 +5898,525 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
     }
 
 
+FUND_API_BASE = "https://fundmobapi.eastmoney.com/FundMNewApi"
+FUND_API_DEVICE_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def normalize_fund_code(fund_code: str) -> str:
+    normalized = str(fund_code or "").strip()
+    if not SYMBOL_PATTERN.fullmatch(normalized):
+        raise HTTPException(status_code=400, detail="fund_code must be a six-digit public fund code.")
+    return normalized
+
+
+def get_eastmoney_fund_component(fund_code: str, endpoint: str) -> dict[str, Any]:
+    parameters = {
+        "FCODE": fund_code,
+        "appType": "ttjj",
+        "deviceid": FUND_API_DEVICE_ID,
+        "plat": "Iphone",
+        "product": "EFund",
+        "serverVersion": "6.3.8",
+        "version": "6.3.8",
+    }
+    payload = read_public_json(
+        f"{FUND_API_BASE}/{endpoint}?{urlencode(parameters)}",
+        "https://fund.eastmoney.com/",
+        timeout=5,
+        attempts=2,
+    )
+    if not isinstance(payload, dict) or payload.get("Success") is False:
+        raise HTTPException(status_code=502, detail=f"Unexpected fund response from {endpoint}.")
+    return payload
+
+
+def fund_component_date(payload: dict[str, Any], rows: list[dict[str, Any]], field: str) -> str | None:
+    expansion = clean_value(payload.get("Expansion"))
+    if expansion and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(expansion)):
+        return str(expansion)
+    return next((str(row[field]) for row in rows if clean_value(row.get(field))), None)
+
+
+def get_fund_exposure_data(
+    fund_code: str,
+    holdings_limit: int,
+    detail_level: str,
+) -> dict[str, Any]:
+    fund_code = normalize_fund_code(fund_code)
+    loaders = {
+        "basic_information": lambda: get_eastmoney_fund_component(
+            fund_code, "FundMNNBasicInformation"
+        ),
+        "holdings": lambda: get_eastmoney_fund_component(
+            fund_code, "FundMNInverstPosition"
+        ),
+        "industry_distribution": lambda: get_eastmoney_fund_component(
+            fund_code, "FundMNSectorAllocation"
+        ),
+        "asset_allocation": lambda: get_eastmoney_fund_component(
+            fund_code, "FundMNAssetAllocationNew"
+        ),
+    }
+    results, component_status, source_errors = collect_components(loaders, 8)
+    if not results:
+        raise HTTPException(status_code=502, detail=f"All public fund exposure sources failed: {fund_code}")
+
+    basic = (results.get("basic_information") or {}).get("Datas") or {}
+    raw_holdings_container = (results.get("holdings") or {}).get("Datas") or {}
+    raw_holdings = (
+        raw_holdings_container.get("fundStocks") or []
+        if isinstance(raw_holdings_container, dict)
+        else []
+    )
+    holdings = []
+    for row in raw_holdings:
+        weight = to_number(row.get("JZBL"))
+        raw_security_code = clean_value(row.get("GPDM"))
+        provider_market_code = clean_value(row.get("TEXCH"))
+        if not raw_security_code or weight is None:
+            continue
+        provider_identifier = (
+            f"{provider_market_code}:{raw_security_code}"
+            if provider_market_code
+            else str(raw_security_code)
+        )
+        mainland_symbol = (
+            str(raw_security_code)
+            if provider_market_code in {"1", "2"}
+            and SYMBOL_PATTERN.fullmatch(str(raw_security_code))
+            else None
+        )
+        holdings.append(
+            {
+                "identifier": mainland_symbol or provider_identifier,
+                "symbol": mainland_symbol,
+                "provider_security_code": str(raw_security_code),
+                "provider_market_code": provider_market_code,
+                "provider_security_identifier": provider_identifier,
+                "name": clean_value(row.get("GPJC")),
+                "weight_pct": weight,
+                "change_from_previous_disclosure_pct_points": to_number(row.get("PCTNVCHG")),
+                "provider_industry_code": clean_value(row.get("INDEXCODE")),
+                "provider_industry_name": clean_value(row.get("INDEXNAME")),
+            }
+        )
+    holdings.sort(key=lambda item: item["weight_pct"], reverse=True)
+    holdings = holdings[:holdings_limit]
+
+    raw_industries = (results.get("industry_distribution") or {}).get("Datas") or []
+    industries = [
+        {
+            "industry_name": clean_value(row.get("HYMC")),
+            "weight_pct": to_number(row.get("ZJZBL")),
+            "reported_market_value_10k_cny": to_number(row.get("SZ")),
+        }
+        for row in raw_industries
+        if clean_value(row.get("HYMC"))
+        and str(row.get("HYMC")) != "合计"
+        and to_number(row.get("ZJZBL")) is not None
+        and to_number(row.get("ZJZBL")) > 0
+    ]
+    industries.sort(key=lambda item: item["weight_pct"], reverse=True)
+
+    raw_allocation = (results.get("asset_allocation") or {}).get("Datas") or []
+    allocation_row = raw_allocation[0] if raw_allocation else {}
+    asset_allocation = {
+        "stock_pct": to_number(allocation_row.get("GP")),
+        "bond_pct": to_number(allocation_row.get("ZQ")),
+        "cash_pct": to_number(allocation_row.get("HB")),
+        "other_pct": to_number(allocation_row.get("QT")),
+        "fund_pct": to_number(allocation_row.get("JJ")),
+        "total_assets_100m_cny": to_number(allocation_row.get("JZC")),
+    }
+    allocation_sum = sum(
+        value or 0
+        for key, value in asset_allocation.items()
+        if key.endswith("_pct")
+    )
+    holdings_date = fund_component_date(
+        results.get("holdings") or {}, raw_holdings, "FSRQ"
+    )
+    industry_date = fund_component_date(
+        results.get("industry_distribution") or {}, raw_industries, "FSRQ"
+    )
+    allocation_date = fund_component_date(
+        results.get("asset_allocation") or {}, raw_allocation, "FSRQ"
+    )
+    disclosure_dates = sorted(
+        {date for date in (holdings_date, industry_date, allocation_date) if date}
+    )
+    missing_fields = []
+    if not holdings:
+        missing_fields.append("top_holdings")
+    if not industries:
+        missing_fields.append("industry_distribution")
+    if not any(value is not None for key, value in asset_allocation.items() if key.endswith("_pct")):
+        missing_fields.append("asset_allocation")
+    detailed_holdings = holdings
+    if detail_level == "summary":
+        detailed_holdings = [
+            {
+                key: item.get(key)
+                for key in (
+                    "identifier",
+                    "symbol",
+                    "name",
+                    "weight_pct",
+                    "provider_industry_name",
+                )
+            }
+            for item in holdings
+        ]
+    nested_errors = [
+        error
+        for payload in results.values()
+        if isinstance(payload, dict)
+        for error in normalize_source_errors(payload.get("source_errors"))
+    ]
+    all_source_errors = [*source_errors, *nested_errors]
+    return {
+        "fund_code": fund_code,
+        "fund_name": clean_value(basic.get("SHORTNAME")) if isinstance(basic, dict) else None,
+        "fund_company": clean_value(basic.get("JJGS")) if isinstance(basic, dict) else None,
+        "established_date": clean_value(basic.get("ESTABDATE")) if isinstance(basic, dict) else None,
+        "latest_nav": to_number(basic.get("DWJZ")) if isinstance(basic, dict) else None,
+        "nav_date": clean_value(basic.get("FSRQ")) if isinstance(basic, dict) else None,
+        "disclosure_dates": disclosure_dates,
+        "holdings_disclosure_date": holdings_date,
+        "industry_disclosure_date": industry_date,
+        "asset_allocation_date": allocation_date,
+        "asset_allocation": asset_allocation,
+        "asset_allocation_reported_sum_pct": round(allocation_sum, 4),
+        "top_holdings": detailed_holdings,
+        "top_holdings_count": len(holdings),
+        "top_holdings_reported_weight_pct": round(
+            sum(item["weight_pct"] for item in holdings), 4
+        ),
+        "holdings_scope": "latest_top_holdings_disclosed_by_public_fund_api_not_a_complete_position_book",
+        "industry_distribution": industries,
+        "component_status": component_status,
+        "source": ["eastmoney_public_fund_api"],
+        "source_errors": all_source_errors,
+        "missing_fields": missing_fields,
+        "detail_level": detail_level,
+        "data_status": (
+            "full_data"
+            if not all_source_errors and not missing_fields
+            else "partial_data"
+        ),
+        "queried_at": now_iso(),
+        "note": "Latest disclosed fund facts only. Holdings may be limited to the public top holdings and can lag the current portfolio; weights are not recommendations.",
+    }
+
+
+def normalized_portfolio_positions(
+    positions: list[dict[str, Any]], normalize_weights: bool
+) -> tuple[list[dict[str, Any]], float]:
+    if not positions:
+        raise HTTPException(status_code=400, detail="positions must contain at least one position.")
+    if len(positions) > 20:
+        raise HTTPException(status_code=400, detail="At most 20 portfolio positions are supported.")
+    combined: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in positions:
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Each position must be an object.")
+        identifier = str(raw.get("identifier") or raw.get("symbol") or raw.get("fund_code") or "").strip()
+        if not SYMBOL_PATTERN.fullmatch(identifier):
+            raise HTTPException(status_code=400, detail="Each position identifier must be a six-digit code.")
+        weight = to_number(raw.get("weight_pct"))
+        if weight is None or weight <= 0:
+            raise HTTPException(status_code=400, detail=f"weight_pct must be positive for {identifier}.")
+        asset_type = str(raw.get("asset_type") or "auto").strip().lower()
+        if asset_type not in {"auto", "fund", "stock"}:
+            raise HTTPException(status_code=400, detail="asset_type must be auto, fund, or stock.")
+        if asset_type == "auto":
+            security = security_metadata(identifier)
+            asset_type = "fund" if security["security_type"] in {"etf", "lof"} else "stock"
+        key = (identifier, asset_type)
+        combined.setdefault(
+            key,
+            {"identifier": identifier, "asset_type": asset_type, "input_weight_pct": 0.0},
+        )
+        combined[key]["input_weight_pct"] += weight
+    normalized = list(combined.values())
+    total = sum(item["input_weight_pct"] for item in normalized)
+    if not normalize_weights and total > 100.0001:
+        raise HTTPException(status_code=400, detail="Total weight_pct must not exceed 100 when normalize_weights is false.")
+    factor = 100 / total if normalize_weights else 1
+    for item in normalized:
+        item["portfolio_weight_pct"] = round(item["input_weight_pct"] * factor, 8)
+    return normalized, total
+
+
+def get_portfolio_exposure_data(
+    positions: list[dict[str, Any]],
+    normalize_weights: bool,
+    holdings_limit: int,
+    detail_level: str,
+) -> dict[str, Any]:
+    normalized, input_total = normalized_portfolio_positions(positions, normalize_weights)
+    fund_positions = [item for item in normalized if item["asset_type"] == "fund"]
+    stock_positions = [item for item in normalized if item["asset_type"] == "stock"]
+    if len(fund_positions) > 10:
+        raise HTTPException(status_code=400, detail="At most 10 fund positions can be looked through per request.")
+    loaders = {
+        **{
+            f"fund:{item['identifier']}": lambda item=item: get_fund_exposure_data(
+                item["identifier"], holdings_limit, "raw"
+            )
+            for item in fund_positions
+        },
+        **{
+            f"stock:{item['identifier']}": lambda item=item: get_resilient_security_reference_data(
+                item["identifier"]
+            )
+            for item in stock_positions
+        },
+    }
+    results, component_status, source_errors = collect_components(loaders, 12) if loaders else ({}, {}, [])
+
+    underlying: dict[str, dict[str, Any]] = {}
+    known_underlying_industry_exposure: dict[str, float] = {}
+    fund_reported_industry_exposure: dict[str, float] = {}
+    allocation = {"stock_pct": 0.0, "bond_pct": 0.0, "cash_pct": 0.0, "other_pct": 0.0, "fund_pct": 0.0}
+    unresolved_weight = 0.0
+    fund_disclosure_dates: dict[str, str | None] = {}
+    position_results = []
+    child_source_errors: list[dict[str, Any]] = []
+    child_missing_fields: list[str] = []
+    partial_child_components: list[str] = []
+
+    def add_underlying(
+        identifier: str,
+        symbol: str | None,
+        name: Any,
+        contribution: float,
+        source_identifier: str,
+        through_type: str,
+    ) -> None:
+        entry = underlying.setdefault(
+            identifier,
+            {
+                "identifier": identifier,
+                "symbol": symbol,
+                "name": clean_value(name),
+                "exposure_pct": 0.0,
+                "sources": [],
+            },
+        )
+        if not entry.get("name") and clean_value(name):
+            entry["name"] = clean_value(name)
+        entry["exposure_pct"] += contribution
+        entry["sources"].append(
+            {
+                "position_identifier": source_identifier,
+                "through_type": through_type,
+                "contribution_pct": round(contribution, 8),
+            }
+        )
+
+    for position in normalized:
+        identifier = position["identifier"]
+        weight = position["portfolio_weight_pct"]
+        component_key = f"{position['asset_type']}:{identifier}"
+        payload = results.get(component_key)
+        if position["asset_type"] == "stock":
+            allocation["stock_pct"] += weight
+            add_underlying(
+                identifier,
+                identifier,
+                (payload or {}).get("name"),
+                weight,
+                identifier,
+                "direct_stock",
+            )
+            industry = clean_value((payload or {}).get("industry"))
+            if industry:
+                known_underlying_industry_exposure[str(industry)] = (
+                    known_underlying_industry_exposure.get(str(industry), 0.0) + weight
+                )
+            position_results.append(
+                {**position, "status": "available" if payload else "partial_data", "name": clean_value((payload or {}).get("name")), "industry": industry}
+            )
+            continue
+
+        fund_disclosure_dates[identifier] = (payload or {}).get("holdings_disclosure_date")
+        if not payload:
+            unresolved_weight += weight
+            position_results.append({**position, "status": "unavailable"})
+            continue
+        child_status = str(payload.get("data_status") or "")
+        component_status.setdefault(component_key, {})["child_data_status"] = child_status or None
+        if child_status and child_status != "full_data":
+            partial_child_components.append(component_key)
+        for error in normalize_source_errors(payload.get("source_errors")):
+            child_source_errors.append(
+                {
+                    **error,
+                    "source": f"{component_key}/{error.get('source') or 'public_fund_source'}",
+                }
+            )
+        child_missing_fields.extend(
+            f"{component_key}:{field}" for field in payload.get("missing_fields") or []
+        )
+        fund_allocation = payload.get("asset_allocation") or {}
+        known_allocation = 0.0
+        for key in allocation:
+            fund_value = to_number(fund_allocation.get(key))
+            if fund_value is None:
+                continue
+            contribution = weight * fund_value / 100
+            allocation[key] += contribution
+            known_allocation += contribution
+        unresolved_weight += max(0.0, weight - known_allocation)
+        holding_contribution = 0.0
+        for holding in payload.get("top_holdings") or []:
+            holding_weight = to_number(holding.get("weight_pct"))
+            holding_identifier = clean_value(
+                holding.get("identifier")
+                or holding.get("provider_security_identifier")
+                or holding.get("symbol")
+            )
+            holding_symbol = clean_value(holding.get("symbol"))
+            if holding_identifier is None or holding_weight is None:
+                continue
+            contribution = weight * holding_weight / 100
+            holding_contribution += contribution
+            add_underlying(
+                str(holding_identifier),
+                str(holding_symbol) if holding_symbol else None,
+                holding.get("name"),
+                contribution,
+                identifier,
+                "fund_top_holding",
+            )
+            holding_industry = clean_value(holding.get("provider_industry_name"))
+            if holding_industry:
+                known_underlying_industry_exposure[str(holding_industry)] = (
+                    known_underlying_industry_exposure.get(str(holding_industry), 0.0)
+                    + contribution
+                )
+        for industry in payload.get("industry_distribution") or []:
+            industry_weight = to_number(industry.get("weight_pct"))
+            industry_name = clean_value(industry.get("industry_name"))
+            if industry_name and industry_weight is not None:
+                fund_reported_industry_exposure[str(industry_name)] = (
+                    fund_reported_industry_exposure.get(str(industry_name), 0.0)
+                    + weight * industry_weight / 100
+                )
+        position_results.append(
+            {
+                **position,
+                "status": payload.get("data_status"),
+                "name": payload.get("fund_name"),
+                "holdings_disclosure_date": payload.get("holdings_disclosure_date"),
+                "top_holdings_covered_portfolio_pct": round(holding_contribution, 8),
+            }
+        )
+
+    underlying_items = []
+    for item in underlying.values():
+        item["exposure_pct"] = round(item["exposure_pct"], 8)
+        item["source_position_count"] = len(
+            {source["position_identifier"] for source in item["sources"]}
+        )
+        underlying_items.append(item)
+    underlying_items.sort(key=lambda item: item["exposure_pct"], reverse=True)
+    overlaps = [item for item in underlying_items if item["source_position_count"] >= 2]
+    industries = [
+        {"industry_name": name, "exposure_pct": round(value, 8)}
+        for name, value in sorted(
+            known_underlying_industry_exposure.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    reported_fund_industries = [
+        {"industry_name": name, "exposure_pct": round(value, 8)}
+        for name, value in sorted(
+            fund_reported_industry_exposure.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+    ]
+    allocation = {key: round(value, 8) for key, value in allocation.items()}
+    disclosure_values = sorted(date for date in fund_disclosure_dates.values() if date)
+    conflicts = []
+    if len(set(disclosure_values)) > 1:
+        conflicts.append(
+            {
+                "type": "fund_disclosure_date_difference",
+                "dates_by_fund": fund_disclosure_dates,
+                "note": "Fund look-through weights come from different public disclosure dates.",
+            }
+        )
+    missing_fields = [
+        key
+        for key, status in component_status.items()
+        if status.get("status") == "unavailable"
+    ] + child_missing_fields
+    all_source_errors = [*source_errors, *child_source_errors]
+    top_exposures = underlying_items if detail_level == "raw" else underlying_items[:10]
+    top_values = [item["exposure_pct"] for item in underlying_items]
+    represented_weight = sum(item["portfolio_weight_pct"] for item in normalized)
+    disclosed_underlying_weight = sum(top_values)
+    sources = sorted(
+        {
+            source
+            for payload in results.values()
+            if isinstance(payload, dict)
+            for source in normalize_sources(payload.get("source"))
+        }
+    )
+    return {
+        "input_position_count": len(positions),
+        "combined_position_count": len(normalized),
+        "input_weight_total_pct": round(input_total, 8),
+        "weights_normalized": normalize_weights,
+        "positions": position_results,
+        "asset_allocation": allocation,
+        "unresolved_asset_allocation_weight_pct": round(unresolved_weight, 8),
+        "represented_position_weight_pct": round(represented_weight, 8),
+        "unallocated_input_weight_pct": round(max(0.0, 100 - represented_weight), 8),
+        "disclosed_underlying_covered_weight_pct": round(disclosed_underlying_weight, 8),
+        "not_looked_through_position_weight_pct": round(
+            max(0.0, represented_weight - disclosed_underlying_weight), 8
+        ),
+        "industry_exposure": industries,
+        "industry_exposure_scope": "direct stocks plus provider industry labels on disclosed fund top holdings; provider levels can differ and undisclosed holdings are excluded",
+        "fund_reported_industry_exposure": reported_fund_industries,
+        "fund_reported_industry_exposure_scope": "portfolio-weighted broad industry allocations reported by each fund; direct stocks are excluded because their classification level is not comparable",
+        "underlying_exposure": top_exposures,
+        "underlying_exposure_scope": "direct stocks plus each fund's latest publicly disclosed top holdings; undisclosed holdings are not inferred",
+        "overlapping_underlyings": overlaps if detail_level == "raw" else overlaps[:10],
+        "concentration": {
+            "top_1_disclosed_underlying_pct": round(sum(top_values[:1]), 8),
+            "top_5_disclosed_underlyings_pct": round(sum(top_values[:5]), 8),
+            "top_10_disclosed_underlyings_pct": round(sum(top_values[:10]), 8),
+            "scope": "known direct stocks and disclosed fund top holdings only",
+        },
+        "fund_disclosure_dates": fund_disclosure_dates,
+        "component_status": component_status,
+        "partial_child_components": sorted(set(partial_child_components)),
+        "source": sources,
+        "source_errors": all_source_errors,
+        "missing_fields": missing_fields,
+        "conflicts": conflicts,
+        "detail_level": detail_level,
+        "data_status": (
+            "full_data"
+            if not all_source_errors
+            and not missing_fields
+            and not conflicts
+            and not partial_child_components
+            and unresolved_weight <= 0.0001
+            else "partial_data"
+        ),
+        "queried_at": now_iso(),
+        "note": "Mechanical look-through aggregation only. Fund-of-funds allocation is reported as fund_pct and is not recursively expanded. The tool does not access a brokerage account, infer undisclosed holdings, score diversification, or make a trading recommendation.",
+    }
+
+
 def get_fastest_index_component() -> dict[str, Any]:
     source_getters = (
         ("eastmoney", get_eastmoney_indices),
@@ -7138,6 +7658,79 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_financials", {"symbol": symbol, "limit": normalized_limit}, 21600,
         lambda: get_financial_data(symbol, normalized_limit), symbol,
+    )
+
+
+@mcp.tool(
+    name="get_fund_exposure",
+    title="Get public fund look-through exposure",
+    description=(
+        "Get the latest publicly disclosed top holdings, provider industry distribution, stock/bond/cash/other "
+        "allocation, disclosure dates, and coverage limits for one six-digit ETF, LOF, or public fund code. "
+        "Holdings can lag and may not cover the complete portfolio; missing data is not inferred."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_fund_exposure(
+    fund_code: str,
+    holdings_limit: int = 10,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            fund_code,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
+    normalized_limit = max(1, min(holdings_limit, 10))
+    return run_cached_tool(
+        "get_fund_exposure",
+        {
+            "fund_code": fund_code,
+            "holdings_limit": normalized_limit,
+            "detail_level": detail_level,
+        },
+        1800,
+        lambda: get_fund_exposure_data(fund_code, normalized_limit, detail_level),
+        fund_code,
+        max_stale_age_seconds=86400,
+    )
+
+
+@mcp.tool(
+    name="get_portfolio_exposure",
+    title="Aggregate caller-supplied portfolio exposure",
+    description=(
+        "Mechanically aggregate up to 20 caller-supplied positions into asset, industry, disclosed underlying, "
+        "overlap, and concentration facts. Each position needs identifier and weight_pct; use asset_type=fund for "
+        "off-exchange public funds, while listed ETFs/LOFs are detected automatically. The tool does not access an "
+        "account, infer undisclosed holdings, score diversification, or recommend trades."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_portfolio_exposure(
+    positions: list[dict[str, Any]],
+    normalize_weights: bool = True,
+    holdings_limit: int = 10,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
+    normalized_limit = max(1, min(holdings_limit, 10))
+    parameters = {
+        "positions": positions,
+        "normalize_weights": normalize_weights,
+        "holdings_limit": normalized_limit,
+        "detail_level": detail_level,
+    }
+    return run_cached_tool(
+        "get_portfolio_exposure",
+        parameters,
+        1800,
+        lambda: get_portfolio_exposure_data(**parameters),
+        max_stale_age_seconds=86400,
     )
 
 
