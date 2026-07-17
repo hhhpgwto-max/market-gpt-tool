@@ -6079,7 +6079,7 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
 IPO_CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 IPO_RULE_SOURCES = {
     "sse": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/issue/c/c_20250515_10778982.shtml",
-    "szse": "https://investor.szse.cn/knowledge/listings/publish/t20180117_538554.html",
+    "szse": "https://www.szse.cn/ipo/guide/rule/P020190228664910292959.pdf",
     "bse": "https://www.bse.cn/fxrz_list/200010917.html",
 }
 IPO_CALENDAR_COLUMNS = (
@@ -6145,7 +6145,12 @@ def get_eastmoney_ipo_calendar_rows(
             if "数据为空" in str(payload.get("message") or ""):
                 return []
             raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
-        return ((payload.get("result") or {}).get("data")) or []
+        result = payload.get("result")
+        if result is None:
+            return []
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+        return result.get("data") or []
 
     rows = load_rows()
     if query and SYMBOL_PATTERN.fullmatch(query) and not rows:
@@ -6212,7 +6217,7 @@ def ipo_market_rules(row: dict[str, Any]) -> dict[str, Any]:
         "minimum_same_market_average_value_cny": 10000,
         "market_value_per_subscription_unit_cny": 5000,
         "market_value_calculation": "average eligible same-market holdings over the 20 trading days through T-2",
-        "eligible_securities_scope": "same-market non-restricted A shares; ETFs, funds, bonds, B shares and other products are excluded",
+        "eligible_securities_scope": "same-market non-restricted A shares and non-restricted depositary receipts; ETFs, funds, bonds, B shares and other products are excluded",
         "subscription_unit_shares": 500,
         "funding_timing": "no_upfront_subscription_cash; winning_allocation_payment_on_published_payment_date",
         "official_rule_url": IPO_RULE_SOURCES["sse" if exchange == "SSE" else "szse"],
@@ -6230,6 +6235,7 @@ def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[
         for field, value in (
             ("issue_price", issue_price),
             ("listing_date", ipo_calendar_date(row.get("LISTING_DATE"))),
+            ("online_subscription_limit_shares", online_apply_upper),
         )
         if value is None
     ]

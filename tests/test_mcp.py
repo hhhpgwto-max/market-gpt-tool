@@ -2313,6 +2313,81 @@ def test_ipo_subscription_status_contract() -> None:
         assert "301707" in captured[0][0]
         assert captured[0][2] == {"timeout": 5, "attempts": 2}
 
+        market_app.read_public_json = lambda *_args, **_kwargs: {
+            "success": True,
+            "result": ["malformed"],
+        }
+        try:
+            market_app.get_eastmoney_ipo_calendar_rows("301707", 10)
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 502
+        else:
+            raise AssertionError("Malformed IPO result should be rejected with 502.")
+
+        name_urls: list[str] = []
+
+        def fake_name_json(url: str, *_: object, **__: object) -> dict:
+            name_urls.append(url)
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": "301707",
+                            "SECURITY_NAME_ABBR": "TestIPO",
+                            "APPLY_CODE": "301707",
+                            "APPLY_DATE": "2026-07-27 00:00:00",
+                            "ISSUE_PRICE": 10,
+                            "ONLINE_APPLY_UPPER": 5000,
+                            "LISTING_DATE": "2026-08-05 00:00:00",
+                        }
+                    ]
+                },
+            }
+
+        market_app.read_public_json = fake_name_json
+        name_match = market_app.get_ipo_subscription_status_data(
+            "TestIPO", 30, 7, 10, "summary"
+        )
+        assert name_match["items"][0]["security_name"] == "TestIPO"
+        assert "SECURITY_NAME_ABBR" in name_urls[0]
+        assert "TestIPO" in name_urls[0]
+
+        today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
+
+        def fake_calendar_json(_url: str, *_: object, **__: object) -> dict:
+            def row(code: str, apply_date: object) -> dict[str, object]:
+                return {
+                    "SECURITY_CODE": code,
+                    "SECURITY_NAME_ABBR": f"IPO {code}",
+                    "APPLY_CODE": code,
+                    "APPLY_DATE": str(apply_date),
+                    "ISSUE_PRICE": 10,
+                    "ONLINE_APPLY_UPPER": 5000,
+                    "LISTING_DATE": str(today + market_app.timedelta(days=10)),
+                }
+
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        row("301708", today),
+                        row("301709", today + market_app.timedelta(days=5)),
+                    ]
+                },
+            }
+
+        market_app.read_public_json = fake_calendar_json
+        calendar = market_app.get_ipo_subscription_status_data(
+            None, 1, 1, 10, "summary"
+        )
+        assert calendar["count"] == 1
+        assert calendar["items"][0]["security_code"] == "301708"
+        assert calendar["schedule_range"] == {
+            "start": (today - market_app.timedelta(days=1)).isoformat(),
+            "end": (today + market_app.timedelta(days=1)).isoformat(),
+        }
+
         def fake_subscription_code_json(url: str, *_: object, **__: object) -> dict:
             if "APPLY_CODE%3D" not in url:
                 return {"success": False, "message": "返回数据为空", "result": None}
@@ -2355,6 +2430,19 @@ def test_ipo_subscription_status_contract() -> None:
         assert bse["eligibility_rules"]["subscription_method"] == "full_cash_subscription"
         assert bse["maximum_subscription_market_value_requirement_cny"] is None
         assert bse["maximum_subscription_cash_cny"] == 19136250.0
+
+        incomplete_limit = market_app.build_ipo_subscription_item(
+            {
+                "SECURITY_CODE": "603408",
+                "APPLY_DATE": "2026-07-20 00:00:00",
+                "ISSUE_PRICE": 10,
+                "LISTING_DATE": "2026-08-01 00:00:00",
+            },
+            "summary",
+        )
+        assert incomplete_limit["pending_fields"] == [
+            "online_subscription_limit_shares"
+        ]
 
         sse_rules = market_app.ipo_market_rules(
             {"SECURITY_CODE": "603407", "MARKET": "涓婁氦鎵€涓绘澘"}
