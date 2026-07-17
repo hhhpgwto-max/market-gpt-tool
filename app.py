@@ -28,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "fund_and_portfolio_exposure_v1"
+ROUTING_REVISION = "bounded_context_exposure_cache_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -329,6 +329,12 @@ PREFERRED_ROUTE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 SINA_AUX_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 TENCENT_KLINE_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+# Composite tools can fan out into several slow public routes. Keep those pools
+# bounded and reusable so concurrent MCP calls do not create an unbounded tree
+# of short-lived threads.
+COMPOSITE_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+FUND_COMPONENT_EXECUTOR = ThreadPoolExecutor(max_workers=12)
+SECURITY_REFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -3545,16 +3551,48 @@ def event_price_feedback(
 
 def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
+    # Use one stable fetch size so different timeline display limits can share
+    # the same official-source cache entry.
+    announcement_limit = 25
+    news_limit = min(limit * 3, 10)
+    kline_limit = min(max(days + 20, 40), 160)
     loaders = {
-        "official_announcements": lambda: get_announcement_data(symbol, days, min(limit * 3, 25)),
-        "news": lambda: get_news_data(symbol, min(limit * 3, 10), days, False),
-        "daily_kline": lambda: get_kline_data(
-            symbol,
-            "daily",
-            min(max(days + 20, 40), 160),
+        "official_announcements": lambda: get_cached_component_with_stale(
+            cache_key(
+                "get_a_share_announcements",
+                {"symbol": symbol, "days": days, "limit": announcement_limit},
+            ),
+            300,
+            3600,
+            lambda: get_announcement_data(symbol, days, announcement_limit),
+        ),
+        "news": lambda: get_cached_component_with_stale(
+            cache_key(
+                "get_a_share_news",
+                {
+                    "symbol": symbol,
+                    "limit": news_limit,
+                    "days": days,
+                    "include_industry_context": False,
+                },
+            ),
+            300,
+            3600,
+            lambda: get_news_data(symbol, news_limit, days, False),
+        ),
+        "daily_kline": lambda: get_cached_component_with_stale(
+            cache_key(
+                "event_timeline_daily_kline",
+                {"symbol": symbol, "limit": kline_limit},
+            ),
+            300,
+            86400,
+            lambda: get_kline_data(symbol, "daily", kline_limit),
         ),
     }
-    results, component_status, source_errors = collect_components(loaders, 14)
+    results, component_status, source_errors = collect_components(
+        loaders, 10, COMPOSITE_TOOL_EXECUTOR
+    )
     if not results.get("official_announcements") and not results.get("news"):
         raise HTTPException(status_code=502, detail="Both official announcements and news timeline sources failed.")
 
@@ -3965,14 +4003,20 @@ def get_resilient_security_reference_data(symbol: str) -> dict[str, Any]:
 
 
 def collect_components(
-    loaders: dict[str, Any], response_budget_seconds: float
+    loaders: dict[str, Any],
+    response_budget_seconds: float,
+    executor: ThreadPoolExecutor | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     def timed_load(loader: Any) -> tuple[Any, int]:
         started = perf_counter()
         return loader(), int((perf_counter() - started) * 1000)
 
-    executor = ThreadPoolExecutor(max_workers=len(loaders))
-    futures = {executor.submit(timed_load, loader): name for name, loader in loaders.items()}
+    owns_executor = executor is None
+    selected_executor = executor or ThreadPoolExecutor(max_workers=max(1, len(loaders)))
+    futures = {
+        selected_executor.submit(timed_load, loader): name
+        for name, loader in loaders.items()
+    }
     done, pending = wait(futures, timeout=response_budget_seconds)
     results: dict[str, Any] = {}
     statuses: dict[str, dict[str, Any]] = {}
@@ -3982,7 +4026,15 @@ def collect_components(
         try:
             result, latency_ms = future.result()
             results[name] = result
-            statuses[name] = {"status": "available", "latency_ms": latency_ms}
+            statuses[name] = {
+                "status": (
+                    "stale_cache"
+                    if isinstance(result, dict)
+                    and result.get("served_from_stale_cache")
+                    else "available"
+                ),
+                "latency_ms": latency_ms,
+            }
         except HTTPException as exc:
             statuses[name] = {"status": "unavailable", "latency_ms": None}
             errors.append(
@@ -4011,7 +4063,8 @@ def collect_components(
                 "message": f"Component exceeded the {response_budget_seconds:g} second response budget.",
             }
         )
-    executor.shutdown(wait=False, cancel_futures=True)
+    if owns_executor:
+        selected_executor.shutdown(wait=False, cancel_futures=True)
     return results, statuses, errors
 
 
@@ -5481,6 +5534,18 @@ def is_market_time_stale(market_time: str | None) -> bool:
     return now - source_time > timedelta(minutes=10)
 
 
+def get_cached_sector_board_component(sector_type: str) -> dict[str, Any]:
+    return get_cached_component_with_stale(
+        cache_key("sector_board_snapshot", {"sector_type": sector_type}),
+        30,
+        300,
+        lambda: {
+            "items": get_eastmoney_sector_boards(sector_type),
+            "source_errors": [],
+        },
+    )
+
+
 def get_sector_rankings_data(
     sector_type: str, level: str, sort_by: str, limit: int
 ) -> dict[str, Any]:
@@ -5504,7 +5569,8 @@ def get_sector_rankings_data(
             ),
         )
 
-    boards = get_eastmoney_sector_boards(normalized_type)
+    board_component = get_cached_sector_board_component(normalized_type)
+    boards = board_component.get("items") or []
     if normalized_type == "industry":
         boards = deduplicate_industry_boards(boards, len(boards))
         if normalized_level != "all":
@@ -5521,7 +5587,7 @@ def get_sector_rankings_data(
         "count": len(items),
         "items": items,
         "source": ["eastmoney_sector_snapshot"],
-        "source_errors": [],
+        "source_errors": normalize_source_errors(board_component.get("source_errors")),
         "queried_at": now_iso(),
         "note": "Mechanical ranking of public sector quotes only; no theme, trading, or investment judgement is generated.",
     }
@@ -5578,6 +5644,31 @@ def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
     raise HTTPException(status_code=502, detail="; ".join(errors))
 
 
+def sector_history_cache_key(secid: str, limit: int) -> str:
+    return cache_key("sector_daily_history", {"secid": secid, "limit": limit})
+
+
+def get_cached_sector_daily_kline(secid: str, limit: int) -> dict[str, Any]:
+    return get_cached_component_with_stale(
+        sector_history_cache_key(secid, limit),
+        300,
+        3600,
+        lambda: get_eastmoney_generic_daily_kline(secid, limit),
+    )
+
+
+def get_recent_sector_history_snapshot(
+    secid: str, limit: int
+) -> dict[str, Any] | None:
+    snapshot = get_cached_tool_snapshot(sector_history_cache_key(secid, limit), 3600)
+    if snapshot is None:
+        return None
+    data, cache = snapshot
+    data["served_from_stale_cache"] = True
+    data["stale_cache_age_seconds"] = cache["cache_age_seconds"]
+    return data
+
+
 def kline_lookback_returns(items: list[dict[str, Any]], lookbacks: list[int]) -> dict[str, float | None]:
     closes = [to_number(item.get("close")) for item in items]
     valid = [value for value in closes if value is not None]
@@ -5608,7 +5699,8 @@ def get_sector_rotation_data(
     if not normalized_lookbacks or any(value < 1 or value > 20 for value in normalized_lookbacks):
         raise HTTPException(status_code=400, detail="lookbacks must contain integers from 1 through 20.")
 
-    boards = get_eastmoney_sector_boards(normalized_type)
+    board_component = get_cached_sector_board_component(normalized_type)
+    boards = board_component.get("items") or []
     if normalized_type == "industry":
         boards = deduplicate_industry_boards(boards, len(boards))
         if normalized_level != "all":
@@ -5633,41 +5725,101 @@ def get_sector_rotation_data(
         seen_board_symbols.add(board_symbol)
         candidates.append(board)
     history_results: dict[str, dict[str, Any]] = {}
-    source_errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(12, len(candidates) + 2)) as executor:
-        futures = {
-            executor.submit(
-                get_eastmoney_generic_daily_kline,
-                f"90.{board['symbol']}",
-                max(normalized_lookbacks) + 6,
-            ): str(board["symbol"])
-            for board in candidates
+    source_errors: list[str | dict[str, Any]] = normalize_source_errors(
+        board_component.get("source_errors")
+    )
+    history_limit = max(normalized_lookbacks) + 6
+    history_route = "eastmoney_sector_daily_history"
+    route_degraded = preferred_route_is_temporarily_degraded(
+        history_route, min_consecutive_failures=1, cooldown_seconds=600
+    )
+    first_board_symbol = (
+        str(candidates[0].get("symbol")) if candidates else None
+    )
+    initial_loaders: dict[str, Any] = {
+        "market_turnover": lambda: get_cached_component_with_stale(
+            cache_key("sector_rotation_market_turnover", {}),
+            15,
+            300,
+            get_overview_breadth_component,
+        )
+    }
+    if not route_degraded and first_board_symbol:
+        initial_loaders.update(
+            {
+                "benchmark_history": lambda: get_cached_sector_daily_kline(
+                    "1.000300", history_limit
+                ),
+                f"sector_history:{first_board_symbol}": lambda: get_cached_sector_daily_kline(
+                    f"90.{first_board_symbol}", history_limit
+                ),
+            }
+        )
+    initial_results, _, initial_errors = collect_components(
+        initial_loaders, 4, COMPOSITE_TOOL_EXECUTOR
+    )
+    source_errors.extend(
+        f"{error['source']}: {error['message']}" for error in initial_errors
+    )
+    market_component = initial_results.get("market_turnover") or {}
+    total_market_turnover = to_number(
+        (market_component.get("turnover") or {}).get("current")
+    )
+    benchmark_history = initial_results.get("benchmark_history") or {
+        "items": [],
+        "source": None,
+    }
+    if first_board_symbol and initial_results.get(f"sector_history:{first_board_symbol}"):
+        history_results[first_board_symbol] = initial_results[
+            f"sector_history:{first_board_symbol}"
+        ]
+
+    board_probe = history_results.get(first_board_symbol or "", {})
+    live_probe_succeeded = bool(
+        board_probe.get("items") and not board_probe.get("served_from_stale_cache")
+    )
+    if first_board_symbol and not route_degraded:
+        record_preferred_route_health(
+            history_route,
+            live_probe_succeeded,
+            None if live_probe_succeeded else "Representative board history route failed.",
+        )
+    if live_probe_succeeded:
+        remaining_loaders = {
+            f"sector_history:{board['symbol']}": lambda board=board: get_cached_sector_daily_kline(
+                f"90.{board['symbol']}", history_limit
+            )
+            for board in candidates[1:]
             if board.get("symbol")
         }
-        benchmark_future = executor.submit(
-            get_eastmoney_generic_daily_kline,
-            "1.000300",
-            max(normalized_lookbacks) + 6,
+        remaining_results, _, remaining_errors = collect_components(
+            remaining_loaders, 4, COMPOSITE_TOOL_EXECUTOR
         )
-        market_turnover_future = executor.submit(get_overview_breadth_component)
-        for future in as_completed(futures):
-            board_symbol = futures[future]
-            try:
-                history_results[board_symbol] = future.result()
-            except HTTPException as exc:
-                source_errors.append(f"sector_history:{board_symbol}: {exc.detail}")
-        try:
-            benchmark_history = benchmark_future.result()
-        except HTTPException as exc:
-            benchmark_history = {"items": [], "source": None}
-            source_errors.append(f"benchmark_history: {exc.detail}")
-        try:
-            market_component = market_turnover_future.result()
-            total_market_turnover = to_number((market_component.get("turnover") or {}).get("current"))
-        except HTTPException as exc:
-            market_component = {}
-            total_market_turnover = None
-            source_errors.append(f"market_turnover: {exc.detail}")
+        source_errors.extend(
+            f"{error['source']}: {error['message']}" for error in remaining_errors
+        )
+        for key, payload in remaining_results.items():
+            history_results[key.split(":", 1)[1]] = payload
+    elif first_board_symbol:
+        route_degraded = True
+        source_errors.append(
+            "sector_history: public board-history route is temporarily bypassed after a failed representative probe"
+        )
+
+    if route_degraded:
+        benchmark_history = (
+            get_recent_sector_history_snapshot("1.000300", history_limit)
+            or benchmark_history
+        )
+        for board in candidates:
+            board_symbol = str(board.get("symbol") or "")
+            if not board_symbol or board_symbol in history_results:
+                continue
+            snapshot = get_recent_sector_history_snapshot(
+                f"90.{board_symbol}", history_limit
+            )
+            if snapshot:
+                history_results[board_symbol] = snapshot
 
     benchmark_returns = kline_lookback_returns(
         benchmark_history.get("items", []), normalized_lookbacks
@@ -5702,6 +5854,8 @@ def get_sector_rotation_data(
                 ),
                 "history_status": "available" if rows else "unavailable",
                 "history_source": history.get("source"),
+                "history_is_stale": bool(history.get("served_from_stale_cache")),
+                "history_cache_age_seconds": history.get("stale_cache_age_seconds"),
                 "turnover_share_of_a_share_market_pct": (
                     round((to_number(board.get("turnover")) or 0) / total_market_turnover * 100, 6)
                     if total_market_turnover not in (None, 0) and to_number(board.get("turnover")) is not None
@@ -5853,7 +6007,16 @@ def get_sina_overnight_observations() -> dict[str, dict[str, Any]]:
 
 
 def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
-    observations = get_sina_overnight_observations()
+    observation_component = get_cached_component_with_stale(
+        cache_key("overnight_observations", {}),
+        15,
+        1800,
+        lambda: {
+            "observations": get_sina_overnight_observations(),
+            "source_errors": [],
+        },
+    )
+    observations = observation_component.get("observations") or {}
     required = [
         *OVERNIGHT_SINA_INSTRUMENTS.keys(),
         "us_dollar_index",
@@ -5890,7 +6053,8 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
                 "message": f"No currently validated free quote route for {identifier}.",
             }
             for identifier in missing
-        ],
+        ]
+        + normalize_source_errors(observation_component.get("source_errors")),
         "data_status": "full_data" if not missing else "partial_data",
         "detail_level": detail_level,
         "queried_at": now_iso(),
@@ -5922,12 +6086,24 @@ def get_eastmoney_fund_component(fund_code: str, endpoint: str) -> dict[str, Any
     payload = read_public_json(
         f"{FUND_API_BASE}/{endpoint}?{urlencode(parameters)}",
         "https://fund.eastmoney.com/",
-        timeout=5,
+        timeout=3,
         attempts=2,
     )
     if not isinstance(payload, dict) or payload.get("Success") is False:
         raise HTTPException(status_code=502, detail=f"Unexpected fund response from {endpoint}.")
     return payload
+
+
+def get_cached_fund_component(fund_code: str, endpoint: str) -> dict[str, Any]:
+    return get_cached_component_with_stale(
+        cache_key(
+            "eastmoney_fund_component",
+            {"fund_code": fund_code, "endpoint": endpoint},
+        ),
+        1800,
+        86400,
+        lambda: get_eastmoney_fund_component(fund_code, endpoint),
+    )
 
 
 def fund_component_date(payload: dict[str, Any], rows: list[dict[str, Any]], field: str) -> str | None:
@@ -5944,20 +6120,22 @@ def get_fund_exposure_data(
 ) -> dict[str, Any]:
     fund_code = normalize_fund_code(fund_code)
     loaders = {
-        "basic_information": lambda: get_eastmoney_fund_component(
+        "basic_information": lambda: get_cached_fund_component(
             fund_code, "FundMNNBasicInformation"
         ),
-        "holdings": lambda: get_eastmoney_fund_component(
+        "holdings": lambda: get_cached_fund_component(
             fund_code, "FundMNInverstPosition"
         ),
-        "industry_distribution": lambda: get_eastmoney_fund_component(
+        "industry_distribution": lambda: get_cached_fund_component(
             fund_code, "FundMNSectorAllocation"
         ),
-        "asset_allocation": lambda: get_eastmoney_fund_component(
+        "asset_allocation": lambda: get_cached_fund_component(
             fund_code, "FundMNAssetAllocationNew"
         ),
     }
-    results, component_status, source_errors = collect_components(loaders, 8)
+    results, component_status, source_errors = collect_components(
+        loaders, 7, FUND_COMPONENT_EXECUTOR
+    )
     if not results:
         raise HTTPException(status_code=502, detail=f"All public fund exposure sources failed: {fund_code}")
 
@@ -6109,6 +6287,70 @@ def get_fund_exposure_data(
     }
 
 
+def get_cached_fund_exposure_data(
+    fund_code: str, holdings_limit: int, detail_level: str
+) -> dict[str, Any]:
+    normalized_code = normalize_fund_code(fund_code)
+    return get_cached_component_with_stale(
+        cache_key(
+            "fund_exposure_internal",
+            {
+                "fund_code": normalized_code,
+                "holdings_limit": holdings_limit,
+                "detail_level": detail_level,
+            },
+        ),
+        1800,
+        86400,
+        lambda: get_fund_exposure_data(
+            normalized_code, holdings_limit, detail_level
+        ),
+    )
+
+
+def get_fast_portfolio_security_reference(symbol: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    recent_reference = get_cached_tool_snapshot(
+        cache_key("security_reference_internal", {"symbol": symbol}), 604800
+    )
+    if recent_reference is not None:
+        data, cache = recent_reference
+        data["reference_cache_age_seconds"] = cache["cache_age_seconds"]
+        return data
+
+    reference_future = SECURITY_REFERENCE_EXECUTOR.submit(
+        get_resilient_security_reference_data, symbol
+    )
+
+    def load_quote_identity() -> dict[str, Any]:
+        quote, source, source_errors = get_fastest_public_quote(symbol)
+        return {
+            "symbol": symbol,
+            "name": clean_value(quote.get("name")),
+            "industry": None,
+            "source": source,
+            "source_errors": source_errors,
+            "identity_scope": "fast_public_quote_name_without_industry_reference",
+        }
+
+    try:
+        identity = get_cached_component_with_stale(
+            cache_key("portfolio_security_identity", {"symbol": symbol}),
+            30,
+            300,
+            load_quote_identity,
+        )
+    except HTTPException:
+        return reference_future.result()
+    if reference_future.done():
+        try:
+            return reference_future.result()
+        except HTTPException:
+            return identity
+    reference_future.add_done_callback(consume_background_future)
+    return identity
+
+
 def normalized_portfolio_positions(
     positions: list[dict[str, Any]], normalize_weights: bool
 ) -> tuple[list[dict[str, Any]], float]:
@@ -6161,19 +6403,23 @@ def get_portfolio_exposure_data(
         raise HTTPException(status_code=400, detail="At most 10 fund positions can be looked through per request.")
     loaders = {
         **{
-            f"fund:{item['identifier']}": lambda item=item: get_fund_exposure_data(
+            f"fund:{item['identifier']}": lambda item=item: get_cached_fund_exposure_data(
                 item["identifier"], holdings_limit, "raw"
             )
             for item in fund_positions
         },
         **{
-            f"stock:{item['identifier']}": lambda item=item: get_resilient_security_reference_data(
+            f"stock:{item['identifier']}": lambda item=item: get_fast_portfolio_security_reference(
                 item["identifier"]
             )
             for item in stock_positions
         },
     }
-    results, component_status, source_errors = collect_components(loaders, 12) if loaders else ({}, {}, [])
+    results, component_status, source_errors = (
+        collect_components(loaders, 8, COMPOSITE_TOOL_EXECUTOR)
+        if loaders
+        else ({}, {}, [])
+    )
 
     underlying: dict[str, dict[str, Any]] = {}
     known_underlying_industry_exposure: dict[str, float] = {}
@@ -6231,6 +6477,15 @@ def get_portfolio_exposure_data(
                 "direct_stock",
             )
             industry = clean_value((payload or {}).get("industry"))
+            if not industry:
+                child_missing_fields.append(f"{component_key}:industry")
+            for error in normalize_source_errors((payload or {}).get("source_errors")):
+                child_source_errors.append(
+                    {
+                        **error,
+                        "source": f"{component_key}/{error.get('source') or 'public_quote_source'}",
+                    }
+                )
             if industry:
                 known_underlying_industry_exposure[str(industry)] = (
                     known_underlying_industry_exposure.get(str(industry), 0.0) + weight
@@ -7690,7 +7945,9 @@ def get_fund_exposure(
             "detail_level": detail_level,
         },
         1800,
-        lambda: get_fund_exposure_data(fund_code, normalized_limit, detail_level),
+        lambda: get_cached_fund_exposure_data(
+            fund_code, normalized_limit, detail_level
+        ),
         fund_code,
         max_stale_age_seconds=86400,
     )

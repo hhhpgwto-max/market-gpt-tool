@@ -1716,12 +1716,36 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert stale["served_from_stale_cache"] is True
     assert stale["cache_hit"] is True
 
+    component_key = market_app.cache_key("component-test", {"scope": "shared"})
+    market_app.get_cached_component_with_stale(
+        component_key,
+        10,
+        120,
+        lambda: {"value": "fresh", "source_errors": []},
+    )
+    market_app.TOOL_CACHE[component_key]["created_at"] = market_app.datetime.now(
+        market_app.timezone.utc
+    ) - market_app.timedelta(seconds=20)
+    component_results, component_status, component_errors = market_app.collect_components(
+        {
+            "shared_component": lambda: market_app.get_cached_component_with_stale(
+                component_key, 10, 120, failing_loader
+            )
+        },
+        1,
+        market_app.COMPOSITE_TOOL_EXECUTOR,
+    )
+    assert component_errors == []
+    assert component_status["shared_component"]["status"] == "stale_cache"
+    assert component_results["shared_component"]["served_from_stale_cache"] is True
+    assert component_results["shared_component"]["source_errors"]
+
     market_app.record_source_health("eastmoney", True, 42)
     health = market_app.get_market_data_health_data()
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "fund_and_portfolio_exposure_v1"
+    assert health["routing_revision"] == "bounded_context_exposure_cache_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2157,9 +2181,9 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         market_app.get_eastmoney_fund_component = original_component
 
     original_fund = market_app.get_fund_exposure_data
-    original_reference = market_app.get_resilient_security_reference_data
+    original_reference = market_app.get_fast_portfolio_security_reference
     market_app.get_fund_exposure_data = fake_get_fund_exposure_data
-    market_app.get_resilient_security_reference_data = lambda symbol: {
+    market_app.get_fast_portfolio_security_reference = lambda symbol: {
         "symbol": symbol,
         "name": "Test Stock",
         "industry": "Manufacturing",
@@ -2201,7 +2225,7 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         partial = market_app.get_portfolio_exposure_data(
             [{"identifier": "512760", "weight_pct": 100}],
             False,
-            10,
+            9,
             "summary",
         )
         assert partial["data_status"] == "partial_data"
@@ -2210,7 +2234,7 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         assert partial["source_errors"][0]["source"] == "fund:512760/child_test"
     finally:
         market_app.get_fund_exposure_data = original_fund
-        market_app.get_resilient_security_reference_data = original_reference
+        market_app.get_fast_portfolio_security_reference = original_reference
 
 
 def main() -> None:
@@ -2272,7 +2296,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "fund_and_portfolio_exposure_v1"
+        assert health.json()["routing_revision"] == "bounded_context_exposure_cache_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
