@@ -219,6 +219,48 @@ def fake_get_announcement_data(symbol: str, days: int, limit: int) -> dict:
     }
 
 
+def fake_get_event_timeline_data(symbol: str, days: int, limit: int) -> dict:
+    return {
+        "symbol": symbol,
+        "period_days": days,
+        "count": 1,
+        "events": [{"event_title": "Test event", "price_feedback": {"status": "available"}}][:limit],
+        "source": ["test"],
+        "source_errors": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_get_sector_rotation_data(
+    sector_type: str, level: str, lookbacks: list[int], limit: int
+) -> dict:
+    return {
+        "sector_type": sector_type,
+        "level": level,
+        "lookbacks": lookbacks,
+        "count": 1,
+        "items": [{"symbol": "BK0001", "name": "Test sector"}][:limit],
+        "source": ["test"],
+        "source_errors": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
+def fake_get_overnight_risk_packet_data(detail_level: str) -> dict:
+    return {
+        "count": 1,
+        "items": [{"identifier": "ftse_china_a50_futures", "price": 12000}],
+        "missing_fields": [],
+        "detail_level": detail_level,
+        "source": ["test"],
+        "source_errors": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
 def fake_get_historical_context_data(symbol: str) -> dict:
     return {
         "symbol": symbol,
@@ -1636,7 +1678,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "adaptive_fallback_bounded_cache_v1"
+    assert health["routing_revision"] == "rotation_overnight_event_timeline_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -1995,6 +2037,40 @@ def test_news_relevance_deduplication_and_source_metadata() -> None:
         market_app.get_google_news_items = original_google
 
 
+def test_rotation_overnight_and_event_helpers() -> None:
+    returns = market_app.kline_lookback_returns(
+        [{"close": 100}, {"close": 105}, {"close": 110}, {"close": 121}],
+        [1, 3, 5],
+    )
+    assert returns == {"1": 10.0, "3": 21.0, "5": None}
+
+    parsed = market_app.parse_sina_overnight_record(
+        "hf_NQ",
+        "global_futures",
+        [
+            "110", "", "109", "110", "112", "108", "10:00:00", "100", "101",
+            "0", "1", "1", "2026-07-10", "Nasdaq futures",
+        ],
+    )
+    assert parsed is not None
+    assert parsed["change_pct"] == 10.0
+    assert parsed["market_time"] == "2026-07-10T10:00:00+08:00"
+
+    bars = [
+        {"date": "2026-07-10", "close": 100},
+        {"date": "2026-07-13", "close": 101},
+        {"date": "2026-07-14", "close": 103},
+        {"date": "2026-07-15", "close": 106},
+        {"date": "2026-07-16", "close": 107},
+        {"date": "2026-07-17", "close": 110},
+    ]
+    feedback = market_app.event_price_feedback("2026-07-10", bars)
+    assert feedback["return_after_1_session_pct"] == 1.0
+    assert feedback["return_after_3_sessions_pct"] == 6.0
+    assert feedback["return_after_5_sessions_pct"] == 10.0
+    assert market_app.event_titles_match("公司回购股份方案", "关于公司回购股份方案的公告") is True
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_kline_range_and_pagination()
@@ -2018,6 +2094,7 @@ def main() -> None:
     test_news_relevance_deduplication_and_source_metadata()
     test_reliability_envelope_cache_and_health()
     test_historical_context_and_security_status_facts()
+    test_rotation_overnight_and_event_helpers()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
@@ -2030,6 +2107,7 @@ def main() -> None:
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_news_data = fake_get_news_data
     market_app.get_announcement_data = fake_get_announcement_data
+    market_app.get_event_timeline_data = fake_get_event_timeline_data
     market_app.get_historical_context_data = fake_get_historical_context_data
     market_app.get_security_status_data = fake_get_security_status_data
     market_app.get_decision_context_data = fake_get_decision_context_data
@@ -2039,6 +2117,8 @@ def main() -> None:
     market_app.get_market_snapshot_data = fake_get_market_snapshot_data
     market_app.get_limit_activity_data = fake_get_limit_activity_data
     market_app.get_sector_rankings_data = fake_get_sector_rankings_data
+    market_app.get_sector_rotation_data = fake_get_sector_rotation_data
+    market_app.get_overnight_risk_packet_data = fake_get_overnight_risk_packet_data
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -2047,7 +2127,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "adaptive_fallback_bounded_cache_v1"
+        assert health.json()["routing_revision"] == "rotation_overnight_event_timeline_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -2095,12 +2175,15 @@ def main() -> None:
             "get_a_share_financials",
             "get_a_share_news",
             "get_a_share_announcements",
+            "get_a_share_event_timeline",
             "get_a_share_historical_context",
             "get_a_share_security_status",
             "get_a_share_decision_context",
             "get_a_share_relative_strength",
             "scan_a_share_intraday_anomalies",
             "get_a_share_sector_rankings",
+            "get_a_share_sector_rotation",
+            "get_overnight_risk_packet",
             "get_a_share_limit_activity",
             "get_a_share_market_snapshot",
             "get_a_share_market_overview",
@@ -2181,6 +2264,9 @@ def main() -> None:
                 "get_a_share_decision_context",
                 {"symbol": "600519", "benchmark_symbol": "index:000001"},
             ),
+            (24, "get_a_share_event_timeline", {"symbol": "600519"}),
+            (25, "get_a_share_sector_rotation", {"sector_type": "industry"}),
+            (26, "get_overnight_risk_packet", {}),
         ):
             response = client.post(
                 "/mcp",

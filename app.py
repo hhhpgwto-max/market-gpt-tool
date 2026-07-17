@@ -28,13 +28,14 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "adaptive_fallback_bounded_cache_v1"
+ROUTING_REVISION = "rotation_overnight_event_timeline_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
     "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
-    "sector rankings, and operational data-route health. "
+    "sector rankings and rotation history, overnight cross-market observations, company event timelines, and "
+    "operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for date-ranged or paginated price history. "
     "Use get_a_share_market_snapshot when market overview, a target security, and peers must be captured in one "
@@ -78,7 +79,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.10.1",
+    version="0.11.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -3467,6 +3468,222 @@ def get_announcement_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
     }
 
 
+def event_timeline_date(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = news_datetime(text)
+    if parsed is not None:
+        return parsed.astimezone(MARKET_TIMEZONE).date().isoformat()
+    match = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", text)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(0).replace("/", "-"), "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def event_timeline_title_key(value: Any) -> str:
+    text = normalized_news_title(value)
+    for marker in ("关于", "公告", "公司", "股份有限公司", "有限责任公司"):
+        text = text.replace(marker, "")
+    return text
+
+
+def event_titles_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 8 and shorter in longer:
+        return True
+    return SequenceMatcher(None, left, right).ratio() >= 0.72
+
+
+def event_price_feedback(
+    disclosure_date: str | None,
+    bars: list[dict[str, Any]],
+) -> dict[str, Any]:
+    result = {
+        "anchor_trade_date": None,
+        "anchor_close": None,
+        "return_after_1_session_pct": None,
+        "return_after_3_sessions_pct": None,
+        "return_after_5_sessions_pct": None,
+        "status": "unavailable",
+    }
+    if not disclosure_date or not bars:
+        return result
+    dated = [bar for bar in bars if clean_value(bar.get("date")) and to_number(bar.get("close")) is not None]
+    anchor_index = next(
+        (index for index, bar in enumerate(dated) if str(bar.get("date")) >= disclosure_date),
+        None,
+    )
+    if anchor_index is None:
+        result["status"] = "pending_no_trading_session_yet"
+        return result
+    anchor = dated[anchor_index]
+    anchor_close = to_number(anchor.get("close"))
+    result["anchor_trade_date"] = clean_value(anchor.get("date"))
+    result["anchor_close"] = anchor_close
+    available = 0
+    for sessions in (1, 3, 5):
+        target_index = anchor_index + sessions
+        if target_index >= len(dated) or anchor_close in (None, 0):
+            continue
+        target_close = to_number(dated[target_index].get("close"))
+        if target_close is None:
+            continue
+        result[f"return_after_{sessions}_session{'s' if sessions > 1 else ''}_pct"] = round(
+            (target_close / anchor_close - 1) * 100, 4
+        )
+        available += 1
+    result["status"] = "available" if available == 3 else "partial_or_pending"
+    return result
+
+
+def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    loaders = {
+        "official_announcements": lambda: get_announcement_data(symbol, days, min(limit * 3, 25)),
+        "news": lambda: get_news_data(symbol, min(limit * 3, 10), days, False),
+        "daily_kline": lambda: get_kline_data(
+            symbol,
+            "daily",
+            min(max(days + 20, 40), 160),
+        ),
+    }
+    results, component_status, source_errors = collect_components(loaders, 14)
+    if not results.get("official_announcements") and not results.get("news"):
+        raise HTTPException(status_code=502, detail="Both official announcements and news timeline sources failed.")
+
+    candidates: list[dict[str, Any]] = []
+    for item in (results.get("official_announcements") or {}).get("items", []):
+        candidates.append(
+            {
+                "record_type": "official_announcement",
+                "title": clean_value(item.get("title")),
+                "published_at": clean_value(item.get("published_at")),
+                "event_date": event_timeline_date(item.get("event_date") or item.get("published_at")),
+                "event_date_type": item.get("event_date_type") or "announcement_publication_date",
+                "source": clean_value(item.get("official_source")) or "official_exchange_announcement",
+                "source_independence": "official_primary_source",
+                "event_tags": item.get("event_tags") or ["other"],
+                "url": clean_value(item.get("url")),
+            }
+        )
+    for item in (results.get("news") or {}).get("items", []):
+        link_type = str(item.get("link_type") or "")
+        candidates.append(
+            {
+                "record_type": "media_report",
+                "title": clean_value(item.get("title")),
+                "published_at": clean_value(item.get("published_at")),
+                "event_date": event_timeline_date(item.get("event_date") or item.get("published_at")),
+                "event_date_type": (
+                    item.get("event_date_status") or "media_publication_date_not_verified_event_time"
+                ),
+                "source": clean_value(item.get("source")) or "publisher_not_disclosed",
+                "source_independence": (
+                    "publisher_attributed_via_news_index"
+                    if "redirect_to_publisher" in link_type
+                    else "hosted_or_reprint_independence_unclear"
+                ),
+                "event_tags": announcement_event_tags(item.get("title")),
+                "url": clean_value(item.get("url")),
+            }
+        )
+
+    candidates.sort(key=lambda item: (str(item.get("event_date") or ""), str(item.get("published_at") or "")))
+    clusters: list[dict[str, Any]] = []
+    for item in candidates:
+        key = event_timeline_title_key(item.get("title"))
+        cluster = next(
+            (candidate for candidate in clusters if event_titles_match(key, candidate["title_key"])),
+            None,
+        )
+        if cluster is None:
+            clusters.append({"title_key": key, "records": [item]})
+        else:
+            cluster["records"].append(item)
+
+    bars = (results.get("daily_kline") or {}).get("items", [])
+    events = []
+    for cluster in clusters:
+        records = sorted(
+            cluster["records"],
+            key=lambda item: (
+                0 if item["record_type"] == "official_announcement" else 1,
+                str(item.get("published_at") or ""),
+            ),
+        )
+        primary = records[0]
+        dates = [str(item["event_date"]) for item in records if item.get("event_date")]
+        source_names = sorted({str(item.get("source")) for item in records if item.get("source")})
+        events.append(
+            {
+                "event_title": primary.get("title"),
+                "event_date": min(dates) if dates else None,
+                "event_date_status": (
+                    "official_disclosure_date_available"
+                    if any(item["record_type"] == "official_announcement" for item in records)
+                    else "media_publication_date_only"
+                ),
+                "event_tags": sorted({tag for item in records for tag in item.get("event_tags", [])}),
+                "record_count": len(records),
+                "source_count": len(source_names),
+                "has_official_primary_source": any(
+                    item["record_type"] == "official_announcement" for item in records
+                ),
+                "independence_status": (
+                    "official_primary_plus_multiple_publishers"
+                    if any(item["record_type"] == "official_announcement" for item in records)
+                    and len(source_names) > 1
+                    else "official_primary_only"
+                    if any(item["record_type"] == "official_announcement" for item in records)
+                    else "multiple_attributed_publishers"
+                    if len(source_names) > 1
+                    else records[0]["source_independence"]
+                ),
+                "sources": source_names,
+                "records": records,
+                "price_feedback": event_price_feedback(min(dates) if dates else None, bars),
+            }
+        )
+    events.sort(key=lambda item: str(item.get("event_date") or ""), reverse=True)
+    events = events[:limit]
+    nested_errors = [
+        error
+        for payload in results.values()
+        if isinstance(payload, dict)
+        for error in normalize_source_errors(payload.get("source_errors"))
+    ]
+    return {
+        "symbol": symbol,
+        "period_days": days,
+        "count": len(events),
+        "events": events,
+        "price_feedback_method": "Forward-adjusted close-to-close return from the first trading session on or after the disclosed/publication date.",
+        "component_status": component_status,
+        "source": sorted(
+            {
+                source
+                for payload in results.values()
+                if isinstance(payload, dict)
+                for source in normalize_sources(payload.get("source"))
+            }
+        ),
+        "source_errors": [*source_errors, *nested_errors],
+        "data_status": (
+            "full_data"
+            if len(results) == 3 and not source_errors and not nested_errors
+            else "partial_data"
+        ),
+        "queried_at": now_iso(),
+        "note": "Records are clustered mechanically by title similarity. Publication time is not silently relabelled as the real-world event time, and price feedback is not a good/bad or trading judgement.",
+    }
+
+
 HISTORICAL_CONTEXT_WINDOWS = (20, 60, 120, 250)
 CORPORATE_ACTION_EVENT_TAGS = {
     "dividend",
@@ -5309,6 +5526,375 @@ def get_sector_rankings_data(
     }
 
 
+def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
+    query = urlencode(
+        {
+            "secid": secid,
+            "klt": 101,
+            "fqt": 1,
+            "lmt": limit,
+            "beg": 0,
+            "end": "20500101",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        }
+    )
+    errors = []
+    for host in ("push2his.eastmoney.com", "push2delay.eastmoney.com"):
+        try:
+            payload = read_public_json(
+                f"https://{host}/api/qt/stock/kline/get?{query}",
+                "https://quote.eastmoney.com/",
+                timeout=4,
+                attempts=1,
+            )
+            data = payload.get("data") or {}
+            rows = []
+            for raw in data.get("klines") or []:
+                values = str(raw).split(",")
+                if len(values) < 11:
+                    continue
+                rows.append(
+                    {
+                        "date": clean_value(values[0]),
+                        "open": to_number(values[1]),
+                        "close": to_number(values[2]),
+                        "high": to_number(values[3]),
+                        "low": to_number(values[4]),
+                        "volume": to_number(values[5]),
+                        "turnover": to_number(values[6]),
+                        "change_pct": to_number(values[8]),
+                        "turnover_rate": to_number(values[10]),
+                    }
+                )
+            if rows:
+                return {"name": clean_value(data.get("name")), "items": rows, "source": host}
+            errors.append(f"{host}: no daily rows")
+        except HTTPException as exc:
+            errors.append(f"{host}: {exc.detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def kline_lookback_returns(items: list[dict[str, Any]], lookbacks: list[int]) -> dict[str, float | None]:
+    closes = [to_number(item.get("close")) for item in items]
+    valid = [value for value in closes if value is not None]
+    latest = valid[-1] if valid else None
+    return {
+        str(window): (
+            round((latest / valid[-window - 1] - 1) * 100, 4)
+            if latest is not None and len(valid) > window and valid[-window - 1] not in (None, 0)
+            else None
+        )
+        for window in lookbacks
+    }
+
+
+def get_sector_rotation_data(
+    sector_type: str,
+    level: str,
+    lookbacks: list[int],
+    limit: int,
+) -> dict[str, Any]:
+    normalized_type = sector_type.strip().lower()
+    if normalized_type not in SECTOR_TYPE_CONFIG:
+        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
+    normalized_level = str(level).strip().lower()
+    if normalized_level not in {"1", "2", "3", "all"}:
+        raise HTTPException(status_code=400, detail="level must be 1, 2, 3, or all.")
+    normalized_lookbacks = sorted({int(value) for value in lookbacks})
+    if not normalized_lookbacks or any(value < 1 or value > 20 for value in normalized_lookbacks):
+        raise HTTPException(status_code=400, detail="lookbacks must contain integers from 1 through 20.")
+
+    boards = get_eastmoney_sector_boards(normalized_type)
+    if normalized_type == "industry":
+        boards = deduplicate_industry_boards(boards, len(boards))
+        if normalized_level != "all":
+            boards = [board for board in boards if board.get("level") == int(normalized_level)]
+    candidate_count = min(max(limit * 2, 12), 24)
+    by_change = sorted(
+        boards,
+        key=lambda item: (
+            item.get("change_pct")
+            if item.get("change_pct") is not None
+            else float("-inf")
+        ),
+        reverse=True,
+    )
+    by_turnover = sorted(boards, key=lambda item: item.get("turnover") or 0, reverse=True)
+    candidates = []
+    seen_board_symbols = set()
+    for board in [*by_change[: candidate_count // 2], *by_turnover[: candidate_count // 2]]:
+        board_symbol = str(board.get("symbol") or "")
+        if not board_symbol or board_symbol in seen_board_symbols:
+            continue
+        seen_board_symbols.add(board_symbol)
+        candidates.append(board)
+    history_results: dict[str, dict[str, Any]] = {}
+    source_errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates) + 1)) as executor:
+        futures = {
+            executor.submit(
+                get_eastmoney_generic_daily_kline,
+                f"90.{board['symbol']}",
+                max(normalized_lookbacks) + 6,
+            ): str(board["symbol"])
+            for board in candidates
+            if board.get("symbol")
+        }
+        benchmark_future = executor.submit(
+            get_eastmoney_generic_daily_kline,
+            "1.000300",
+            max(normalized_lookbacks) + 6,
+        )
+        market_turnover_future = executor.submit(get_overview_breadth_component)
+        for future in as_completed(futures):
+            board_symbol = futures[future]
+            try:
+                history_results[board_symbol] = future.result()
+            except HTTPException as exc:
+                source_errors.append(f"sector_history:{board_symbol}: {exc.detail}")
+        try:
+            benchmark_history = benchmark_future.result()
+        except HTTPException as exc:
+            benchmark_history = {"items": [], "source": None}
+            source_errors.append(f"benchmark_history: {exc.detail}")
+        try:
+            market_component = market_turnover_future.result()
+            total_market_turnover = to_number((market_component.get("turnover") or {}).get("current"))
+        except HTTPException as exc:
+            market_component = {}
+            total_market_turnover = None
+            source_errors.append(f"market_turnover: {exc.detail}")
+
+    benchmark_returns = kline_lookback_returns(
+        benchmark_history.get("items", []), normalized_lookbacks
+    )
+    items = []
+    for board in candidates:
+        history = history_results.get(str(board.get("symbol")), {"items": []})
+        rows = history.get("items", [])
+        returns = kline_lookback_returns(rows, normalized_lookbacks)
+        relative_returns = {
+            window: (
+                round(value - benchmark_returns[window], 4)
+                if value is not None and benchmark_returns.get(window) is not None
+                else None
+            )
+            for window, value in returns.items()
+        }
+        recent_changes = [to_number(row.get("change_pct")) for row in rows[-5:]]
+        recent_changes = [value for value in recent_changes if value is not None]
+        recent_closes = [to_number(row.get("close")) for row in rows[-20:]]
+        recent_closes = [value for value in recent_closes if value is not None]
+        item = deepcopy(board)
+        item.update(
+            {
+                "returns_pct": returns,
+                "benchmark_returns_pct": benchmark_returns,
+                "relative_to_csi300_pct": relative_returns,
+                "positive_sessions_last_5": sum(value > 0 for value in recent_changes) if recent_changes else None,
+                "available_sessions_last_5": len(recent_changes),
+                "at_20_session_closing_high": (
+                    recent_closes[-1] == max(recent_closes) if recent_closes else None
+                ),
+                "history_status": "available" if rows else "unavailable",
+                "history_source": history.get("source"),
+                "turnover_share_of_a_share_market_pct": (
+                    round((to_number(board.get("turnover")) or 0) / total_market_turnover * 100, 6)
+                    if total_market_turnover not in (None, 0) and to_number(board.get("turnover")) is not None
+                    else None
+                ),
+                "leader_continuity": None,
+                "leader_continuity_status": "unavailable_without_reliable_daily_constituent-leader_history",
+            }
+        )
+        items.append(item)
+
+    ranking_window = "5" if "5" in {str(value) for value in normalized_lookbacks} else str(normalized_lookbacks[0])
+    items.sort(
+        key=lambda item: (
+            item["relative_to_csi300_pct"].get(ranking_window)
+            if item["relative_to_csi300_pct"].get(ranking_window) is not None
+            else item.get("change_pct")
+            if item.get("change_pct") is not None
+            else float("-inf")
+        ),
+        reverse=True,
+    )
+    items = items[:limit]
+    histories_available = sum(item["history_status"] == "available" for item in items)
+    return {
+        "sector_type": normalized_type,
+        "level": normalized_level if normalized_type == "industry" else None,
+        "lookbacks": normalized_lookbacks,
+        "benchmark": {"identifier": "index:000300", "name": "CSI 300", "returns_pct": benchmark_returns},
+        "a_share_market_turnover": total_market_turnover,
+        "a_share_market_turnover_unit": "CNY" if total_market_turnover is not None else None,
+        "ranking_basis": f"{ranking_window}-session relative return when available, otherwise current change_pct",
+        "count": len(items),
+        "history_available_count": histories_available,
+        "items": items,
+        "source": sorted(
+            {
+                "eastmoney_sector_snapshot",
+                *[str(item.get("history_source")) for item in items if item.get("history_source")],
+                *([str(benchmark_history.get("source"))] if benchmark_history.get("source") else []),
+                *([str(market_component.get("source"))] if market_component.get("source") else []),
+            }
+        ),
+        "source_errors": source_errors,
+        "data_status": (
+            "full_data"
+            if histories_available == len(items)
+            and all(value is not None for value in benchmark_returns.values())
+            else "partial_data"
+        ),
+        "queried_at": now_iso(),
+        "note": "Rotation fields are mechanical multi-session returns, breadth, turnover, and persistence facts. Missing board history or leader continuity remains explicit and is not inferred.",
+    }
+
+
+OVERNIGHT_SINA_INSTRUMENTS = {
+    "shanghai_copper_continuous": ("nf_CU0", "domestic_futures"),
+    "lme_copper": ("hf_CAD", "global_futures"),
+    "comex_copper": ("hf_HG", "global_futures"),
+    "usd_cny_onshore": ("fx_susdcny", "fx"),
+    "nasdaq_100_futures": ("hf_NQ", "global_futures"),
+    "ftse_china_a50_futures": ("hf_CHA50CFD", "global_futures"),
+    "hang_seng_index_futures": ("hf_HSI", "global_futures"),
+    "nasdaq_composite": ("gb_ixic", "global_index"),
+}
+
+
+def parse_sina_overnight_record(identifier: str, category: str, values: list[str]) -> dict[str, Any] | None:
+    if not values or not any(str(value).strip() for value in values):
+        return None
+    if category == "domestic_futures" and len(values) >= 18:
+        current = to_number(values[8])
+        previous = to_number(values[10])
+        clock = values[1]
+        if re.fullmatch(r"\d{6}", clock):
+            clock = f"{clock[:2]}:{clock[2:4]}:{clock[4:]}"
+        return {
+            "name": clean_value(values[0]),
+            "price": current,
+            "change": round(current - previous, 6) if current is not None and previous is not None else None,
+            "change_pct": round((current / previous - 1) * 100, 4) if current is not None and previous not in (None, 0) else None,
+            "market_time": format_market_time(f"{values[17]} {clock}") if values[17] and clock else None,
+            "previous_reference": previous,
+            "reference_type": "previous_settlement",
+        }
+    if category == "global_futures" and len(values) >= 14:
+        current = to_number(values[0])
+        previous = to_number(values[7])
+        return {
+            "name": clean_value(values[13]),
+            "price": current,
+            "change": round(current - previous, 6) if current is not None and previous is not None else None,
+            "change_pct": round((current / previous - 1) * 100, 4) if current is not None and previous not in (None, 0) else None,
+            "market_time": format_market_time(f"{values[12]} {values[6]}") if values[12] and values[6] else None,
+            "previous_reference": previous,
+            "reference_type": "previous_settlement",
+        }
+    if category == "fx" and len(values) >= 18:
+        return {
+            "name": clean_value(values[9]),
+            "price": to_number(values[1]),
+            "change": to_number(values[11]),
+            "change_pct": to_number(values[10]),
+            "market_time": format_market_time(f"{values[17]} {values[0]}") if values[17] and values[0] else None,
+            "previous_reference": to_number(values[8]),
+            "reference_type": "provider_reference",
+        }
+    if category == "global_index" and len(values) >= 5:
+        return {
+            "name": clean_value(values[0]),
+            "price": to_number(values[1]),
+            "change": to_number(values[4]),
+            "change_pct": to_number(values[2]),
+            "market_time": format_market_time(values[3]),
+            "previous_reference": to_number(values[25]) if len(values) > 25 else None,
+            "reference_type": "previous_close",
+        }
+    return None
+
+
+def get_sina_overnight_observations() -> dict[str, dict[str, Any]]:
+    codes = ",".join(code for code, _ in OVERNIGHT_SINA_INSTRUMENTS.values())
+    try:
+        text = read_market_text(
+            f"https://hq.sinajs.cn/list={codes}",
+            "https://finance.sina.com.cn/",
+            timeout=5,
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail=f"Sina overnight quote route unavailable: {exc}") from exc
+    raw_by_code = {
+        match.group(1): match.group(2).split(",")
+        for match in re.finditer(r'var hq_str_([^=]+)="([^"]*)";', text)
+    }
+    observations = {}
+    for name, (code, category) in OVERNIGHT_SINA_INSTRUMENTS.items():
+        parsed = parse_sina_overnight_record(name, category, raw_by_code.get(code, []))
+        if parsed:
+            observations[name] = {
+                "identifier": name,
+                "provider_code": code,
+                "market_group": category,
+                **parsed,
+                "source": "sina_public_quote",
+            }
+    if not observations:
+        raise HTTPException(status_code=502, detail="Sina returned no usable overnight observations.")
+    return observations
+
+
+def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
+    observations = get_sina_overnight_observations()
+    required = [
+        *OVERNIGHT_SINA_INSTRUMENTS.keys(),
+        "us_dollar_index",
+        "us_10_year_treasury_yield",
+    ]
+    missing = [identifier for identifier in required if identifier not in observations]
+    latest_times = [
+        parsed
+        for item in observations.values()
+        if (parsed := parse_market_datetime(item.get("market_time"))) is not None
+    ]
+    latest_time = max(latest_times).isoformat() if latest_times else None
+    items = list(observations.values())
+    if detail_level == "summary":
+        items = [
+            {key: item.get(key) for key in ("identifier", "name", "price", "change", "change_pct", "market_time", "reference_type", "source")}
+            for item in items
+        ]
+    return {
+        "market_time": latest_time,
+        "count": len(items),
+        "items": items,
+        "missing_fields": missing,
+        "coverage": {
+            "requested_count": len(required),
+            "available_count": len(observations),
+            "unavailable_count": len(missing),
+        },
+        "source": ["sina_public_quote"],
+        "source_errors": [
+            {
+                "source": "current_free_public_routes",
+                "error_type": "instrument_unavailable",
+                "message": f"No currently validated free quote route for {identifier}.",
+            }
+            for identifier in missing
+        ],
+        "data_status": "full_data" if not missing else "partial_data",
+        "detail_level": detail_level,
+        "queried_at": now_iso(),
+        "note": "Latest cross-market observations only. Different venues have different sessions and timestamps; missing dollar-index or Treasury-yield data is not estimated, and no next-day A-share direction is inferred.",
+    }
+
+
 def get_fastest_index_component() -> dict[str, Any]:
     source_getters = (
         ("eastmoney", get_eastmoney_indices),
@@ -6625,6 +7211,36 @@ def get_a_share_announcements(
 
 
 @mcp.tool(
+    name="get_a_share_event_timeline",
+    title="Build an A-share event timeline",
+    description=(
+        "Mechanically cluster recent official announcements and attributed media reports for one company, preserve "
+        "the distinction between disclosure/publication time and real-world event time, and attach 1/3/5-session "
+        "forward-adjusted price feedback where enough trading sessions exist. No sentiment or impact judgement is made."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_event_timeline(
+    symbol: str,
+    days: int = 60,
+    limit: int = 10,
+) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    normalized_days = max(1, min(days, 90))
+    normalized_limit = max(1, min(limit, 20))
+    return run_cached_tool(
+        "get_a_share_event_timeline",
+        {"symbol": symbol, "days": normalized_days, "limit": normalized_limit},
+        300,
+        lambda: get_event_timeline_data(symbol, normalized_days, normalized_limit),
+        symbol,
+        max_stale_age_seconds=3600,
+    )
+
+
+@mcp.tool(
     name="get_a_share_historical_context",
     title="Get mechanical A-share historical context",
     description=(
@@ -6813,6 +7429,64 @@ def get_a_share_sector_rankings(
             sector_type, level, sort_by, normalized_limit,
         ),
         max_stale_age_seconds=300,
+    )
+
+
+@mcp.tool(
+    name="get_a_share_sector_rotation",
+    title="Get multi-session A-share sector rotation facts",
+    description=(
+        "Compare public industry or concept boards across caller-selected 1-20 session lookbacks, including returns "
+        "relative to CSI 300, current turnover and breadth, five-session persistence, and 20-session closing-high facts. "
+        "Unavailable history and leader continuity remain explicit; no main-line or trading label is assigned."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_sector_rotation(
+    sector_type: str = "industry",
+    level: str = "2",
+    lookbacks: list[int] | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    normalized_limit = max(1, min(limit, 20))
+    normalized_lookbacks = lookbacks or [1, 3, 5, 10, 20]
+    parameters = {
+        "sector_type": sector_type,
+        "level": level,
+        "lookbacks": normalized_lookbacks,
+        "limit": normalized_limit,
+    }
+    return run_cached_tool(
+        "get_a_share_sector_rotation",
+        parameters,
+        300,
+        lambda: get_sector_rotation_data(**parameters),
+        max_stale_age_seconds=3600,
+    )
+
+
+@mcp.tool(
+    name="get_overnight_risk_packet",
+    title="Get an overnight cross-market observation packet",
+    description=(
+        "Return latest free public observations for Shanghai, LME and COMEX copper, USD/CNY, Nasdaq futures and "
+        "index, FTSE China A50 futures, and Hang Seng futures with venue timestamps. Missing dollar-index or US "
+        "Treasury-yield routes remain explicit. This tool reports facts only and does not predict the next A-share session."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_overnight_risk_packet(detail_level: str = "summary") -> dict[str, Any]:
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
+    return run_cached_tool(
+        "get_overnight_risk_packet",
+        {"detail_level": detail_level},
+        15,
+        lambda: get_overnight_risk_packet_data(detail_level),
+        max_stale_age_seconds=1800,
     )
 
 
