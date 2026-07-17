@@ -503,8 +503,11 @@ def test_kline_range_and_pagination() -> None:
 
 def test_tencent_minute_kline_adjustment_fallback() -> None:
     original_reader = market_app.read_public_json
+    market_app.TOOL_CACHE.clear()
+    requested_urls: list[str] = []
     try:
         def fake_reader(url: str, *_: object, **__: object) -> dict:
+            requested_urls.append(url)
             if "/kline/mkline" in url:
                 return {
                     "data": {
@@ -534,27 +537,57 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
 
         market_app.read_public_json = fake_reader
         result = market_app.get_tencent_kline(
-            "600519", "5m", 2, "2026-07-10", "2026-07-10", "forward"
+            "600519", "5m", 1, "2026-07-10", "2026-07-10", "forward"
         )
         assert result["source"] == "tencent"
         assert result["adjustment"] == "forward_adjusted"
         assert result["adjustment_source_parameter"] == "tencent_mkline_plus_qfq_daily_factor"
-        assert result["items"][0]["open"] == 50.0
-        assert result["items"][0]["close"] == 50.5
-        assert result["items"][0]["volume"] == 1000.0
+        assert result["items"][0]["open"] == 50.5
+        assert result["items"][0]["close"] == 51.0
+        assert result["items"][0]["volume"] == 2000.0
         assert result["missing_fields"] == ["turnover", "turnover_rate", "amplitude"]
+        assert result["has_more"] is True
+
+        second = market_app.get_tencent_kline(
+            "600519",
+            "5m",
+            1,
+            "2026-07-10",
+            "2026-07-10",
+            "forward",
+            result["next_page_token"],
+        )
+        assert second["items"][0]["date"] == "2026-07-10 09:35"
+        assert sum("/kline/mkline" in url for url in requested_urls) == 1
+        assert sum("/fqkline/get" in url for url in requested_urls) == 1
+        assert sum("/kline/kline" in url for url in requested_urls) == 1
     finally:
         market_app.read_public_json = original_reader
+        market_app.TOOL_CACHE.clear()
 
 
 def test_synchronized_market_snapshot_contract() -> None:
     original_overview = market_app.get_market_overview_data
     original_batch = market_app.get_batch_quote_data
     original_quote = market_app.get_quote_data
+    calls = {"overview": 0, "batch": 0, "quote": 0}
+    market_app.TOOL_CACHE.clear()
     try:
-        market_app.get_market_overview_data = fake_get_market_overview_data
-        market_app.get_batch_quote_data = fake_get_batch_quote_data
-        market_app.get_quote_data = fake_get_quote_data
+        def cached_overview(limit: int = 5) -> dict:
+            calls["overview"] += 1
+            return fake_get_market_overview_data(limit)
+
+        def cached_batch(symbols: list[str]) -> dict:
+            calls["batch"] += 1
+            return fake_get_batch_quote_data(symbols)
+
+        def cached_quote(symbol: str) -> dict:
+            calls["quote"] += 1
+            return fake_get_quote_data(symbol)
+
+        market_app.get_market_overview_data = cached_overview
+        market_app.get_batch_quote_data = cached_batch
+        market_app.get_quote_data = cached_quote
         snapshot = market_app.get_market_snapshot_data(
             "600519", [], None, 5, "summary"
         )
@@ -564,6 +597,11 @@ def test_synchronized_market_snapshot_contract() -> None:
         assert snapshot["conflicts"][0]["type"] == "target_price_difference"
         assert snapshot["recommended_source"] == ["test"]
         assert snapshot["data_status"] == "partial_data"
+        repeated = market_app.get_market_snapshot_data(
+            "600519", [], None, 5, "summary"
+        )
+        assert repeated["snapshot_id"] != snapshot["snapshot_id"]
+        assert calls == {"overview": 1, "batch": 1, "quote": 1}
 
         try:
             market_app.normalize_snapshot_as_of("2000-01-01T10:30:00+08:00")
@@ -575,6 +613,7 @@ def test_synchronized_market_snapshot_contract() -> None:
         market_app.get_market_overview_data = original_overview
         market_app.get_batch_quote_data = original_batch
         market_app.get_quote_data = original_quote
+        market_app.TOOL_CACHE.clear()
 
 
 def test_search_source_parser() -> None:
@@ -1590,7 +1629,40 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "historical_bars_and_synchronized_snapshot_v1"
+    assert health["routing_revision"] == "adaptive_fallback_bounded_cache_v1"
+    assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
+
+    market_app.SOURCE_HEALTH.clear()
+    market_app.record_source_health("eastmoney", False, 50, "temporary failure one")
+    market_app.record_source_health("eastmoney", False, 50, "temporary failure two")
+    adaptive_started = market_app.perf_counter()
+    adaptive_payload, adaptive_source, adaptive_errors = (
+        market_app.prefer_primary_public_source(
+            ("eastmoney", lambda: (sleep(0.25), {"source": "eastmoney"})[1]),
+            ("tencent", lambda: {"source": "tencent"}),
+            1,
+        )
+    )
+    assert market_app.perf_counter() - adaptive_started < 0.15
+    assert adaptive_payload["source"] == "tencent"
+    assert adaptive_source == "tencent"
+    assert any("adaptive fast fallback" in error for error in adaptive_errors)
+
+    original_cache_limit = market_app.TOOL_CACHE_MAX_ENTRIES
+    market_app.TOOL_CACHE.clear()
+    market_app.TOOL_CACHE_MAX_ENTRIES = 3
+    try:
+        for index in range(5):
+            market_app.get_cached_tool_data(
+                f"bounded-{index}",
+                10,
+                lambda index=index: {"value": index},
+            )
+        assert len(market_app.TOOL_CACHE) == 3
+        assert "bounded-0" not in market_app.TOOL_CACHE
+        assert "bounded-4" in market_app.TOOL_CACHE
+    finally:
+        market_app.TOOL_CACHE_MAX_ENTRIES = original_cache_limit
 
     market_app.TOOL_CACHE.clear()
     concurrent_calls = 0
@@ -1959,7 +2031,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "historical_bars_and_synchronized_snapshot_v1"
+        assert health.json()["routing_revision"] == "adaptive_fallback_bounded_cache_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
