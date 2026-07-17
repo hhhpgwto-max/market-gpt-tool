@@ -2275,6 +2275,17 @@ def test_ipo_subscription_status_contract() -> None:
     )
     market_app.TOOL_CACHE.pop(fast_cache_key, None)
 
+    normalized_fast_row = market_app.normalize_fast_ipo_row(
+        {
+            "SECURITY_CODE": "301707",
+            "SECURITY_NAME": "Test IPO",
+            "APPLY_NUM_UPPER": 5500,
+            "SELECT_LISTING_DATE": "2026-08-05 00:00:00",
+        }
+    )
+    assert normalized_fast_row["ONLINE_APPLY_UPPER"] == 5500
+    assert normalized_fast_row["LISTING_DATE"] == "2026-08-05 00:00:00"
+
     def fake_ipo_json(url: str, *args: object, **kwargs: object) -> dict:
         captured.append((url, args, kwargs))
         return {

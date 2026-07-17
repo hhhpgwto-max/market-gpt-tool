@@ -6136,6 +6136,9 @@ def normalize_fast_ipo_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized["LISTING_DATE"] = row.get("LISTING_DATE") or row.get(
         "SELECT_LISTING_DATE"
     )
+    normalized["ONLINE_APPLY_UPPER"] = row.get("ONLINE_APPLY_UPPER") or row.get(
+        "APPLY_NUM_UPPER"
+    )
     return normalized
 
 
