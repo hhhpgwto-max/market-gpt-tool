@@ -29,7 +29,7 @@ ChatGPT Business 自定义应用填写方式：
 - `search_a_share`：按代码或名称搜索 A 股、ETF、LOF。
 - `get_a_share_quote`：查询一只 A 股、ETF 或 LOF 的最新行情。
 - `get_a_share_batch_quotes`：一次查询最多 20 只 A 股、ETF、LOF；成功项目来自同一公开批量快照，个别无效代码单独返回错误。指数需要写成 `index:000300`，以免与同代码股票混淆。
-- `get_a_share_kline`：查询最多 30 条近期股票、ETF 或 LOF K 线数据。
+- `get_a_share_kline`：按起止日期查询最多 500 条股票、ETF 或 LOF K 线，支持 1/5/15/30/60 分钟、日、周、月周期，前复权/不复权/后复权和向前分页。
 - `get_a_share_intraday`：查询最多 240 条当日一分钟股票、ETF 或 LOF 分时数据，并返回 5/15/30 分钟涨跌、日内高低点距离、均价偏离、相对开盘涨跌和成交速度等机械指标。
 - `get_a_share_auction`：查询可核实的开盘集合竞价结果；公开源没有提供的竞价过程、撤单和未匹配委托会明确返回为空。
 - `filter_a_share_securities`：按调用方指定的涨跌幅、成交额、换手率、是否高于均价和市值条件机械筛选普通 A 股，不加入评分或推荐。
@@ -38,6 +38,7 @@ ChatGPT Business 自定义应用填写方式：
 - `get_a_share_news`：按证券代码和已核实公司名并发检索东方财富新闻索引与 Google News RSS，机械过滤弱相关结果、百科/论文索引和例行行情表格，合并近似重复标题，并返回媒体、发布时间、相关性依据、来源层级、链接类型和部分失败；可按需附带少量行业背景。
 - `get_a_share_sector_rankings`：按涨跌幅或成交额机械排列行业或概念板块；行业默认只返回二级分类，避免把二级、三级分类混在一起。
 - `get_a_share_limit_activity`：查询涨停、跌停、炸板、封板成功率、连板数量、最高连板高度、连板梯队和封单金额等公开机械统计，并可返回对应证券明细；不生成情绪或买卖标签。
+- `get_a_share_market_snapshot`：在一次有界请求内采集大盘、可选目标证券和最多 9 个同行/指数，统一返回 `snapshot_id`、各组件行情时间、最大时间差、来源价差、冲突、推荐来源、缺失字段和数据年龄；不伪造任意历史时刻快照。
 - `get_a_share_market_overview`：查询三大指数、主要风格指数、全市场广度、成交额、涨跌停/炸板统计和行业板块快照。
 - `get_a_share_announcements`：查询最近 1—365 天的交易所官方公告，并按业绩、分红、回购、股东变动、解禁、停复牌、风险提示、监管、重大交易、融资和治理等公开关键词做机械标签。
 - `get_a_share_historical_context`：用最多 260 根前复权日线计算 20/60/120/250 个交易日的收益、年化波动、最大回撤、区间高低点，以及成交额、成交量、换手率和振幅的历史百分位；只提供事实，不评分。
@@ -54,7 +55,8 @@ ChatGPT Business 自定义应用填写方式：
 - 报价中的 `trade_date` 表示行情所属交易日，`quote_time` 表示该交易日内最后可能成交的时间，`source_updated_at` 表示数据源刷新快照的时间；收盘后的刷新时间不会再冒充成交时间。`queried_at` 仅表示本服务查询时间。
 - 报价中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 已统一换算为人民币元，`turnover_unit` 固定为 `CNY`。
 - 代码会先识别证券类别和交易所，再转换为各数据源需要的格式。例如上交所 ETF `512760` 会使用 `sh512760`（腾讯/新浪）和 `1.512760`（东方财富），不会误当成深市股票。股票、ETF 和 LOF 名称搜索优先使用腾讯轻量接口，结果为空时自动回退新浪。
-- K 线中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 使用人民币元，`turnover_unit` 固定为 `CNY`。`latest_trade_date` 是最后一根 K 线所属交易日。K 线优先直连东方财富，失败时自动回退腾讯；两路都使用前复权，并分别明确返回 `eastmoney_fqt_1` 或 `tencent_qfq` 来源参数。
+- K 线中的 `volume` 已统一换算为股，`volume_unit` 固定为 `share`；`turnover` 使用人民币元，`turnover_unit` 固定为 `CNY`。`latest_trade_date` 是最后一根 K 线所属交易日。日/周/月前复权优先直连东方财富，失败时自动回退腾讯；不复权和后复权会明确使用东方财富对应参数，不用不同复权口径的备用源混接。
+- K 线通过 `start_date`、`end_date`、`limit` 和 `page_token` 分页；每页保持时间升序，`has_more=true` 时把 `next_page_token` 原样传给下一次调用。分钟历史优先使用东方财富，断链时由腾讯 640 根公开分钟线接管，并用腾讯日线复权因子机械统一 OHLC；请求范围早于公开上限时会标记 `partial_public_source_limit_640` 和缺失原因，不冒充完整历史。
 - 分钟线中的 `volume` 同样统一为股，`volume_unit` 固定为 `share`；`turnover_unit` 固定为 `CNY`。
 - 分钟线的 `average_price` 会说明口径：东方财富提供时是来源报告的当日累计均价；腾讯回退没有该字段时，只能用已返回分钟数据计算窗口 VWAP，并会明确标注不是完整当日均价。午休不会虚构分钟线，最后一根若与当前交易分钟相同会标记为 `is_current_minute_unfinished`。
 - `return_from_open_pct` 固定使用来源提供的正式开盘价，即使最多 240 条的返回窗口从 09:31 或 09:32 才开始也不会改变基准；窗口首条的变化另列为 `return_from_first_returned_minute_pct`。`opening_price`、`opening_price_scope` 和 `first_returned_minute_time` 会同时说明口径。全日 `high`/`low` 也会在截取窗口前保留。
@@ -71,7 +73,8 @@ ChatGPT Business 自定义应用填写方式：
 - 板块快照提供成交额、上涨/下跌家数和来源报告的领涨成分股；5/15/30 分钟动量目前不提供排名，因为公开板块分钟线接口不稳定，不能用不完整样本冒充完整排行。
 - 快速全市场聚合保证沪、深、北三市上涨/下跌/平盘家数与成交额；±3/5/7% 等仍需逐只扫描的字段会列入 `unavailable_breadth_detail_fields`。涨停、跌停和炸板改由三个轻量公开池并发补充，不再抓取约 56 页个股明细拖慢交易时段调用。
 - 批量报价的 `market_time_range` 说明同一批公开请求内各证券的来源更新时间范围，`queried_at` 是本服务统一完成查询的时间。单个失败不会影响同批其他结果。
-- 所有 MCP 工具统一返回 `ok`、`market_status`、`trade_date`、`market_time`、`queried_at`、`source`、`source_errors`、`is_stale`、`stale_reason`、`data_age_seconds`、`latency_ms` 和嵌套的 `data`。原有的主要字段仍保留在顶层，避免旧调用失效。
+- 所有 MCP 工具统一返回 `ok`、`snapshot_id`、`market_status`、`trade_date`、`market_time`、`queried_at`、`source_updated_at`、`source`、`source_errors`、`is_stale`、`stale_reason`、`missing_fields`、`conflicts`、`data_status`、`detail_level`、`data_age_seconds`、`latency_ms` 和嵌套的 `data`。原有的主要字段仍保留在顶层，避免旧调用失效。
+- 同步快照只接受“现在附近”的 `as_of`；如果传入早于当前 5 分钟的历史时间，会明确拒绝并说明当前免费实时源无法重建，不会拿最新行情冒充历史切片。默认 `detail_level=summary`，需要完整大盘组件时可用 `raw`。
 - `source_errors` 是结构化的部分失败记录，会带来源、错误类别和说明；一个备用来源失败不会丢掉其他来源已经取得的有效数据。
 - 实时类工具只缓存成功结果，报价/批量报价为 2 秒，大盘概览为 5 秒，分时为 15 秒；命中缓存时会明确返回 `cache_hit`、`cache_created_at` 和 `cache_age_seconds`，不会把缓存伪装为新请求。
 - 每个公开上游请求默认 3 秒超时；单只报价同时尝试东方财富、腾讯和新浪，优先返回最先成功的结果，总等待预算为 6 秒。

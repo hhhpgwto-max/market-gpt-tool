@@ -1,4 +1,5 @@
 import os
+import base64
 import json
 import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -27,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "limit_activity_and_index_identity_v1"
+ROUTING_REVISION = "historical_bars_and_synchronized_snapshot_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -35,7 +36,10 @@ MCP_INSTRUCTIONS = (
     "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
     "sector rankings, and operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
-    "Use get_a_share_quote for the latest quote and get_a_share_kline for recent price history. "
+    "Use get_a_share_quote for the latest quote and get_a_share_kline for date-ranged or paginated price history. "
+    "Use get_a_share_market_snapshot when market overview, a target security, and peers must be captured in one "
+    "bounded request with explicit timestamp differences and source conflicts. Historical as-of reconstruction is "
+    "not available unless the tool explicitly says so. "
     "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
     "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
     "for current company events. News results are evidence with provenance, not positive/negative judgements. "
@@ -74,7 +78,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.9.0",
+    version="0.10.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -132,6 +136,12 @@ KLINE_PERIODS = {
     "60m": 60,
 }
 
+KLINE_ADJUSTMENTS = {
+    "none": {"eastmoney_fqt": 0, "label": "unadjusted"},
+    "forward": {"eastmoney_fqt": 1, "label": "forward_adjusted"},
+    "backward": {"eastmoney_fqt": 2, "label": "backward_adjusted"},
+}
+
 EASTMONEY_FIELDS = ",".join(
     [
         "f57",
@@ -181,6 +191,13 @@ KLINE_RESPONSE_FIELDS = (
     "turnover",
     "turnover_unit",
     "change_pct",
+)
+
+KLINE_RAW_RESPONSE_FIELDS = (
+    *KLINE_RESPONSE_FIELDS,
+    "amplitude",
+    "change",
+    "turnover_rate",
 )
 
 FINANCIAL_RESPONSE_FIELDS = {
@@ -700,6 +717,15 @@ def standardize_tool_success(
     queried_at = now_iso()
     content = deepcopy(data)
     content["queried_at"] = queried_at
+    content.setdefault(
+        "snapshot_id",
+        f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+    )
+    content.setdefault("source_updated_at", None)
+    content.setdefault("missing_fields", [])
+    content.setdefault("conflicts", [])
+    content.setdefault("data_status", "full_data")
+    content.setdefault("detail_level", "summary")
     market_time = (
         content.get("market_time")
         or content.get("quote_time")
@@ -1458,13 +1484,111 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
     }
 
 
-def get_kline_data(symbol: str, period: str, limit: int) -> dict[str, Any]:
+def parse_iso_date_parameter(value: str | None, field_name: str) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{field_name} must use YYYY-MM-DD."
+        ) from exc
+
+
+def encode_kline_page_token(before: str) -> str:
+    payload = json.dumps({"before": before}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def decode_kline_page_token(page_token: str | None) -> str | None:
+    if not page_token:
+        return None
+    try:
+        padded = page_token + "=" * (-len(page_token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        before = str(payload["before"])
+        datetime.fromisoformat(before)
+        return before
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid K-line page_token.") from exc
+
+
+def filter_and_page_kline_items(
+    items: list[dict[str, Any]],
+    limit: int,
+    start_date: str | None,
+    end_date: str | None,
+    page_token: str | None,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    before = decode_kline_page_token(page_token)
+    filtered = []
+    for item in items:
+        item_time = str(item.get("date") or "")
+        item_day = item_time[:10]
+        if not item_time:
+            continue
+        if start_date and item_day < start_date:
+            continue
+        if end_date and item_day > end_date:
+            continue
+        if before and item_time >= before:
+            continue
+        filtered.append(item)
+    filtered.sort(key=lambda item: str(item.get("date") or ""))
+    has_more = len(filtered) > limit
+    page = filtered[-limit:]
+    next_page_token = (
+        encode_kline_page_token(str(page[0]["date"])) if has_more and page else None
+    )
+    return page, next_page_token, has_more
+
+
+def kline_coverage_status(
+    period: str, start_date: str | None, items: list[dict[str, Any]]
+) -> tuple[str, list[str]]:
+    if period == "1m" and start_date:
+        first_day = str(items[0].get("date") or "")[:10] if items else None
+        if not first_day or first_day > start_date:
+            return (
+                "partial_public_source_history",
+                ["historical_1m_before_available_public_range"],
+            )
+    return "available_public_range", []
+
+
+def get_kline_data(
+    symbol: str,
+    period: str,
+    limit: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "forward",
+    page_token: str | None = None,
+) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     klt = KLINE_PERIODS.get(period)
     if klt is None:
         raise HTTPException(status_code=400, detail=f"Unsupported period: {period}")
+    start_date = parse_iso_date_parameter(start_date, "start_date")
+    end_date = parse_iso_date_parameter(end_date, "end_date")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must not be after end_date.")
+    if adjust not in KLINE_ADJUSTMENTS:
+        raise HTTPException(
+            status_code=400, detail="adjust must be none, forward, or backward."
+        )
+    decode_kline_page_token(page_token)
 
-    payload = get_fallback_kline(symbol, period, klt, limit)
+    payload = get_fallback_kline(
+        symbol,
+        period,
+        klt,
+        limit,
+        start_date,
+        end_date,
+        adjust,
+        page_token,
+    )
     security = security_metadata(symbol)
     payload.update(
         {
@@ -1475,29 +1599,67 @@ def get_kline_data(symbol: str, period: str, limit: int) -> dict[str, Any]:
     return payload
 
 
-def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
+def get_eastmoney_kline(
+    symbol: str,
+    period: str,
+    klt: int,
+    limit: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "forward",
+    page_token: str | None = None,
+) -> dict[str, Any]:
+    before = decode_kline_page_token(page_token)
+    source_end_date = end_date
+    if before and not (start_date or end_date):
+        before_day = before[:10]
+        source_end_date = before_day
+    requested_source_limit = 5000 if start_date or end_date or page_token else limit + 1
+    adjustment = KLINE_ADJUSTMENTS[adjust]
     query = urlencode(
         {
             "secid": eastmoney_secid(symbol),
             "klt": klt,
-            "fqt": 1,
-            "lmt": limit,
-            "end": "20500101",
+            "fqt": adjustment["eastmoney_fqt"],
+            "lmt": requested_source_limit,
+            "beg": (start_date or "0").replace("-", ""),
+            "end": (source_end_date or "2050-01-01").replace("-", ""),
             "fields1": "f1,f2,f3,f4,f5,f6",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
     )
-    payload = read_public_json(
-        f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}",
-        "https://quote.eastmoney.com/",
-    )
+    def load_source_payload() -> dict[str, Any]:
+        return read_public_json(
+            f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}",
+            "https://quote.eastmoney.com/",
+            attempts=2,
+        )
+
+    if start_date or end_date:
+        source_cache_key = cache_key(
+            "eastmoney_kline_source_range",
+            {
+                "symbol": symbol,
+                "period": period,
+                "start_date": start_date,
+                "end_date": end_date,
+                "adjust": adjust,
+            },
+        )
+        payload, _ = get_cached_tool_data(
+            source_cache_key,
+            300 if period in {"daily", "weekly", "monthly"} else 30,
+            load_source_payload,
+        )
+    else:
+        payload = load_source_payload()
     data = payload.get("data") or {}
     klines = data.get("klines") or []
     if not klines:
         raise HTTPException(status_code=404, detail=f"Kline data not found from Eastmoney: {symbol}")
 
     items = []
-    for kline in klines[-limit:]:
+    for kline in klines:
         values = kline.split(",")
         if len(values) < 11:
             continue
@@ -1522,11 +1684,26 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
     if not items:
         raise HTTPException(status_code=502, detail=f"Unexpected Eastmoney Kline format: {symbol}")
 
+    items, next_page_token, has_more = filter_and_page_kline_items(
+        items, limit, start_date, end_date, page_token
+    )
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Kline data not found in requested range: {symbol}")
+    coverage_status, missing_fields = kline_coverage_status(period, start_date, items)
+
     return {
         "symbol": symbol,
         "period": period,
-        "adjustment": "forward_adjusted",
-        "adjustment_source_parameter": "eastmoney_fqt_1",
+        "adjustment": adjustment["label"],
+        "adjustment_source_parameter": f"eastmoney_fqt_{adjustment['eastmoney_fqt']}",
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "available_start": items[0]["date"],
+        "available_end": items[-1]["date"],
+        "coverage_status": coverage_status,
+        "missing_fields": missing_fields,
+        "has_more": has_more,
+        "next_page_token": next_page_token,
         "count": len(items),
         "items": items,
         "source": "eastmoney",
@@ -1536,7 +1713,193 @@ def get_eastmoney_kline(symbol: str, period: str, klt: int, limit: int) -> dict[
     }
 
 
-def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
+def get_tencent_minute_adjustment_factors(
+    symbol: str, adjust: str
+) -> dict[str, float]:
+    if adjust == "none":
+        return {}
+    adjustment_code = "qfq" if adjust == "forward" else "hfq"
+    market_code = market_symbol(symbol)
+    adjusted_url = (
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+        + urlencode({"param": f"{market_code},day,,,640,{adjustment_code}"})
+    )
+    raw_url = (
+        "https://ifzq.gtimg.cn/appstock/app/kline/kline?"
+        + urlencode({"param": f"{market_code},day,,,640"})
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        adjusted_future = executor.submit(
+            read_public_json, adjusted_url, "https://gu.qq.com/", 4, 2
+        )
+        raw_future = executor.submit(
+            read_public_json, raw_url, "https://gu.qq.com/", 4, 2
+        )
+        adjusted_payload = adjusted_future.result()
+        raw_payload = raw_future.result()
+    adjusted_rows = (
+        (adjusted_payload.get("data") or {}).get(market_code) or {}
+    ).get(f"{adjustment_code}day") or []
+    raw_rows = ((raw_payload.get("data") or {}).get(market_code) or {}).get("day") or []
+    raw_close_by_date = {
+        str(row[0]): to_number(row[2])
+        for row in raw_rows
+        if len(row) >= 3 and to_number(row[2]) not in (None, 0)
+    }
+    factors = {}
+    for row in adjusted_rows:
+        if len(row) < 3:
+            continue
+        trade_date = str(row[0])
+        adjusted_close = to_number(row[2])
+        raw_close = raw_close_by_date.get(trade_date)
+        if adjusted_close is not None and raw_close not in (None, 0):
+            factors[trade_date] = adjusted_close / raw_close
+    if not factors:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Tencent {adjustment_code} factors were unavailable for minute K-line fallback.",
+        )
+    return factors
+
+
+def get_tencent_minute_kline(
+    symbol: str,
+    period: str,
+    limit: int,
+    start_date: str | None,
+    end_date: str | None,
+    adjust: str,
+    page_token: str | None,
+) -> dict[str, Any]:
+    tencent_period = {
+        "1m": "m1",
+        "5m": "m5",
+        "15m": "m15",
+        "30m": "m30",
+        "60m": "m60",
+    }[period]
+    market_code = market_symbol(symbol)
+    query = urlencode({"param": f"{market_code},{tencent_period},,640"})
+    payload = read_public_json(
+        f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?{query}",
+        "https://gu.qq.com/",
+        timeout=4,
+        attempts=2,
+    )
+    rows = ((payload.get("data") or {}).get(market_code) or {}).get(tencent_period) or []
+    if not rows:
+        raise HTTPException(
+            status_code=404, detail=f"Minute Kline data not found from Tencent: {symbol}"
+        )
+    factors = get_tencent_minute_adjustment_factors(symbol, adjust)
+    items = []
+    previous_close = None
+    missing_factor_dates = set()
+    for row in rows:
+        if len(row) < 6:
+            continue
+        try:
+            item_time = datetime.strptime(str(row[0]), "%Y%m%d%H%M").strftime(
+                "%Y-%m-%d %H:%M"
+            )
+        except ValueError:
+            continue
+        trade_date = item_time[:10]
+        factor = 1.0 if adjust == "none" else factors.get(trade_date)
+        if factor is None:
+            missing_factor_dates.add(trade_date)
+            continue
+        open_price = to_number(row[1])
+        close = to_number(row[2])
+        high = to_number(row[3])
+        low = to_number(row[4])
+        volume = to_number(row[5])
+        adjusted_close = close * factor if close is not None else None
+        change_pct = None
+        if adjusted_close is not None and previous_close not in (None, 0):
+            change_pct = round((adjusted_close - previous_close) / previous_close * 100, 4)
+        items.append(
+            {
+                "date": item_time,
+                "open": open_price * factor if open_price is not None else None,
+                "close": adjusted_close,
+                "high": high * factor if high is not None else None,
+                "low": low * factor if low is not None else None,
+                "volume": volume * 100 if volume is not None else None,
+                "volume_unit": "share",
+                "turnover": None,
+                "turnover_unit": "CNY",
+                "change_pct": change_pct,
+            }
+        )
+        previous_close = adjusted_close
+    if not items:
+        raise HTTPException(
+            status_code=502, detail=f"Unexpected Tencent minute Kline format: {symbol}"
+        )
+    source_first_day = str(items[0]["date"])[:10]
+    requested_range_is_truncated = bool(
+        start_date and len(rows) >= 640 and source_first_day > start_date
+    )
+    items, next_page_token, has_more = filter_and_page_kline_items(
+        items, limit, start_date, end_date, page_token
+    )
+    if not items:
+        raise HTTPException(
+            status_code=404, detail=f"Kline data not found in requested range: {symbol}"
+        )
+    missing_fields = ["turnover", "turnover_rate", "amplitude"]
+    if requested_range_is_truncated:
+        missing_fields.append("history_before_tencent_640_bar_public_limit")
+    if missing_factor_dates:
+        missing_fields.append(
+            "adjustment_factors_for:" + ",".join(sorted(missing_factor_dates))
+        )
+    adjustment = KLINE_ADJUSTMENTS[adjust]
+    return {
+        "symbol": symbol,
+        "period": period,
+        "adjustment": adjustment["label"],
+        "adjustment_source_parameter": (
+            "tencent_unadjusted_mkline"
+            if adjust == "none"
+            else f"tencent_mkline_plus_{'qfq' if adjust == 'forward' else 'hfq'}_daily_factor"
+        ),
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "available_start": items[0]["date"],
+        "available_end": items[-1]["date"],
+        "coverage_status": (
+            "partial_public_source_limit_640"
+            if requested_range_is_truncated or missing_factor_dates
+            else "available_public_range"
+        ),
+        "missing_fields": missing_fields,
+        "has_more": has_more,
+        "next_page_token": next_page_token,
+        "count": len(items),
+        "items": items,
+        "source": "tencent",
+        "latest_trade_date": items[-1]["date"],
+        "queried_at": now_iso(),
+        "note": "Tencent public minute bars with explicit adjustment-factor provenance; no investment judgement.",
+    }
+
+
+def get_tencent_kline(
+    symbol: str,
+    period: str,
+    limit: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "forward",
+    page_token: str | None = None,
+) -> dict[str, Any]:
+    if period in {"1m", "5m", "15m", "30m", "60m"}:
+        return get_tencent_minute_kline(
+            symbol, period, limit, start_date, end_date, adjust, page_token
+        )
     tencent_periods = {
         "daily": "day",
         "weekly": "week",
@@ -1545,10 +1908,16 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
     tencent_period = tencent_periods.get(period)
     if tencent_period is None:
         raise HTTPException(status_code=502, detail=f"Tencent Kline fallback is unavailable for {period}.")
+    if adjust != "forward":
+        raise HTTPException(
+            status_code=502,
+            detail="Tencent Kline fallback only provides the forward-adjusted contract.",
+        )
 
+    requested_source_limit = 5000 if start_date or end_date or page_token else limit + 1
     query = urlencode(
         {
-            "param": f"{market_symbol(symbol)},{tencent_period},,,{limit},qfq",
+            "param": f"{market_symbol(symbol)},{tencent_period},,,{requested_source_limit},qfq",
         }
     )
     payload = read_public_json(
@@ -1562,7 +1931,7 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
 
     items = []
     previous_close = None
-    for row in rows[-limit:]:
+    for row in rows:
         if len(row) < 6:
             continue
         close = to_number(row[2])
@@ -1588,11 +1957,25 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
     if not items:
         raise HTTPException(status_code=502, detail=f"Unexpected Tencent Kline format: {symbol}")
 
+    items, next_page_token, has_more = filter_and_page_kline_items(
+        items, limit, start_date, end_date, page_token
+    )
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Kline data not found in requested range: {symbol}")
+
     return {
         "symbol": symbol,
         "period": period,
         "adjustment": "forward_adjusted",
         "adjustment_source_parameter": "tencent_qfq",
+        "requested_start_date": start_date,
+        "requested_end_date": end_date,
+        "available_start": items[0]["date"],
+        "available_end": items[-1]["date"],
+        "coverage_status": "available_public_range",
+        "missing_fields": ["turnover", "turnover_rate", "amplitude"],
+        "has_more": has_more,
+        "next_page_token": next_page_token,
         "count": len(items),
         "items": items,
         "source": "tencent",
@@ -1602,11 +1985,46 @@ def get_tencent_kline(symbol: str, period: str, limit: int) -> dict[str, Any]:
     }
 
 
-def get_fallback_kline(symbol: str, period: str, klt: int, limit: int) -> dict[str, Any]:
+def get_fallback_kline(
+    symbol: str,
+    period: str,
+    klt: int,
+    limit: int,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "forward",
+    page_token: str | None = None,
+) -> dict[str, Any]:
+    if period in {"daily", "weekly", "monthly"} and adjust != "forward":
+        payload = get_eastmoney_kline(
+            symbol, period, klt, limit, start_date, end_date, adjust, page_token
+        )
+        payload["source_errors"] = []
+        return payload
+    def eastmoney_loader() -> dict[str, Any]:
+        return get_eastmoney_kline(
+            symbol, period, klt, limit, start_date, end_date, adjust, page_token
+        )
+
+    def tencent_loader() -> dict[str, Any]:
+        return get_tencent_kline(
+            symbol, period, limit, start_date, end_date, adjust, page_token
+        )
+
+    primary = (
+        ("tencent", tencent_loader)
+        if period == "1m"
+        else ("eastmoney", eastmoney_loader)
+    )
+    secondary = (
+        ("eastmoney", eastmoney_loader)
+        if period == "1m"
+        else ("tencent", tencent_loader)
+    )
     payload, _, errors = prefer_primary_public_source(
-        ("eastmoney", lambda: get_eastmoney_kline(symbol, period, klt, limit)),
-        ("tencent", lambda: get_tencent_kline(symbol, period, limit)),
-        3.5,
+        primary,
+        secondary,
+        7.0 if period in {"1m", "5m", "15m", "30m", "60m"} else 3.5,
     )
     payload["source_errors"] = errors
     return payload
@@ -5264,6 +5682,243 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     }
 
 
+def normalize_snapshot_as_of(as_of: str | None) -> str | None:
+    if not as_of or str(as_of).strip().lower() == "now":
+        return None
+    try:
+        value = str(as_of).strip().replace("Z", "+00:00")
+        requested = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="as_of must be an ISO date-time such as 2026-07-17T10:30:00+08:00.",
+        ) from exc
+    if requested.tzinfo is None:
+        requested = requested.replace(tzinfo=MARKET_TIMEZONE)
+    requested = requested.astimezone(MARKET_TIMEZONE)
+    now = datetime.now(MARKET_TIMEZONE)
+    if requested > now + timedelta(minutes=1):
+        raise HTTPException(status_code=400, detail="as_of cannot be in the future.")
+    if requested < now - timedelta(minutes=5):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Exact historical as-of reconstruction is unavailable from the current public real-time sources. "
+                "Omit as_of to capture a new synchronized snapshot now."
+            ),
+        )
+    return requested.isoformat()
+
+
+def compact_market_overview_for_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: payload.get(key)
+        for key in (
+            "market_status",
+            "trade_date",
+            "market_time",
+            "indices",
+            "style_indices",
+            "style_index_catalog",
+            "industry_boards",
+            "market_breadth",
+            "turnover",
+            "limit_stats",
+            "market_activity_facts",
+            "component_status",
+            "data_status",
+        )
+    }
+
+
+def snapshot_time_entry(component: str, value: Any) -> dict[str, Any] | None:
+    parsed = parse_market_datetime(value)
+    if parsed is None:
+        return None
+    return {"component": component, "market_time": parsed.isoformat(), "parsed": parsed}
+
+
+def get_market_snapshot_data(
+    symbol: str | None,
+    peer_symbols: list[str] | None,
+    as_of: str | None,
+    sector_limit: int,
+    detail_level: str,
+) -> dict[str, Any]:
+    started_at = perf_counter()
+    started_iso = now_iso()
+    requested_as_of = normalize_snapshot_as_of(as_of)
+    target_symbol = normalize_symbol(symbol) if symbol else None
+    requested_identifiers: list[str] = []
+    for identifier in [target_symbol, *(peer_symbols or [])]:
+        if identifier is None:
+            continue
+        normalized_identifier = str(identifier).strip()
+        batch_security_metadata(normalized_identifier)
+        if normalized_identifier not in requested_identifiers:
+            requested_identifiers.append(normalized_identifier)
+    if len(requested_identifiers) > 10:
+        raise HTTPException(
+            status_code=400, detail="A synchronized snapshot supports at most 10 target and peer identifiers."
+        )
+
+    loaders: dict[str, Any] = {
+        "market_overview": lambda: get_market_overview_data(sector_limit),
+    }
+    if requested_identifiers:
+        loaders["batch_quotes"] = lambda: get_batch_quote_data(requested_identifiers)
+    if target_symbol:
+        loaders["target_quote"] = lambda: get_quote_data(target_symbol)
+    results, component_status, source_errors = collect_components(loaders, 12)
+    if not results:
+        raise HTTPException(status_code=502, detail="All synchronized snapshot components failed.")
+
+    overview = results.get("market_overview") or {}
+    batch = results.get("batch_quotes") or {}
+    target_payload = results.get("target_quote") or {}
+    target_quote = target_payload.get("quote") or None
+    batch_results = batch.get("results") or []
+    batch_target = next(
+        (
+            item
+            for item in batch_results
+            if target_symbol and str(item.get("symbol")) == target_symbol
+        ),
+        None,
+    )
+
+    time_entries = [
+        entry
+        for entry in (
+            snapshot_time_entry("market_overview", overview.get("market_time")),
+            snapshot_time_entry("batch_quotes", batch.get("market_time")),
+            snapshot_time_entry(
+                "target_quote",
+                (target_quote or {}).get("quote_time")
+                or (target_quote or {}).get("market_time"),
+            ),
+        )
+        if entry is not None
+    ]
+    sorted_times = sorted(time_entries, key=lambda item: item["parsed"])
+    earliest_time = sorted_times[0]["market_time"] if sorted_times else None
+    latest_time = sorted_times[-1]["market_time"] if sorted_times else None
+    time_difference_seconds = (
+        round((sorted_times[-1]["parsed"] - sorted_times[0]["parsed"]).total_seconds(), 3)
+        if len(sorted_times) >= 2
+        else 0.0 if sorted_times else None
+    )
+
+    direct_price = to_number((target_quote or {}).get("price"))
+    batch_price = to_number((batch_target or {}).get("price"))
+    source_difference_pct = (
+        round(abs(direct_price - batch_price) / batch_price * 100, 6)
+        if direct_price is not None and batch_price not in (None, 0)
+        else None
+    )
+    conflicts: list[dict[str, Any]] = []
+    if time_difference_seconds is not None and time_difference_seconds > 60:
+        conflicts.append(
+            {
+                "type": "market_time_difference",
+                "difference_seconds": time_difference_seconds,
+                "threshold_seconds": 60,
+                "components": [
+                    {"component": item["component"], "market_time": item["market_time"]}
+                    for item in sorted_times
+                ],
+            }
+        )
+    if source_difference_pct is not None and source_difference_pct > 0.05:
+        conflicts.append(
+            {
+                "type": "target_price_difference",
+                "difference_pct": source_difference_pct,
+                "threshold_pct": 0.05,
+                "direct_price": direct_price,
+                "batch_price": batch_price,
+            }
+        )
+
+    missing_fields = []
+    if target_symbol and target_quote is None:
+        missing_fields.append("target_quote")
+    missing_peer_identifiers = [
+        identifier
+        for identifier in requested_identifiers
+        if not any(
+            identifier in {str(item.get("identifier")), str(item.get("symbol"))}
+            for item in batch_results
+        )
+    ]
+    if missing_peer_identifiers:
+        missing_fields.append("batch_quotes_for:" + ",".join(missing_peer_identifiers))
+    if not overview:
+        missing_fields.append("market_overview")
+
+    sources = sorted(
+        {
+            source
+            for payload in results.values()
+            if isinstance(payload, dict)
+            for source in normalize_sources(payload.get("source"))
+        }
+    )
+    recommended_source = normalize_sources(target_payload.get("source")) or normalize_sources(
+        batch.get("source")
+    )
+    component_source_errors = [
+        error
+        for payload in results.values()
+        if isinstance(payload, dict)
+        for error in normalize_source_errors(payload.get("source_errors"))
+    ]
+    all_source_errors = [*source_errors, *component_source_errors]
+    source_updated_at = (target_quote or {}).get("source_updated_at") or latest_time
+    completed_at = now_iso()
+    return {
+        "snapshot_id": f"market-snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+        "requested_as_of": requested_as_of,
+        "as_of_status": "captured_now_from_current_or_latest_public_snapshots",
+        "snapshot_started_at": started_iso,
+        "snapshot_completed_at": completed_at,
+        "snapshot_span_ms": int((perf_counter() - started_at) * 1000),
+        "symbol": target_symbol,
+        "requested_identifiers": requested_identifiers,
+        "market_time": latest_time,
+        "market_time_range": {"earliest": earliest_time, "latest": latest_time},
+        "source_time_difference_seconds": time_difference_seconds,
+        "source_updated_at": source_updated_at,
+        "source_difference_pct": source_difference_pct,
+        "recommended_source": recommended_source,
+        "recommended_source_reason": (
+            "The dedicated target quote is preferred for the target security; the batch snapshot keeps peers on one public request."
+            if target_quote
+            else "The batch snapshot is the available synchronized security source."
+        ),
+        "target_quote": target_quote,
+        "peer_quotes": [
+            item for item in batch_results if str(item.get("symbol")) != target_symbol
+        ],
+        "market_overview": (
+            overview if detail_level == "raw" else compact_market_overview_for_snapshot(overview)
+        ),
+        "component_status": component_status,
+        "source": sources,
+        "source_errors": all_source_errors,
+        "conflicts": conflicts,
+        "missing_fields": missing_fields,
+        "detail_level": detail_level,
+        "data_status": (
+            "full_data"
+            if not all_source_errors and not missing_fields and not conflicts
+            else "partial_data"
+        ),
+        "queried_at": completed_at,
+        "note": "One bounded capture with explicit component times and source differences. It does not reconstruct an arbitrary historical snapshot or produce an investment judgement.",
+    }
+
+
 def get_market_data_health_data() -> dict[str, Any]:
     with SOURCE_HEALTH_LOCK:
         observed = deepcopy(SOURCE_HEALTH)
@@ -5362,6 +6017,12 @@ def mcp_error(
         "cache_hit": False,
         "cache_created_at": None,
         "cache_age_seconds": None,
+        "snapshot_id": f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+        "source_updated_at": None,
+        "missing_fields": [],
+        "conflicts": [],
+        "data_status": "unavailable",
+        "detail_level": "summary",
         "error_type": classify_error_type(message, exc.status_code),
         "error": message,
         "data": {},
@@ -5479,21 +6140,45 @@ def get_a_share_batch_quotes(symbols: list[str]) -> dict[str, Any]:
 @mcp.tool(
     name="get_a_share_kline",
     title="Get stock or listed-fund price history",
-    description="Get up to 30 recent A-share stock, ETF, or LOF price records for a daily, weekly, monthly, or intraday period.",
+    description=(
+        "Get up to 500 A-share stock, ETF, or LOF bars for a date range and adjustment mode, with backward pagination. "
+        "Supports 1/5/15/30/60-minute, daily, weekly, and monthly periods. Minute fallback history is capped by the public source and explicitly marked partial when the requested range is longer."
+    ),
     annotations=READ_ONLY_TOOL,
 )
 def get_a_share_kline(
     symbol: str,
     period: str = "daily",
     limit: int = 30,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    adjust: str = "forward",
+    page_token: str | None = None,
+    detail_level: str = "summary",
 ) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
         return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
-    normalized_limit = max(1, min(limit, 30))
+    normalized_limit = max(1, min(limit, 500))
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            symbol,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
 
     def kline_response() -> dict[str, Any]:
-        payload = get_kline_data(symbol=symbol, period=period, limit=normalized_limit)
+        payload = get_kline_data(
+            symbol=symbol,
+            period=period,
+            limit=normalized_limit,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+            page_token=page_token,
+        )
+        response_fields = (
+            KLINE_RAW_RESPONSE_FIELDS if detail_level == "raw" else KLINE_RESPONSE_FIELDS
+        )
         return {
             "symbol": payload["symbol"],
             "security_type": payload.get("security_type"),
@@ -5503,9 +6188,19 @@ def get_a_share_kline(
             "adjustment_source_parameter": payload.get(
                 "adjustment_source_parameter"
             ),
+            "requested_start_date": payload.get("requested_start_date"),
+            "requested_end_date": payload.get("requested_end_date"),
+            "available_start": payload.get("available_start"),
+            "available_end": payload.get("available_end"),
+            "coverage_status": payload.get("coverage_status"),
+            "has_more": payload.get("has_more", False),
+            "next_page_token": payload.get("next_page_token"),
+            "detail_level": detail_level,
+            "missing_fields": payload.get("missing_fields", []),
+            "conflicts": [],
             "count": payload["count"],
             "items": [
-                {field: clean_value(item.get(field)) for field in KLINE_RESPONSE_FIELDS}
+                {field: clean_value(item.get(field)) for field in response_fields}
                 for item in payload["items"]
             ],
             "source": payload["source"],
@@ -5518,7 +6213,16 @@ def get_a_share_kline(
     max_stale_age = 86400 if period in {"daily", "weekly", "monthly"} else 120
     return run_cached_tool(
         "get_a_share_kline",
-        {"symbol": symbol, "period": period, "limit": normalized_limit},
+        {
+            "symbol": symbol,
+            "period": period,
+            "limit": normalized_limit,
+            "start_date": start_date,
+            "end_date": end_date,
+            "adjust": adjust,
+            "page_token": page_token,
+            "detail_level": detail_level,
+        },
         ttl_seconds,
         kline_response,
         symbol,
@@ -5924,6 +6628,43 @@ def get_a_share_limit_activity(limit: int = 20) -> dict[str, Any]:
         lambda: get_limit_activity_data(normalized_limit),
         max_stale_age_seconds=3600,
     )
+
+
+@mcp.tool(
+    name="get_a_share_market_snapshot",
+    title="Capture a synchronized A-share market snapshot",
+    description=(
+        "Capture market overview, an optional target security, and up to nine peers in one bounded request. "
+        "Returns one snapshot_id, component timestamps, maximum source-time difference, price conflicts, data age, "
+        "recommended source, missing fields, and source errors. Arbitrary historical as-of reconstruction is rejected."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_a_share_market_snapshot(
+    symbol: str | None = None,
+    peer_symbols: list[str] | None = None,
+    as_of: str | None = None,
+    sector_limit: int = 5,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
+    started_at = perf_counter()
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            symbol,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            started_at,
+        )
+    try:
+        data = get_market_snapshot_data(
+            symbol.strip() if symbol else None,
+            peer_symbols,
+            as_of,
+            max(1, min(sector_limit, 10)),
+            detail_level,
+        )
+    except HTTPException as exc:
+        return mcp_error(symbol, exc, started_at)
+    return standardize_tool_success(data, started_at)
 
 
 @mcp.tool(
