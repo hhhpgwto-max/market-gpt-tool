@@ -5540,12 +5540,14 @@ def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
         }
     )
     errors = []
-    for host in ("push2his.eastmoney.com", "push2delay.eastmoney.com"):
+    # The delayed quote host identifies boards but currently returns an empty K-line
+    # array. Avoid a second serial wait after the dedicated history route fails.
+    for host in ("push2his.eastmoney.com",):
         try:
             payload = read_public_json(
                 f"https://{host}/api/qt/stock/kline/get?{query}",
                 "https://quote.eastmoney.com/",
-                timeout=4,
+                timeout=3,
                 attempts=1,
             )
             data = payload.get("data") or {}
@@ -5610,7 +5612,7 @@ def get_sector_rotation_data(
         boards = deduplicate_industry_boards(boards, len(boards))
         if normalized_level != "all":
             boards = [board for board in boards if board.get("level") == int(normalized_level)]
-    candidate_count = min(max(limit * 2, 12), 24)
+    candidate_count = min(max(limit * 2, 8), 16)
     by_change = sorted(
         boards,
         key=lambda item: (
@@ -5631,7 +5633,7 @@ def get_sector_rotation_data(
         candidates.append(board)
     history_results: dict[str, dict[str, Any]] = {}
     source_errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=min(6, len(candidates) + 1)) as executor:
+    with ThreadPoolExecutor(max_workers=min(12, len(candidates) + 2)) as executor:
         futures = {
             executor.submit(
                 get_eastmoney_generic_daily_kline,
