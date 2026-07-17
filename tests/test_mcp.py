@@ -2305,6 +2305,7 @@ def test_ipo_subscription_status_contract() -> None:
         assert item["subscription_code"] == "301707"
         assert item["eligibility_rules"]["exchange"] == "SZSE"
         assert item["eligibility_rules"]["required_permission"] == "chinext_trading_permission"
+        assert "szse.cn" in item["eligibility_rules"]["official_rule_url"]
         assert item["maximum_subscription_market_value_requirement_cny"] == 55000
         assert item["pending_fields"] == ["issue_price", "listing_date"]
         assert result["data_status"] == "partial_data"
@@ -2354,6 +2355,11 @@ def test_ipo_subscription_status_contract() -> None:
         assert bse["eligibility_rules"]["subscription_method"] == "full_cash_subscription"
         assert bse["maximum_subscription_market_value_requirement_cny"] is None
         assert bse["maximum_subscription_cash_cny"] == 19136250.0
+
+        sse_rules = market_app.ipo_market_rules(
+            {"SECURITY_CODE": "603407", "MARKET": "涓婁氦鎵€涓绘澘"}
+        )
+        assert "sse.com.cn/lawandrules/sselawsrules2025" in sse_rules["official_rule_url"]
 
         today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
         assert market_app.ipo_subscription_stage(

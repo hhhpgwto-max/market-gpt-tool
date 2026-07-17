@@ -6078,7 +6078,7 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
 
 IPO_CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 IPO_RULE_SOURCES = {
-    "sse": "https://english.sse.com.cn/news/newsrelease/c/4947510.shtml",
+    "sse": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/issue/c/c_20250515_10778982.shtml",
     "szse": "https://investor.szse.cn/knowledge/listings/publish/t20180117_538554.html",
     "bse": "https://www.bse.cn/fxrz_list/200010917.html",
 }
