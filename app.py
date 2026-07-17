@@ -28,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "historical_bars_and_synchronized_snapshot_v1"
+ROUTING_REVISION = "adaptive_fallback_bounded_cache_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -78,7 +78,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.10.0",
+    version="0.10.1",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -319,6 +319,7 @@ LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
 TOOL_CACHE_INFLIGHT: dict[str, dict[str, Any]] = {}
+TOOL_CACHE_MAX_ENTRIES = 512
 SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
@@ -429,6 +430,18 @@ def cache_key(tool_name: str, parameters: Any) -> str:
     return f"{tool_name}:{json.dumps(parameters, ensure_ascii=False, sort_keys=True, default=str)}"
 
 
+def prune_tool_cache_locked(incoming_key: str) -> None:
+    """Keep the in-process success cache bounded without touching in-flight work."""
+    if incoming_key in TOOL_CACHE:
+        return
+    while len(TOOL_CACHE) >= TOOL_CACHE_MAX_ENTRIES:
+        oldest_key = min(
+            TOOL_CACHE,
+            key=lambda key: TOOL_CACHE[key]["created_at"],
+        )
+        TOOL_CACHE.pop(oldest_key, None)
+
+
 def get_cached_tool_data(
     key: str, ttl_seconds: int, loader: Any
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -471,6 +484,7 @@ def get_cached_tool_data(
         data = loader()
         created_at = datetime.now(timezone.utc)
         with TOOL_CACHE_LOCK:
+            prune_tool_cache_locked(key)
             TOOL_CACHE[key] = {"created_at": created_at, "data": deepcopy(data)}
         return (
             data,
@@ -516,6 +530,29 @@ def get_cached_tool_snapshot(
         )
 
 
+def get_cached_component_with_stale(
+    key: str,
+    ttl_seconds: int,
+    max_stale_age_seconds: int,
+    loader: Any,
+) -> dict[str, Any]:
+    """Share component refreshes and preserve a recent honest fallback on transient failure."""
+    try:
+        data, _ = get_cached_tool_data(key, ttl_seconds, loader)
+        return data
+    except HTTPException as exc:
+        stale = get_cached_tool_snapshot(key, max_stale_age_seconds)
+        if stale is None:
+            raise
+        data, cache = stale
+        data["served_from_stale_cache"] = True
+        data["stale_cache_age_seconds"] = cache["cache_age_seconds"]
+        data.setdefault("source_errors", []).append(
+            f"live_refresh: {exc.detail}; using recent component cache"
+        )
+        return data
+
+
 def source_name_from_url(url: str) -> str:
     text = url.lower()
     if "eastmoney" in text:
@@ -540,6 +577,7 @@ def record_source_health(source: str, success: bool, latency_ms: int, error: str
                 "last_success_at": None,
                 "last_error_at": None,
                 "last_error": None,
+                "consecutive_failures": 0,
             },
         )
         state["attempt_count"] += 1
@@ -552,10 +590,30 @@ def record_source_health(source: str, success: bool, latency_ms: int, error: str
         if success:
             state["success_count"] += 1
             state["last_success_at"] = now
+            state["consecutive_failures"] = 0
         else:
             state["failure_count"] += 1
             state["last_error_at"] = now
             state["last_error"] = error
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+
+
+def source_is_temporarily_degraded(
+    source: str, min_consecutive_failures: int = 2, cooldown_seconds: int = 90
+) -> bool:
+    """Use recent observed failures as a short-lived circuit-breaker signal."""
+    with SOURCE_HEALTH_LOCK:
+        state = deepcopy(SOURCE_HEALTH.get(source))
+    if not state or state.get("consecutive_failures", 0) < min_consecutive_failures:
+        return False
+    last_error_at = state.get("last_error_at")
+    if not last_error_at:
+        return False
+    try:
+        error_time = datetime.fromisoformat(str(last_error_at))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - error_time).total_seconds() <= cooldown_seconds
 
 
 def classify_error_type(message: Any, status_code: int | None = None) -> str:
@@ -651,6 +709,18 @@ def prefer_primary_public_source(
                 errors.append(f"{source}: {exc}")
                 status_codes.append(502)
         primary_pending = any(futures[future] == primary_source for future in pending)
+        if (
+            fallback_payload is not None
+            and primary_pending
+            and source_is_temporarily_degraded(primary_source)
+        ):
+            for future in pending:
+                if futures[future] == primary_source:
+                    future.cancel()
+            errors.append(
+                f"{primary_source}: adaptive fast fallback used after repeated recent source failures"
+            )
+            return fallback_payload, fallback_source, errors
         if fallback_payload is not None and not primary_pending:
             return fallback_payload, fallback_source, errors
     for future in pending:
@@ -1728,39 +1798,50 @@ def get_tencent_minute_adjustment_factors(
         "https://ifzq.gtimg.cn/appstock/app/kline/kline?"
         + urlencode({"param": f"{market_code},day,,,640"})
     )
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        adjusted_future = executor.submit(
-            read_public_json, adjusted_url, "https://gu.qq.com/", 4, 2
-        )
-        raw_future = executor.submit(
-            read_public_json, raw_url, "https://gu.qq.com/", 4, 2
-        )
-        adjusted_payload = adjusted_future.result()
-        raw_payload = raw_future.result()
-    adjusted_rows = (
-        (adjusted_payload.get("data") or {}).get(market_code) or {}
-    ).get(f"{adjustment_code}day") or []
-    raw_rows = ((raw_payload.get("data") or {}).get(market_code) or {}).get("day") or []
-    raw_close_by_date = {
-        str(row[0]): to_number(row[2])
-        for row in raw_rows
-        if len(row) >= 3 and to_number(row[2]) not in (None, 0)
-    }
-    factors = {}
-    for row in adjusted_rows:
-        if len(row) < 3:
-            continue
-        trade_date = str(row[0])
-        adjusted_close = to_number(row[2])
-        raw_close = raw_close_by_date.get(trade_date)
-        if adjusted_close is not None and raw_close not in (None, 0):
-            factors[trade_date] = adjusted_close / raw_close
-    if not factors:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Tencent {adjustment_code} factors were unavailable for minute K-line fallback.",
-        )
-    return factors
+    def load_factors() -> dict[str, Any]:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            adjusted_future = executor.submit(
+                read_public_json, adjusted_url, "https://gu.qq.com/", 4, 2
+            )
+            raw_future = executor.submit(
+                read_public_json, raw_url, "https://gu.qq.com/", 4, 2
+            )
+            adjusted_payload = adjusted_future.result()
+            raw_payload = raw_future.result()
+        adjusted_rows = (
+            (adjusted_payload.get("data") or {}).get(market_code) or {}
+        ).get(f"{adjustment_code}day") or []
+        raw_rows = ((raw_payload.get("data") or {}).get(market_code) or {}).get("day") or []
+        raw_close_by_date = {
+            str(row[0]): to_number(row[2])
+            for row in raw_rows
+            if len(row) >= 3 and to_number(row[2]) not in (None, 0)
+        }
+        factors = {}
+        for row in adjusted_rows:
+            if len(row) < 3:
+                continue
+            trade_date = str(row[0])
+            adjusted_close = to_number(row[2])
+            raw_close = raw_close_by_date.get(trade_date)
+            if adjusted_close is not None and raw_close not in (None, 0):
+                factors[trade_date] = adjusted_close / raw_close
+        if not factors:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Tencent {adjustment_code} factors were unavailable for minute K-line fallback.",
+            )
+        return {"factors": factors}
+
+    cached, _ = get_cached_tool_data(
+        cache_key(
+            "tencent_minute_adjustment_factors",
+            {"symbol": symbol, "adjust": adjust},
+        ),
+        300,
+        load_factors,
+    )
+    return cached["factors"]
 
 
 def get_tencent_minute_kline(
@@ -1781,11 +1862,18 @@ def get_tencent_minute_kline(
     }[period]
     market_code = market_symbol(symbol)
     query = urlencode({"param": f"{market_code},{tencent_period},,640"})
-    payload = read_public_json(
-        f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?{query}",
-        "https://gu.qq.com/",
-        timeout=4,
-        attempts=2,
+    payload, _ = get_cached_tool_data(
+        cache_key(
+            "tencent_minute_kline_source",
+            {"symbol": symbol, "period": period},
+        ),
+        15,
+        lambda: read_public_json(
+            f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?{query}",
+            "https://gu.qq.com/",
+            timeout=4,
+            attempts=2,
+        ),
     )
     rows = ((payload.get("data") or {}).get(market_code) or {}).get(tencent_period) or []
     if not rows:
@@ -5763,12 +5851,30 @@ def get_market_snapshot_data(
         )
 
     loaders: dict[str, Any] = {
-        "market_overview": lambda: get_market_overview_data(sector_limit),
+        "market_overview": lambda: get_cached_component_with_stale(
+            cache_key("snapshot_market_overview", {"sector_limit": sector_limit}),
+            5,
+            120,
+            lambda: get_market_overview_data(sector_limit),
+        ),
     }
     if requested_identifiers:
-        loaders["batch_quotes"] = lambda: get_batch_quote_data(requested_identifiers)
+        loaders["batch_quotes"] = lambda: get_cached_component_with_stale(
+            cache_key(
+                "snapshot_batch_quotes",
+                {"identifiers": requested_identifiers},
+            ),
+            2,
+            15,
+            lambda: get_batch_quote_data(requested_identifiers),
+        )
     if target_symbol:
-        loaders["target_quote"] = lambda: get_quote_data(target_symbol)
+        loaders["target_quote"] = lambda: get_cached_component_with_stale(
+            cache_key("snapshot_target_quote", {"symbol": target_symbol}),
+            2,
+            15,
+            lambda: get_quote_data(target_symbol),
+        )
     results, component_status, source_errors = collect_components(loaders, 12)
     if not results:
         raise HTTPException(status_code=502, detail="All synchronized snapshot components failed.")
@@ -5936,6 +6042,8 @@ def get_market_data_health_data() -> dict[str, Any]:
                     "average_latency_ms": None,
                     "last_success_at": None,
                     "last_error": None,
+                    "consecutive_failures": 0,
+                    "adaptive_fast_fallback": False,
                 }
             )
             continue
@@ -5951,6 +6059,8 @@ def get_market_data_health_data() -> dict[str, Any]:
                 "average_latency_ms": state["average_latency_ms"],
                 "last_success_at": state["last_success_at"],
                 "last_error": state["last_error"],
+                "consecutive_failures": state.get("consecutive_failures", 0),
+                "adaptive_fast_fallback": source_is_temporarily_degraded(source),
             }
         )
 
@@ -5969,6 +6079,11 @@ def get_market_data_health_data() -> dict[str, Any]:
             "providers": ["eastmoney", "tencent"],
             "strategy": "parallel_fastest_success_with_9_second_total_budget_and_session_filter",
         },
+        "kline_route": {
+            "status": "configured",
+            "providers": ["eastmoney", "tencent"],
+            "strategy": "preferred_source_with_adaptive_fast_fallback_and_shared_source_payload_cache",
+        },
         "market_overview_route": {
             "status": "configured",
             "breadth_providers": [
@@ -5983,7 +6098,11 @@ def get_market_data_health_data() -> dict[str, Any]:
             "providers": ["eastmoney", "tencent", "sina"],
             "note": "ETF and LOF code prefixes are classified before public-source routing.",
         },
-        "cache": {"entry_count": cache_entries, "policy": "short_TTL_success_only"},
+        "cache": {
+            "entry_count": cache_entries,
+            "max_entries": TOOL_CACHE_MAX_ENTRIES,
+            "policy": "bounded_short_TTL_success_only_with_singleflight",
+        },
         "routing_revision": ROUTING_REVISION,
         "degraded_mode": degraded,
         "note": "Observed request health only; this endpoint does not fabricate a live probe or investment conclusion.",
@@ -6654,17 +6773,28 @@ def get_a_share_market_snapshot(
             HTTPException(status_code=400, detail="detail_level must be summary or raw."),
             started_at,
         )
-    try:
-        data = get_market_snapshot_data(
-            symbol.strip() if symbol else None,
+    normalized_symbol = symbol.strip() if symbol else None
+    normalized_sector_limit = max(1, min(sector_limit, 10))
+    return run_cached_tool(
+        "get_a_share_market_snapshot",
+        {
+            "symbol": normalized_symbol,
+            "peer_symbols": peer_symbols or [],
+            "as_of": as_of,
+            "sector_limit": normalized_sector_limit,
+            "detail_level": detail_level,
+        },
+        2,
+        lambda: get_market_snapshot_data(
+            normalized_symbol,
             peer_symbols,
             as_of,
-            max(1, min(sector_limit, 10)),
+            normalized_sector_limit,
             detail_level,
-        )
-    except HTTPException as exc:
-        return mcp_error(symbol, exc, started_at)
-    return standardize_tool_success(data, started_at)
+        ),
+        normalized_symbol,
+        max_stale_age_seconds=15,
+    )
 
 
 @mcp.tool(
