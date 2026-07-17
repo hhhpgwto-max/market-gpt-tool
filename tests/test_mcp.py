@@ -225,6 +225,33 @@ def fake_get_portfolio_exposure_data(
     }
 
 
+def fake_get_ipo_subscription_status_data(
+    symbol_or_name: str | None,
+    days_ahead: int,
+    days_back: int,
+    limit: int,
+    detail_level: str,
+) -> dict:
+    return {
+        "query": symbol_or_name,
+        "schedule_range": {"days_ahead": days_ahead, "days_back": days_back},
+        "count": 1,
+        "items": [
+            {
+                "security_code": "301707",
+                "subscription_code": "301707",
+                "subscription_stage": "subscription_scheduled",
+            }
+        ][:limit],
+        "detail_level": detail_level,
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+        "queried_at": "2026-07-10T00:00:00+00:00",
+    }
+
+
 def fake_get_news_data(
     symbol: str,
     limit: int,
@@ -1748,7 +1775,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "bounded_context_exposure_cache_v1"
+    assert health["routing_revision"] == "ipo_subscription_status_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2240,6 +2267,208 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         market_app.get_fast_portfolio_security_reference = original_reference
 
 
+def test_ipo_subscription_status_contract() -> None:
+    original_json = market_app.read_public_json
+    captured: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def fake_ipo_json(url: str, *args: object, **kwargs: object) -> dict:
+        captured.append((url, args, kwargs))
+        return {
+            "success": True,
+            "result": {
+                "data": [
+                    {
+                        "SECURITY_CODE": "301707",
+                        "SECURITY_NAME_ABBR": "Test IPO",
+                        "APPLY_CODE": "301707",
+                        "APPLY_DATE": "2026-07-27 00:00:00",
+                        "ASSIGN_DATE": "2026-07-28 00:00:00",
+                        "BALLOT_NUM_DATE": "2026-07-29 00:00:00",
+                        "BALLOT_PAY_DATE": "2026-07-29 00:00:00",
+                        "LISTING_DATE": None,
+                        "MARKET": "深交所创业板",
+                        "ISSUE_PRICE": None,
+                        "ONLINE_APPLY_UPPER": 5500,
+                        "ONLINE_ISSUE_NUM": 5756500,
+                        "UP_DATE": "2026-07-17 00:00:00",
+                    }
+                ]
+            },
+        }
+
+    market_app.read_public_json = fake_ipo_json
+    try:
+        result = market_app.get_ipo_subscription_status_data(
+            "301707", 30, 7, 10, "raw"
+        )
+        item = result["items"][0]
+        assert item["subscription_code"] == "301707"
+        assert item["eligibility_rules"]["exchange"] == "SZSE"
+        assert item["eligibility_rules"]["required_permission"] == "chinext_trading_permission"
+        assert "szse.cn" in item["eligibility_rules"]["official_rule_url"]
+        assert item["maximum_subscription_market_value_requirement_cny"] == 55000
+        assert item["pending_fields"] == ["issue_price", "listing_date"]
+        assert result["data_status"] == "partial_data"
+        assert "SECURITY_CODE" in captured[0][0]
+        assert "301707" in captured[0][0]
+        assert captured[0][2] == {"timeout": 5, "attempts": 2}
+
+        market_app.read_public_json = lambda *_args, **_kwargs: {
+            "success": True,
+            "result": ["malformed"],
+        }
+        try:
+            market_app.get_eastmoney_ipo_calendar_rows("301707", 10)
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 502
+        else:
+            raise AssertionError("Malformed IPO result should be rejected with 502.")
+
+        name_urls: list[str] = []
+
+        def fake_name_json(url: str, *_: object, **__: object) -> dict:
+            name_urls.append(url)
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": "301707",
+                            "SECURITY_NAME_ABBR": "TestIPO",
+                            "APPLY_CODE": "301707",
+                            "APPLY_DATE": "2026-07-27 00:00:00",
+                            "ISSUE_PRICE": 10,
+                            "ONLINE_APPLY_UPPER": 5000,
+                            "LISTING_DATE": "2026-08-05 00:00:00",
+                        }
+                    ]
+                },
+            }
+
+        market_app.read_public_json = fake_name_json
+        name_match = market_app.get_ipo_subscription_status_data(
+            "TestIPO", 30, 7, 10, "summary"
+        )
+        assert name_match["items"][0]["security_name"] == "TestIPO"
+        assert "SECURITY_NAME_ABBR" in name_urls[0]
+        assert "TestIPO" in name_urls[0]
+
+        today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
+
+        def fake_calendar_json(_url: str, *_: object, **__: object) -> dict:
+            def row(code: str, apply_date: object) -> dict[str, object]:
+                return {
+                    "SECURITY_CODE": code,
+                    "SECURITY_NAME_ABBR": f"IPO {code}",
+                    "APPLY_CODE": code,
+                    "APPLY_DATE": str(apply_date),
+                    "ISSUE_PRICE": 10,
+                    "ONLINE_APPLY_UPPER": 5000,
+                    "LISTING_DATE": str(today + market_app.timedelta(days=10)),
+                }
+
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        row("301708", today),
+                        row("301709", today + market_app.timedelta(days=5)),
+                    ]
+                },
+            }
+
+        market_app.read_public_json = fake_calendar_json
+        calendar = market_app.get_ipo_subscription_status_data(
+            None, 1, 1, 10, "summary"
+        )
+        assert calendar["count"] == 1
+        assert calendar["items"][0]["security_code"] == "301708"
+        assert calendar["schedule_range"] == {
+            "start": (today - market_app.timedelta(days=1)).isoformat(),
+            "end": (today + market_app.timedelta(days=1)).isoformat(),
+        }
+
+        def fake_subscription_code_json(url: str, *_: object, **__: object) -> dict:
+            if "APPLY_CODE%3D" not in url:
+                return {"success": False, "message": "返回数据为空", "result": None}
+            return {
+                "success": True,
+                "result": {
+                    "data": [
+                        {
+                            "SECURITY_CODE": "603407",
+                            "SECURITY_NAME_ABBR": "Subscription Code Match",
+                            "APPLY_CODE": "732407",
+                            "APPLY_DATE": "2026-04-27 00:00:00",
+                            "MARKET": "上交所主板",
+                        }
+                    ]
+                },
+            }
+
+        market_app.read_public_json = fake_subscription_code_json
+        subscription_code_match = market_app.get_ipo_subscription_status_data(
+            "732407", 30, 7, 10, "summary"
+        )
+        assert subscription_code_match["items"][0]["security_code"] == "603407"
+        assert subscription_code_match["items"][0]["subscription_code"] == "732407"
+
+        bse = market_app.build_ipo_subscription_item(
+            {
+                "SECURITY_CODE": "920065",
+                "SECURITY_NAME_ABBR": "BSE IPO",
+                "APPLY_CODE": "920065",
+                "APPLY_DATE": "2026-07-20 00:00:00",
+                "ISSUE_PRICE": 24.3,
+                "ONLINE_APPLY_UPPER": 787500,
+                "IS_BEIJING": 1,
+            },
+            "summary",
+        )
+        assert bse["market"] == "北京证券交易所"
+        assert bse["subscription_unit_shares"] == 100
+        assert bse["eligibility_rules"]["subscription_method"] == "full_cash_subscription"
+        assert bse["maximum_subscription_market_value_requirement_cny"] is None
+        assert bse["maximum_subscription_cash_cny"] == 19136250.0
+
+        incomplete_limit = market_app.build_ipo_subscription_item(
+            {
+                "SECURITY_CODE": "603408",
+                "APPLY_DATE": "2026-07-20 00:00:00",
+                "ISSUE_PRICE": 10,
+                "LISTING_DATE": "2026-08-01 00:00:00",
+            },
+            "summary",
+        )
+        assert incomplete_limit["pending_fields"] == [
+            "online_subscription_limit_shares"
+        ]
+
+        sse_rules = market_app.ipo_market_rules(
+            {"SECURITY_CODE": "603407", "MARKET": "涓婁氦鎵€涓绘澘"}
+        )
+        assert "sse.com.cn/lawandrules/sselawsrules2025" in sse_rules["official_rule_url"]
+
+        today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
+        assert market_app.ipo_subscription_stage(
+            {
+                "APPLY_DATE": (today - market_app.timedelta(days=2)).isoformat(),
+                "BALLOT_PAY_DATE": today.isoformat(),
+                "LISTING_DATE": (today + market_app.timedelta(days=5)).isoformat(),
+            },
+            today.isoformat(),
+        ) == "ballot_result_and_payment_today"
+
+        try:
+            market_app.normalize_ipo_query('301707")')
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 400
+        else:
+            raise AssertionError("Unsafe IPO query characters should be rejected.")
+    finally:
+        market_app.read_public_json = original_json
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_kline_range_and_pagination()
@@ -2265,6 +2494,7 @@ def main() -> None:
     test_historical_context_and_security_status_facts()
     test_rotation_overnight_and_event_helpers()
     test_fund_and_portfolio_exposure_calculations()
+    test_ipo_subscription_status_contract()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
@@ -2291,6 +2521,7 @@ def main() -> None:
     market_app.get_sector_rankings_data = fake_get_sector_rankings_data
     market_app.get_sector_rotation_data = fake_get_sector_rotation_data
     market_app.get_overnight_risk_packet_data = fake_get_overnight_risk_packet_data
+    market_app.get_ipo_subscription_status_data = fake_get_ipo_subscription_status_data
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -2299,7 +2530,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "bounded_context_exposure_cache_v1"
+        assert health.json()["routing_revision"] == "ipo_subscription_status_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -2347,6 +2578,7 @@ def main() -> None:
             "get_a_share_financials",
             "get_fund_exposure",
             "get_portfolio_exposure",
+            "get_ipo_subscription_status",
             "get_a_share_news",
             "get_a_share_announcements",
             "get_a_share_event_timeline",
@@ -2452,6 +2684,7 @@ def main() -> None:
                     ]
                 },
             ),
+            (29, "get_ipo_subscription_status", {"symbol_or_name": "301707"}),
         ):
             response = client.post(
                 "/mcp",

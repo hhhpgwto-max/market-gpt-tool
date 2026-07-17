@@ -28,7 +28,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "bounded_context_exposure_cache_v1"
+ROUTING_REVISION = "ipo_subscription_status_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -36,12 +36,15 @@ MCP_INSTRUCTIONS = (
     "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
     "sector rankings and rotation history, overnight cross-market observations, company event timelines, fund "
     "look-through holdings, portfolio exposure aggregation, and "
+    "public IPO subscription schedules and eligibility rules, and "
     "operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
     "Use get_a_share_quote for the latest quote and get_a_share_kline for date-ranged or paginated price history. "
     "Use get_a_share_market_snapshot when market overview, a target security, and peers must be captured in one "
     "bounded request with explicit timestamp differences and source conflicts. Historical as-of reconstruction is "
     "not available unless the tool explicitly says so. "
+    "Use get_ipo_subscription_status for current IPO schedules, subscription codes, dates, issuer limits, and "
+    "exchange rules. Never infer the user's account market value, board permissions, application, or winning status. "
     "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
     "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
     "for current company events. News results are evidence with provenance, not positive/negative judgements. "
@@ -6073,6 +6076,267 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
     }
 
 
+IPO_CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+IPO_RULE_SOURCES = {
+    "sse": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/issue/c/c_20250515_10778982.shtml",
+    "szse": "https://www.szse.cn/ipo/guide/rule/P020190228664910292959.pdf",
+    "bse": "https://www.bse.cn/fxrz_list/200010917.html",
+}
+IPO_CALENDAR_COLUMNS = (
+    "SECURITY_CODE,SECURITY_NAME,SECURITY_NAME_ABBR,APPLY_CODE,APPLY_DATE,"
+    "LISTING_DATE,TRADE_MARKET,MARKET,MARKET_TYPE_NEW,BALLOT_PAY_DATE,"
+    "ASSIGN_DATE,BALLOT_NUM_DATE,RESULT_NOTICE_DATE,ISSUE_PRICE,"
+    "ONLINE_APPLY_PRICE,ONLINE_APPLY_UPPER,ONLINE_ISSUE_NUM,EACHBALLOT_SHARES,"
+    "ISSUE_WAY,MARKET_CAP_CONFIRMDATE,INFO_CODE,MAIN_BUSINESS,ISSUE_STATE,"
+    "IS_BEIJING,UP_DATE"
+)
+
+
+def normalize_ipo_query(symbol_or_name: str | None) -> str | None:
+    if symbol_or_name is None:
+        return None
+    normalized = str(symbol_or_name).strip()
+    if not normalized:
+        return None
+    if len(normalized) > 30 or not re.fullmatch(r"[0-9A-Za-z\u4e00-\u9fff·()（）-]+", normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="symbol_or_name must be an exact six-digit IPO code or a short company name.",
+        )
+    return normalized
+
+
+def ipo_calendar_date(value: Any) -> str | None:
+    text = str(value or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def get_eastmoney_ipo_calendar_rows(
+    symbol_or_name: str | None, fetch_limit: int
+) -> list[dict[str, Any]]:
+    query = normalize_ipo_query(symbol_or_name)
+    parameters: dict[str, Any] = {
+        "reportName": "RPTA_APP_IPOAPPLY",
+        "columns": IPO_CALENDAR_COLUMNS,
+        "sortColumns": "APPLY_DATE",
+        "sortTypes": -1,
+        "pageSize": max(20, min(fetch_limit, 100)),
+        "pageNumber": 1,
+    }
+    if query:
+        field = "SECURITY_CODE" if SYMBOL_PATTERN.fullmatch(query) else "SECURITY_NAME_ABBR"
+        parameters["filter"] = f'({field}="{query}")'
+
+    def load_rows() -> list[Any]:
+        payload = read_public_json(
+            f"{IPO_CALENDAR_API}?{urlencode(parameters)}",
+            "https://data.eastmoney.com/xg/xg/default.html",
+            timeout=5,
+            attempts=2,
+        )
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+        if payload.get("success") is False:
+            if "数据为空" in str(payload.get("message") or ""):
+                return []
+            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+        result = payload.get("result")
+        if result is None:
+            return []
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+        return result.get("data") or []
+
+    rows = load_rows()
+    if query and SYMBOL_PATTERN.fullmatch(query) and not rows:
+        parameters["filter"] = f'(APPLY_CODE="{query}")'
+        rows = load_rows()
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="IPO calendar rows had an unexpected format.")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def ipo_subscription_stage(row: dict[str, Any], today: str) -> str:
+    apply_date = ipo_calendar_date(row.get("APPLY_DATE"))
+    assign_date = ipo_calendar_date(row.get("ASSIGN_DATE"))
+    ballot_date = ipo_calendar_date(row.get("BALLOT_NUM_DATE"))
+    payment_date = ipo_calendar_date(row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE"))
+    listing_date = ipo_calendar_date(row.get("LISTING_DATE"))
+    if listing_date and listing_date <= today:
+        return "listed"
+    if payment_date == today:
+        return "ballot_result_and_payment_today"
+    if ballot_date == today:
+        return "ballot_result_scheduled_today"
+    if assign_date == today:
+        return "allocation_numbering_today"
+    if apply_date == today:
+        return "subscription_open_today"
+    if apply_date and apply_date > today:
+        return "subscription_scheduled"
+    if listing_date and listing_date > today:
+        return "listing_scheduled"
+    if payment_date and payment_date < today:
+        return "listing_date_pending"
+    if apply_date and apply_date < today:
+        return "post_subscription_schedule_pending"
+    return "schedule_pending"
+
+
+def ipo_market_rules(row: dict[str, Any]) -> dict[str, Any]:
+    market = str(row.get("MARKET") or row.get("TRADE_MARKET") or "")
+    is_beijing = "北交所" in market or int(to_number(row.get("IS_BEIJING")) or 0) == 1
+    if is_beijing:
+        return {
+            "exchange": "BSE",
+            "required_permission": "bse_qualified_investor_permission",
+            "subscription_method": "full_cash_subscription",
+            "minimum_same_market_average_value_cny": None,
+            "market_value_per_subscription_unit_cny": None,
+            "market_value_calculation": None,
+            "eligible_securities_scope": None,
+            "subscription_unit_shares": int(to_number(row.get("EACHBALLOT_SHARES")) or 100),
+            "funding_timing": "full_subscription_cash_required_on_subscription_day",
+            "official_rule_url": IPO_RULE_SOURCES["bse"],
+        }
+    exchange = "SSE" if "上交所" in market or str(row.get("SECURITY_CODE") or "").startswith("6") else "SZSE"
+    required_permission = "corresponding_a_share_market_account"
+    if "科创板" in market:
+        required_permission = "star_market_trading_permission"
+    elif "创业板" in market:
+        required_permission = "chinext_trading_permission"
+    return {
+        "exchange": exchange,
+        "required_permission": required_permission,
+        "subscription_method": "same_market_value_subscription",
+        "minimum_same_market_average_value_cny": 10000,
+        "market_value_per_subscription_unit_cny": 5000,
+        "market_value_calculation": "average eligible same-market holdings over the 20 trading days through T-2",
+        "eligible_securities_scope": "same-market non-restricted A shares and non-restricted depositary receipts; ETFs, funds, bonds, B shares and other products are excluded",
+        "subscription_unit_shares": 500,
+        "funding_timing": "no_upfront_subscription_cash; winning_allocation_payment_on_published_payment_date",
+        "official_rule_url": IPO_RULE_SOURCES["sse" if exchange == "SSE" else "szse"],
+    }
+
+
+def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[str, Any]:
+    today = datetime.now(MARKET_TIMEZONE).date().isoformat()
+    rules = ipo_market_rules(row)
+    issue_price = to_number(row.get("ISSUE_PRICE") or row.get("ONLINE_APPLY_PRICE"))
+    online_apply_upper = to_number(row.get("ONLINE_APPLY_UPPER"))
+    unit_shares = int(rules["subscription_unit_shares"])
+    pending_fields = [
+        field
+        for field, value in (
+            ("issue_price", issue_price),
+            ("listing_date", ipo_calendar_date(row.get("LISTING_DATE"))),
+            ("online_subscription_limit_shares", online_apply_upper),
+        )
+        if value is None
+    ]
+    item = {
+        "security_code": clean_value(row.get("SECURITY_CODE")),
+        "security_name": clean_value(row.get("SECURITY_NAME_ABBR") or row.get("SECURITY_NAME")),
+        "subscription_code": clean_value(row.get("APPLY_CODE")),
+        "market": clean_value(row.get("MARKET") or row.get("TRADE_MARKET"))
+        or ({"SSE": "上海证券交易所", "SZSE": "深圳证券交易所", "BSE": "北京证券交易所"}[rules["exchange"]]),
+        "subscription_stage": ipo_subscription_stage(row, today),
+        "subscription_date": ipo_calendar_date(row.get("APPLY_DATE")),
+        "allocation_number_date": ipo_calendar_date(row.get("ASSIGN_DATE")),
+        "ballot_result_date": ipo_calendar_date(row.get("BALLOT_NUM_DATE") or row.get("RESULT_NOTICE_DATE")),
+        "payment_date": ipo_calendar_date(row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE")),
+        "listing_date": ipo_calendar_date(row.get("LISTING_DATE")),
+        "issue_price_cny": issue_price,
+        "online_subscription_limit_shares": int(online_apply_upper) if online_apply_upper is not None else None,
+        "subscription_unit_shares": unit_shares,
+        "maximum_subscription_cash_cny": (
+            round(online_apply_upper * issue_price, 2)
+            if online_apply_upper is not None and issue_price is not None
+            else None
+        ),
+        "maximum_subscription_market_value_requirement_cny": (
+            int(online_apply_upper / unit_shares * rules["market_value_per_subscription_unit_cny"])
+            if online_apply_upper is not None
+            and rules["market_value_per_subscription_unit_cny"] is not None
+            else None
+        ),
+        "eligibility_rules": rules,
+        "personal_eligibility_status": "not_evaluated_without_brokerage_account_and_permissions",
+        "pending_fields": pending_fields,
+        "source_updated_at": ipo_calendar_date(row.get("UP_DATE")),
+    }
+    if detail_level == "raw":
+        item.update(
+            {
+                "online_issue_shares": int(to_number(row.get("ONLINE_ISSUE_NUM")) or 0) or None,
+                "issue_method": clean_value(row.get("ISSUE_WAY")),
+                "main_business": clean_value(row.get("MAIN_BUSINESS")),
+                "provider_information_code": clean_value(row.get("INFO_CODE")),
+                "provider_issue_state": clean_value(row.get("ISSUE_STATE")),
+            }
+        )
+    return item
+
+
+def get_ipo_subscription_status_data(
+    symbol_or_name: str | None,
+    days_ahead: int,
+    days_back: int,
+    limit: int,
+    detail_level: str,
+) -> dict[str, Any]:
+    query = normalize_ipo_query(symbol_or_name)
+    rows = get_eastmoney_ipo_calendar_rows(query, 100 if query is None else limit)
+    today = datetime.now(MARKET_TIMEZONE).date()
+    range_start = (today - timedelta(days=days_back)).isoformat()
+    range_end = (today + timedelta(days=days_ahead)).isoformat()
+    if query:
+        selected = rows[:limit]
+    else:
+        selected = [
+            row
+            for row in rows
+            if (apply_date := ipo_calendar_date(row.get("APPLY_DATE")))
+            and range_start <= apply_date <= range_end
+        ][:limit]
+    if query and not selected:
+        raise HTTPException(status_code=404, detail=f"No public IPO calendar record found for {query}.")
+    items = [build_ipo_subscription_item(row, detail_level) for row in selected]
+    pending_fields = sorted(
+        {
+            f"{item.get('security_code') or item.get('security_name')}:{field}"
+            for item in items
+            for field in item.get("pending_fields") or []
+        }
+    )
+    source_update_dates = sorted(
+        str(item["source_updated_at"])
+        for item in items
+        if item.get("source_updated_at")
+    )
+    return {
+        "query": query,
+        "schedule_range": {"start": range_start, "end": range_end} if query is None else None,
+        "count": len(items),
+        "items": items,
+        "personalized_eligibility": "not_available_without_brokerage_account_market_value_and_board_permissions",
+        "rule_source_urls": sorted({item["eligibility_rules"]["official_rule_url"] for item in items}),
+        "source": ["eastmoney_public_ipo_calendar"],
+        "source_updated_at": source_update_dates[-1] if source_update_dates else None,
+        "source_errors": [],
+        "missing_fields": pending_fields,
+        "detail_level": detail_level,
+        "data_status": "partial_data" if pending_fields else "full_data",
+        "queried_at": now_iso(),
+        "note": "Public schedule and rule facts only. Issue price, listing date, and issuer limits can be pending or revised; confirm the latest issuer announcement and brokerage screen before submitting. The tool cannot see account market value, permissions, prior applications, or winning allocations.",
+    }
+
+
 FUND_API_BASE = "https://fundmobapi.eastmoney.com/FundMNewApi"
 FUND_API_DEVICE_ID = "00000000-0000-0000-0000-000000000000"
 
@@ -7924,6 +8188,52 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
     return run_cached_tool(
         "get_a_share_financials", {"symbol": symbol, "limit": normalized_limit}, 21600,
         lambda: get_financial_data(symbol, normalized_limit), symbol,
+    )
+
+
+@mcp.tool(
+    name="get_ipo_subscription_status",
+    title="Get public IPO subscription and listing status",
+    description=(
+        "Look up an exact IPO stock code or company name, or list the recent and upcoming public IPO calendar. "
+        "Returns the subscription code, issue price, subscription/allocation/payment/listing dates, issuer limit, "
+        "board permission, same-market value or BSE cash-subscription rules, pending fields, and official rule links. "
+        "It cannot inspect an account, confirm personal eligibility, application history, or winning allocation."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def get_ipo_subscription_status(
+    symbol_or_name: str | None = None,
+    days_ahead: int = 30,
+    days_back: int = 7,
+    limit: int = 20,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
+    try:
+        query = normalize_ipo_query(symbol_or_name)
+    except HTTPException as exc:
+        return mcp_error(None, exc)
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
+    normalized_ahead = max(0, min(days_ahead, 90))
+    normalized_back = max(0, min(days_back, 90))
+    normalized_limit = max(1, min(limit, 50))
+    parameters = {
+        "symbol_or_name": query,
+        "days_ahead": normalized_ahead,
+        "days_back": normalized_back,
+        "limit": normalized_limit,
+        "detail_level": detail_level,
+    }
+    return run_cached_tool(
+        "get_ipo_subscription_status",
+        parameters,
+        300,
+        lambda: get_ipo_subscription_status_data(**parameters),
+        max_stale_age_seconds=86400,
     )
 
 
