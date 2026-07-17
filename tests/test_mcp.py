@@ -2126,6 +2126,36 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
     assert normalized[0]["asset_type"] == "fund"
     assert normalized[1]["asset_type"] == "stock"
 
+    original_component = market_app.get_eastmoney_fund_component
+    market_app.get_eastmoney_fund_component = lambda _code, endpoint: (
+        {
+            "Datas": {
+                "fundStocks": [
+                    {
+                        "GPDM": "00700",
+                        "GPJC": "Tencent",
+                        "JZBL": "5",
+                        "TEXCH": "116",
+                    }
+                ]
+            },
+            "Expansion": "2026-03-31",
+        }
+        if endpoint == "FundMNInverstPosition"
+        else {"Datas": [{"GP": "5", "FSRQ": "2026-03-31"}]}
+        if endpoint == "FundMNAssetAllocationNew"
+        else {"Datas": {}}
+        if endpoint == "FundMNNBasicInformation"
+        else {"Datas": []}
+    )
+    try:
+        foreign = market_app.get_fund_exposure_data("008888", 10, "raw")
+        assert foreign["top_holdings"][0]["identifier"] == "116:00700"
+        assert foreign["top_holdings"][0]["symbol"] is None
+        assert foreign["top_holdings"][0]["provider_security_code"] == "00700"
+    finally:
+        market_app.get_eastmoney_fund_component = original_component
+
     original_fund = market_app.get_fund_exposure_data
     original_reference = market_app.get_resilient_security_reference_data
     market_app.get_fund_exposure_data = fake_get_fund_exposure_data
@@ -2153,6 +2183,31 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         assert result["overlapping_underlyings"][0]["source_position_count"] == 2
         assert result["industry_exposure"][0]["exposure_pct"] == 46.0
         assert result["fund_reported_industry_exposure"][0]["exposure_pct"] == 48.0
+
+        def partial_fund(code: str, limit: int, level: str) -> dict:
+            payload = fake_get_fund_exposure_data(code, limit, level)
+            payload["data_status"] = "partial_data"
+            payload["missing_fields"] = ["industry_distribution"]
+            payload["source_errors"] = [
+                {
+                    "source": "child_test",
+                    "error_type": "upstream_failure",
+                    "message": "partial child",
+                }
+            ]
+            return payload
+
+        market_app.get_fund_exposure_data = partial_fund
+        partial = market_app.get_portfolio_exposure_data(
+            [{"identifier": "512760", "weight_pct": 100}],
+            False,
+            10,
+            "summary",
+        )
+        assert partial["data_status"] == "partial_data"
+        assert partial["partial_child_components"] == ["fund:512760"]
+        assert "fund:512760:industry_distribution" in partial["missing_fields"]
+        assert partial["source_errors"][0]["source"] == "fund:512760/child_test"
     finally:
         market_app.get_fund_exposure_data = original_fund
         market_app.get_resilient_security_reference_data = original_reference
