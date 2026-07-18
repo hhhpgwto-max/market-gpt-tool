@@ -861,9 +861,9 @@ def staleness_basis_for(
     if is_stale:
         return "current_session_freshness_window"
     if parsed is not None:
-        if market_status != "open" and parsed.hour == 15 and parsed.minute == 0:
+        if market_status not in {"open", "lunch_break"} and parsed.hour == 15 and parsed.minute == 0:
             return "completed_session_final"
-        if market_status == "open" and parsed.date() == now.date():
+        if market_status in {"open", "lunch_break"} and parsed.date() == now.date():
             return "current_session_observation"
         return "latest_available_market_observation"
     if trade_date:
@@ -904,7 +904,11 @@ def standardize_tool_success(
         is_stale = is_market_time_stale(market_time)
         if is_stale:
             stale_reason = "market_time_lags_current_trading_session"
-    elif trade_date and market_status == "open" and trade_date < datetime.now(MARKET_TIMEZONE).date().isoformat():
+    elif (
+        trade_date
+        and market_status in {"open", "lunch_break"}
+        and trade_date < datetime.now(MARKET_TIMEZONE).date().isoformat()
+    ):
         is_stale = True
         stale_reason = "previous_trade_day_data_during_open_market"
 
@@ -5663,16 +5667,24 @@ def latest_market_time(indices: list[dict[str, Any]]) -> str | None:
     return max(timestamps) if timestamps else None
 
 
-def is_market_time_stale(market_time: str | None) -> bool:
-    now = datetime.now(MARKET_TIMEZONE)
-    if market_status_at(now) != "open":
+def is_market_time_stale(
+    market_time: str | None, now: datetime | None = None
+) -> bool:
+    now = now or datetime.now(MARKET_TIMEZONE)
+    status = market_status_at(now)
+    if status not in {"open", "lunch_break"}:
         return False
     source_time = parse_market_datetime(market_time)
     if source_time is None:
         return True
     if source_time.date() != now.date():
         return True
-    return now - source_time > timedelta(minutes=10)
+    freshness_reference = (
+        now.replace(hour=11, minute=30, second=0, microsecond=0)
+        if status == "lunch_break"
+        else now
+    )
+    return freshness_reference - source_time > timedelta(minutes=10)
 
 
 def get_cached_sector_board_component(sector_type: str) -> dict[str, Any]:

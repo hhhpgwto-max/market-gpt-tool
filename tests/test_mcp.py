@@ -839,6 +839,28 @@ def test_quote_timestamp_semantics() -> None:
     assert result["quote_time"] == "2026-07-10T15:00:00+08:00"
     assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
 
+    lunch_time = market_app.datetime(
+        2026, 7, 17, 12, 0, tzinfo=market_app.MARKET_TIMEZONE
+    )
+    assert market_app.is_market_time_stale(
+        "2026-07-16T15:00:00+08:00", lunch_time
+    )
+    assert not market_app.is_market_time_stale(
+        "2026-07-17T11:30:00+08:00", lunch_time
+    )
+    assert market_app.is_market_time_stale(
+        "2026-07-17T11:00:00+08:00", lunch_time
+    )
+    assert (
+        market_app.staleness_basis_for(
+            "2026-07-16T15:00:00+08:00",
+            "2026-07-16",
+            "lunch_break",
+            True,
+        )
+        == "current_session_freshness_window"
+    )
+
 
 def test_industry_board_parser() -> None:
     original_json = market_app.read_public_json
