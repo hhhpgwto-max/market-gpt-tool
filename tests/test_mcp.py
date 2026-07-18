@@ -839,6 +839,28 @@ def test_quote_timestamp_semantics() -> None:
     assert result["quote_time"] == "2026-07-10T15:00:00+08:00"
     assert result["source_updated_at"] == "2026-07-10T16:14:42+08:00"
 
+    lunch_time = market_app.datetime(
+        2026, 7, 17, 12, 0, tzinfo=market_app.MARKET_TIMEZONE
+    )
+    assert market_app.is_market_time_stale(
+        "2026-07-16T15:00:00+08:00", lunch_time
+    )
+    assert not market_app.is_market_time_stale(
+        "2026-07-17T11:30:00+08:00", lunch_time
+    )
+    assert market_app.is_market_time_stale(
+        "2026-07-17T11:00:00+08:00", lunch_time
+    )
+    assert (
+        market_app.staleness_basis_for(
+            "2026-07-16T15:00:00+08:00",
+            "2026-07-16",
+            "lunch_break",
+            True,
+        )
+        == "current_session_freshness_window"
+    )
+
 
 def test_industry_board_parser() -> None:
     original_json = market_app.read_public_json
@@ -1420,7 +1442,7 @@ def test_intraday_and_index_fallback_parsers() -> None:
         market_app.get_eastmoney_industry_boards = lambda _: [
             {"symbol": "BK0001", "name": "Test Industry", "price": 100, "change_pct": 1.5, "change": 1.48}
         ]
-        market_app.get_all_realtime_quotes = lambda: market_app.pd.DataFrame()
+        market_app.get_all_realtime_quotes = lambda: types.SimpleNamespace(empty=True)
         fields = [""] * 35
         fields[1:6] = ["Test Index", "000001", "100.0", "99.0", "99.5"]
         fields[30:33] = ["20260710150000", "1.0", "1.01"]
@@ -1708,6 +1730,7 @@ def test_reliability_envelope_cache_and_health() -> None:
             "symbol": "600519",
             "source": "eastmoney",
             "market_time": "2026-07-10T15:00:00+08:00",
+            "queried_at": "2026-07-10T15:00:03+08:00",
         }
 
     key = market_app.cache_key("test", {"symbol": "600519"})
@@ -1718,12 +1741,28 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert first_cache["cache_hit"] is False
     assert second_cache["cache_hit"] is True
 
-    result = market_app.standardize_tool_success(first, market_app.perf_counter(), second_cache)
+    original_market_status_at = market_app.market_status_at
+    market_app.market_status_at = lambda *_: "closed"
+    try:
+        result = market_app.standardize_tool_success(
+            first, market_app.perf_counter(), second_cache
+        )
+    finally:
+        market_app.market_status_at = original_market_status_at
     assert result["ok"] is True
     assert result["source"] == ["eastmoney"]
     assert result["cache_hit"] is True
     assert result["data"]["symbol"] == "600519"
     assert "latency_ms" in result
+    assert result["effective_market_time"] == "2026-07-10T15:00:00+08:00"
+    assert result["source_fetch_time"] == "2026-07-10T15:00:03+08:00"
+    assert result["tool_queried_at"] == result["queried_at"]
+    assert result["tool_queried_at"] != result["source_fetch_time"]
+    assert result["staleness_basis"] == "completed_session_final"
+    assert result["data"]["effective_market_time"] == result["effective_market_time"]
+    assert result["data"]["source_fetch_time"] == result["source_fetch_time"]
+    assert result["data"]["tool_queried_at"] == result["tool_queried_at"]
+    assert result["data"]["staleness_basis"] == result["staleness_basis"]
 
     market_app.TOOL_CACHE[key]["created_at"] = market_app.datetime.now(
         market_app.timezone.utc
@@ -1743,6 +1782,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert stale["ok"] is True
     assert stale["is_stale"] is True
     assert stale["stale_reason"] == "live_sources_failed_using_recent_cache"
+    assert stale["staleness_basis"] == "recent_success_cache_after_live_source_failure"
     assert stale["served_from_stale_cache"] is True
     assert stale["cache_hit"] is True
 
@@ -1775,7 +1815,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "decision_follow_up_tools_v1"
+    assert health["routing_revision"] == "explicit_time_semantics_lazy_startup_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2596,7 +2636,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "decision_follow_up_tools_v1"
+        assert health.json()["routing_revision"] == "explicit_time_semantics_lazy_startup_v1"
 
         for legacy_path in (
             "/search?keyword=600000",

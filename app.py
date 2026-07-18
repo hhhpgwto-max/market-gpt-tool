@@ -18,8 +18,6 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree  # nosec B405
 
-import efinance as ef
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
@@ -28,12 +26,12 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "decision_follow_up_tools_v1"
+ROUTING_REVISION = "explicit_time_semantics_lazy_startup_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
-    "anomaly scans, relative strength, historical context, security status, GPT decision-context evidence packets, "
+    "anomaly scans, relative strength, historical context, security status, multi-source market evidence packets, "
     "sector rankings and rotation history, overnight cross-market observations, company event timelines, fund "
     "look-through holdings, portfolio exposure aggregation, and "
     "public IPO subscription schedules and eligibility rules, and "
@@ -51,8 +49,9 @@ MCP_INSTRUCTIONS = (
     "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
     "for current company events. News results are evidence with provenance, not positive/negative judgements. "
     "Use get_a_share_limit_activity for public limit-up, limit-down, open-board, and consecutive-board facts. "
-    "Do not convert those mechanical counts into sentiment or trading labels unless the user explicitly interprets them. "
-    "All data is informational only and is not investment advice."
+    "Do not convert those mechanical counts into sentiment or trading labels. Never place trades, access brokerage "
+    "accounts, issue buy/sell recommendations, or make automated financial decisions. All data is informational only "
+    "and is not investment advice."
 )
 
 READ_ONLY_TOOL = ToolAnnotations(
@@ -850,12 +849,33 @@ def infer_trade_date(data: dict[str, Any], market_time: str | None) -> str | Non
     return market_time[:10] if market_time and len(market_time) >= 10 else None
 
 
+def staleness_basis_for(
+    market_time: str | None,
+    trade_date: str | None,
+    market_status: str,
+    is_stale: bool,
+) -> str:
+    """Explain which market-time state the stale flag is evaluated against."""
+    parsed = parse_market_datetime(market_time)
+    now = datetime.now(MARKET_TIMEZONE)
+    if is_stale:
+        return "current_session_freshness_window"
+    if parsed is not None:
+        if market_status not in {"open", "lunch_break"} and parsed.hour == 15 and parsed.minute == 0:
+            return "completed_session_final"
+        if market_status in {"open", "lunch_break"} and parsed.date() == now.date():
+            return "current_session_observation"
+        return "latest_available_market_observation"
+    if trade_date:
+        return "trade_date_only"
+    return "unavailable"
+
+
 def standardize_tool_success(
     data: dict[str, Any], started_at: float, cache: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    queried_at = now_iso()
+    tool_queried_at = now_iso()
     content = deepcopy(data)
-    content["queried_at"] = queried_at
     content.setdefault(
         "snapshot_id",
         f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
@@ -884,26 +904,56 @@ def standardize_tool_success(
         is_stale = is_market_time_stale(market_time)
         if is_stale:
             stale_reason = "market_time_lags_current_trading_session"
-    elif trade_date and market_status == "open" and trade_date < datetime.now(MARKET_TIMEZONE).date().isoformat():
+    elif (
+        trade_date
+        and market_status in {"open", "lunch_break"}
+        and trade_date < datetime.now(MARKET_TIMEZONE).date().isoformat()
+    ):
         is_stale = True
         stale_reason = "previous_trade_day_data_during_open_market"
 
     cache = cache or {
         "cache_hit": False,
-        "cache_created_at": queried_at,
+        "cache_created_at": tool_queried_at,
         "cache_age_seconds": 0.0,
     }
+    source_fetch_time = (
+        content.get("source_fetch_time")
+        or content.get("queried_at")
+        or cache.get("cache_created_at")
+        or tool_queried_at
+    )
+    staleness_basis = staleness_basis_for(
+        market_time,
+        trade_date,
+        market_status,
+        is_stale,
+    )
+    content.update(
+        {
+            "effective_market_time": market_time,
+            "source_fetch_time": source_fetch_time,
+            "tool_queried_at": tool_queried_at,
+            "staleness_basis": staleness_basis,
+            # Backward-compatible alias. New callers should use tool_queried_at.
+            "queried_at": tool_queried_at,
+        }
+    )
     result = {"ok": True, **content}
     result.update(
         {
             "market_status": market_status,
             "trade_date": trade_date,
+            "effective_market_time": market_time,
             "market_time": market_time,
-            "queried_at": queried_at,
+            "source_fetch_time": source_fetch_time,
+            "tool_queried_at": tool_queried_at,
+            "queried_at": tool_queried_at,
             "source": normalize_sources(content.get("source")),
             "source_errors": normalize_source_errors(content.get("source_errors")),
             "is_stale": is_stale,
             "stale_reason": stale_reason,
+            "staleness_basis": staleness_basis,
             "data_age_seconds": round(source_age_seconds, 3)
             if source_age_seconds is not None
             else cache["cache_age_seconds"],
@@ -974,14 +1024,21 @@ def market_time_from_source_update(source_updated_at: str | None) -> str | None:
 
 
 def clean_value(value: Any) -> Any:
-    if pd.isna(value):
+    if value is None:
         return None
+    if type(value).__name__ in {"NAType", "NaTType"}:
+        return None
+    try:
+        if bool(value != value):
+            return None
+    except (TypeError, ValueError):
+        pass
     if hasattr(value, "item"):
         return value.item()
     return value
 
 
-def row_to_dict(row: pd.Series, columns: dict[str, str]) -> dict[str, Any]:
+def row_to_dict(row: Any, columns: dict[str, str]) -> dict[str, Any]:
     available_columns = getattr(row, "index", row)
     return {
         output_key: clean_value(row.get(input_key))
@@ -1280,8 +1337,13 @@ def normalize_quote_units(quote: dict[str, Any], source: str) -> dict[str, Any]:
     return quote
 
 
-def get_all_realtime_quotes() -> pd.DataFrame:
+def get_all_realtime_quotes() -> Any:
     try:
+        # efinance imports pandas and numpy. Keep that heavy import off the
+        # process-start path so /health and MCP discovery can answer sooner on
+        # a sleeping free Render instance. This fallback loads it on first use.
+        import efinance as ef
+
         data = ef.stock.get_realtime_quotes()
     except Exception as exc:
         raise HTTPException(
@@ -5605,16 +5667,24 @@ def latest_market_time(indices: list[dict[str, Any]]) -> str | None:
     return max(timestamps) if timestamps else None
 
 
-def is_market_time_stale(market_time: str | None) -> bool:
-    now = datetime.now(MARKET_TIMEZONE)
-    if market_status_at(now) != "open":
+def is_market_time_stale(
+    market_time: str | None, now: datetime | None = None
+) -> bool:
+    now = now or datetime.now(MARKET_TIMEZONE)
+    status = market_status_at(now)
+    if status not in {"open", "lunch_break"}:
         return False
     source_time = parse_market_datetime(market_time)
     if source_time is None:
         return True
     if source_time.date() != now.date():
         return True
-    return now - source_time > timedelta(minutes=10)
+    freshness_reference = (
+        now.replace(hour=11, minute=30, second=0, microsecond=0)
+        if status == "lunch_break"
+        else now
+    )
+    return freshness_reference - source_time > timedelta(minutes=10)
 
 
 def get_cached_sector_board_component(sector_type: str) -> dict[str, Any]:
@@ -8007,14 +8077,17 @@ def get_market_data_health_data() -> dict[str, Any]:
 def mcp_error(
     symbol: str | None, exc: HTTPException, started_at: float | None = None
 ) -> dict[str, Any]:
-    queried_at = now_iso()
+    tool_queried_at = now_iso()
     message = str(exc.detail)
     result: dict[str, Any] = {
         "ok": False,
         "market_status": market_status_at(),
         "trade_date": None,
+        "effective_market_time": None,
         "market_time": None,
-        "queried_at": queried_at,
+        "source_fetch_time": None,
+        "tool_queried_at": tool_queried_at,
+        "queried_at": tool_queried_at,
         "source": [],
         "source_errors": [
             {
@@ -8025,6 +8098,7 @@ def mcp_error(
         ],
         "is_stale": False,
         "stale_reason": None,
+        "staleness_basis": "unavailable",
         "data_age_seconds": None,
         "latency_ms": int((perf_counter() - started_at) * 1000) if started_at else 0,
         "cache_hit": False,
@@ -8077,6 +8151,8 @@ def run_cached_tool(
             result = standardize_tool_success(data, started_at, cache)
             result["is_stale"] = True
             result["stale_reason"] = "live_sources_failed_using_recent_cache"
+            result["staleness_basis"] = "recent_success_cache_after_live_source_failure"
+            result["data"]["staleness_basis"] = result["staleness_basis"]
             return result
         return mcp_error(symbol, exc, started_at)
     return standardize_tool_success(data, started_at, cache)
@@ -8633,12 +8709,12 @@ def get_a_share_security_status(symbol: str) -> dict[str, Any]:
 
 @mcp.tool(
     name="get_a_share_decision_context",
-    title="Get an evidence packet for GPT judgement",
+    title="Get a multi-source market evidence packet",
     description=(
         "Concurrently gather quote, compact intraday structure, historical context, security status, relative strength, "
         "official announcements, financials, and market overview. Returns evidence and missing-data reasons only; "
         "when a component misses the response budget it also returns exact recommended follow-up tool calls. "
-        "GPT remains responsible for judgement."
+        "It does not produce a recommendation, score, trade, or automated financial decision."
     ),
     annotations=READ_ONLY_TOOL,
 )
