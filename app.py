@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "explicit_time_semantics_lazy_startup_v1"
+ROUTING_REVISION = "fund_look_through_explicit_units_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -184,6 +184,10 @@ QUOTE_RESPONSE_FIELDS = (
     "volume_unit",
     "turnover",
     "turnover_unit",
+    "total_market_value",
+    "total_market_value_unit",
+    "circulating_market_value",
+    "circulating_market_value_unit",
 )
 
 KLINE_RESPONSE_FIELDS = (
@@ -1324,16 +1328,30 @@ def get_fallback_quote(symbol: str) -> tuple[dict[str, Any], str]:
 def normalize_quote_units(quote: dict[str, Any], source: str) -> dict[str, Any]:
     volume = to_number(quote.get("volume"))
     turnover = to_number(quote.get("turnover"))
+    total_market_value = to_number(quote.get("total_market_value"))
+    circulating_market_value = to_number(quote.get("circulating_market_value"))
 
     if volume is not None and source in {"efinance", "eastmoney", "tencent"}:
         volume *= 100
     if turnover is not None and source == "tencent":
         turnover *= 10_000
+    # Tencent publishes both market-cap fields in 100 million CNY, while the
+    # Eastmoney route already publishes raw CNY. Normalize the public contract
+    # so callers never have to infer a unit from the selected fallback source.
+    if source == "tencent":
+        if total_market_value is not None:
+            total_market_value *= 100_000_000
+        if circulating_market_value is not None:
+            circulating_market_value *= 100_000_000
 
     quote["volume"] = volume
     quote["volume_unit"] = "share"
     quote["turnover"] = turnover
     quote["turnover_unit"] = "CNY"
+    quote["total_market_value"] = total_market_value
+    quote["total_market_value_unit"] = "CNY"
+    quote["circulating_market_value"] = circulating_market_value
+    quote["circulating_market_value_unit"] = "CNY"
     return quote
 
 
@@ -1623,7 +1641,9 @@ def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]
         "turnover_rate": to_number(row.get("f8")),
         "volume_ratio": to_number(row.get("f10")),
         "total_market_value": to_number(row.get("f20")),
+        "total_market_value_unit": "CNY",
         "circulating_market_value": to_number(row.get("f21")),
+        "circulating_market_value_unit": "CNY",
         "market_time": market_time,
         "source": "eastmoney_batch",
     }
@@ -6075,6 +6095,75 @@ OVERNIGHT_SINA_INSTRUMENTS = {
     "nasdaq_composite": ("gb_ixic", "global_index"),
 }
 
+OVERNIGHT_INSTRUMENT_METADATA = {
+    "shanghai_copper_continuous": {
+        "venue": "SHFE",
+        "instrument_type": "futures_continuous_quote",
+        "quote_currency": "CNY",
+        "price_unit": "CNY_per_metric_tonne",
+        "contract_size": 5,
+        "contract_size_unit": "metric_tonne",
+        "contract_spec_status": "standard_contract_spec_continuous_provider_quote",
+        "contract_spec_source": "https://www.shfe.com.cn/regulation/exchangerules/productrules/202512/t20251231_829954.html",
+    },
+    "lme_copper": {
+        "venue": "LME",
+        "instrument_type": "futures_provider_quote",
+        "quote_currency": "USD",
+        "price_unit": "USD_per_metric_tonne",
+        "contract_size": 25,
+        "contract_size_unit": "metric_tonne",
+        "contract_spec_status": "standard_contract_spec_provider_code_has_no_expiry",
+        "contract_spec_source": "https://www.lme.com/en/metals/non-ferrous/lme-copper",
+    },
+    "comex_copper": {
+        "venue": "COMEX",
+        "instrument_type": "futures_provider_quote",
+        "quote_currency": "USD",
+        "price_unit": "US_cent_per_pound",
+        "contract_size": 25_000,
+        "contract_size_unit": "pound",
+        "contract_spec_status": "standard_HG_contract_spec_provider_code_has_no_expiry",
+        "contract_spec_source": "https://www.cmegroup.com/trading/metals/files/copper-futures-and-options.pdf",
+    },
+    "usd_cny_onshore": {
+        "venue": "onshore_fx",
+        "instrument_type": "foreign_exchange",
+        "base_currency": "USD",
+        "quote_currency": "CNY",
+        "price_unit": "CNY_per_USD",
+        "contract_spec_status": "not_applicable",
+    },
+    "nasdaq_100_futures": {
+        "venue": "provider_global_futures_feed",
+        "instrument_type": "index_futures_provider_quote",
+        "quote_currency": "USD",
+        "price_unit": "index_points",
+        "contract_spec_status": "provider_code_does_not_identify_expiry_or_multiplier",
+    },
+    "ftse_china_a50_futures": {
+        "venue": "provider_global_futures_feed",
+        "instrument_type": "index_futures_provider_quote",
+        "quote_currency": "USD",
+        "price_unit": "index_points",
+        "contract_spec_status": "provider_code_does_not_identify_expiry_or_multiplier",
+    },
+    "hang_seng_index_futures": {
+        "venue": "provider_global_futures_feed",
+        "instrument_type": "index_futures_provider_quote",
+        "quote_currency": "HKD",
+        "price_unit": "index_points",
+        "contract_spec_status": "provider_code_does_not_identify_expiry_or_multiplier",
+    },
+    "nasdaq_composite": {
+        "venue": "NASDAQ",
+        "instrument_type": "cash_index",
+        "quote_currency": None,
+        "price_unit": "index_points",
+        "contract_spec_status": "not_applicable",
+    },
+}
+
 
 def parse_sina_overnight_record(identifier: str, category: str, values: list[str]) -> dict[str, Any] | None:
     if not values or not any(str(value).strip() for value in values):
@@ -6151,6 +6240,7 @@ def get_sina_overnight_observations() -> dict[str, dict[str, Any]]:
                 "identifier": name,
                 "provider_code": code,
                 "market_group": category,
+                **OVERNIGHT_INSTRUMENT_METADATA.get(name, {}),
                 **parsed,
                 "source": "sina_public_quote",
             }
@@ -6185,7 +6275,28 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
     items = list(observations.values())
     if detail_level == "summary":
         items = [
-            {key: item.get(key) for key in ("identifier", "name", "price", "change", "change_pct", "market_time", "reference_type", "source")}
+            {
+                key: item.get(key)
+                for key in (
+                    "identifier",
+                    "name",
+                    "provider_code",
+                    "venue",
+                    "instrument_type",
+                    "price",
+                    "price_unit",
+                    "quote_currency",
+                    "contract_size",
+                    "contract_size_unit",
+                    "contract_spec_status",
+                    "contract_spec_source",
+                    "change",
+                    "change_pct",
+                    "market_time",
+                    "reference_type",
+                    "source",
+                )
+            }
             for item in items
         ]
     return {
@@ -6630,6 +6741,7 @@ def get_fund_exposure_data(
     fund_code: str,
     holdings_limit: int,
     detail_level: str,
+    look_through_depth: int = 1,
 ) -> dict[str, Any]:
     fund_code = normalize_fund_code(fund_code)
     loaders = {
@@ -6719,6 +6831,65 @@ def get_fund_exposure_data(
         "fund_pct": to_number(allocation_row.get("JJ")),
         "total_assets_100m_cny": to_number(allocation_row.get("JZC")),
     }
+    underlying_fund_code = (
+        clean_value(raw_holdings_container.get("ETFCODE"))
+        if isinstance(raw_holdings_container, dict)
+        else None
+    )
+    underlying_fund_name = (
+        clean_value(raw_holdings_container.get("ETFSHORTNAME"))
+        if isinstance(raw_holdings_container, dict)
+        else None
+    )
+    if (
+        not underlying_fund_code
+        or not SYMBOL_PATTERN.fullmatch(str(underlying_fund_code))
+        or str(underlying_fund_code) == fund_code
+    ):
+        underlying_fund_code = None
+        underlying_fund_name = None
+    underlying_fund_weight_pct = (
+        asset_allocation.get("fund_pct") if underlying_fund_code else None
+    )
+    look_through_holdings: list[dict[str, Any]] = []
+    look_through_source_errors: list[dict[str, Any]] = []
+    look_through_status = "not_applicable"
+    if underlying_fund_code:
+        look_through_status = "depth_limit_reached"
+        if look_through_depth > 0:
+            try:
+                underlying_payload = get_cached_fund_exposure_data(
+                    str(underlying_fund_code), holdings_limit, "raw", 0
+                )
+                for item in underlying_payload.get("top_holdings") or []:
+                    child_weight = to_number(item.get("weight_pct"))
+                    if child_weight is None or underlying_fund_weight_pct is None:
+                        continue
+                    look_through_holdings.append(
+                        {
+                            **item,
+                            "weight_pct": round(
+                                underlying_fund_weight_pct * child_weight / 100, 8
+                            ),
+                            "underlying_fund_holding_weight_pct": child_weight,
+                            "underlying_fund_code": str(underlying_fund_code),
+                        }
+                    )
+                look_through_source_errors = normalize_source_errors(
+                    underlying_payload.get("source_errors")
+                )
+                look_through_status = (
+                    "available" if look_through_holdings else "partial_data"
+                )
+            except HTTPException as exc:
+                look_through_status = "unavailable"
+                look_through_source_errors.append(
+                    {
+                        "source": f"underlying_fund:{underlying_fund_code}",
+                        "error_type": "upstream_failure",
+                        "message": str(exc.detail),
+                    }
+                )
     allocation_sum = sum(
         value or 0
         for key, value in asset_allocation.items()
@@ -6743,6 +6914,8 @@ def get_fund_exposure_data(
         missing_fields.append("industry_distribution")
     if not any(value is not None for key, value in asset_allocation.items() if key.endswith("_pct")):
         missing_fields.append("asset_allocation")
+    if underlying_fund_code and look_through_depth > 0 and not look_through_holdings:
+        missing_fields.append("look_through_holdings")
     detailed_holdings = holdings
     if detail_level == "summary":
         detailed_holdings = [
@@ -6764,7 +6937,7 @@ def get_fund_exposure_data(
         if isinstance(payload, dict)
         for error in normalize_source_errors(payload.get("source_errors"))
     ]
-    all_source_errors = [*source_errors, *nested_errors]
+    all_source_errors = [*source_errors, *nested_errors, *look_through_source_errors]
     return {
         "fund_code": fund_code,
         "fund_name": clean_value(basic.get("SHORTNAME")) if isinstance(basic, dict) else None,
@@ -6784,6 +6957,33 @@ def get_fund_exposure_data(
             sum(item["weight_pct"] for item in holdings), 4
         ),
         "holdings_scope": "latest_top_holdings_disclosed_by_public_fund_api_not_a_complete_position_book",
+        "underlying_fund_code": underlying_fund_code,
+        "underlying_fund_name": underlying_fund_name,
+        "underlying_fund_weight_pct": underlying_fund_weight_pct,
+        "look_through_holdings": (
+            look_through_holdings
+            if detail_level == "raw"
+            else [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "identifier",
+                        "symbol",
+                        "name",
+                        "weight_pct",
+                        "underlying_fund_holding_weight_pct",
+                        "underlying_fund_code",
+                        "provider_industry_name",
+                    )
+                }
+                for item in look_through_holdings
+            ]
+        ),
+        "look_through_holdings_reported_weight_pct": round(
+            sum(item["weight_pct"] for item in look_through_holdings), 8
+        ),
+        "look_through_status": look_through_status,
+        "look_through_scope": "one_explicit_provider_link_to_the_underlying_fund_then_its_latest_public_top_holdings_only",
         "industry_distribution": industries,
         "component_status": component_status,
         "source": ["eastmoney_public_fund_api"],
@@ -6796,12 +6996,15 @@ def get_fund_exposure_data(
             else "partial_data"
         ),
         "queried_at": now_iso(),
-        "note": "Latest disclosed fund facts only. Holdings may be limited to the public top holdings and can lag the current portfolio; weights are not recommendations.",
+        "note": "Latest disclosed fund facts only. For an explicitly linked feeder fund, look_through_holdings makes one bounded hop into the underlying fund and scales only its public top holdings; undisclosed positions are not inferred. Weights are not recommendations.",
     }
 
 
 def get_cached_fund_exposure_data(
-    fund_code: str, holdings_limit: int, detail_level: str
+    fund_code: str,
+    holdings_limit: int,
+    detail_level: str,
+    look_through_depth: int = 1,
 ) -> dict[str, Any]:
     normalized_code = normalize_fund_code(fund_code)
     return get_cached_component_with_stale(
@@ -6811,12 +7014,13 @@ def get_cached_fund_exposure_data(
                 "fund_code": normalized_code,
                 "holdings_limit": holdings_limit,
                 "detail_level": detail_level,
+                "look_through_depth": look_through_depth,
             },
         ),
         1800,
         86400,
         lambda: get_fund_exposure_data(
-            normalized_code, holdings_limit, detail_level
+            normalized_code, holdings_limit, detail_level, look_through_depth
         ),
     )
 
@@ -7064,6 +7268,33 @@ def get_portfolio_exposure_data(
                     known_underlying_industry_exposure.get(str(holding_industry), 0.0)
                     + contribution
                 )
+        look_through_contribution = 0.0
+        for holding in payload.get("look_through_holdings") or []:
+            effective_weight = to_number(holding.get("weight_pct"))
+            holding_identifier = clean_value(
+                holding.get("identifier")
+                or holding.get("provider_security_identifier")
+                or holding.get("symbol")
+            )
+            holding_symbol = clean_value(holding.get("symbol"))
+            if holding_identifier is None or effective_weight is None:
+                continue
+            contribution = weight * effective_weight / 100
+            look_through_contribution += contribution
+            add_underlying(
+                str(holding_identifier),
+                str(holding_symbol) if holding_symbol else None,
+                holding.get("name"),
+                contribution,
+                identifier,
+                "fund_underlying_fund_top_holding",
+            )
+            holding_industry = clean_value(holding.get("provider_industry_name"))
+            if holding_industry:
+                known_underlying_industry_exposure[str(holding_industry)] = (
+                    known_underlying_industry_exposure.get(str(holding_industry), 0.0)
+                    + contribution
+                )
         for industry in payload.get("industry_distribution") or []:
             industry_weight = to_number(industry.get("weight_pct"))
             industry_name = clean_value(industry.get("industry_name"))
@@ -7079,6 +7310,11 @@ def get_portfolio_exposure_data(
                 "name": payload.get("fund_name"),
                 "holdings_disclosure_date": payload.get("holdings_disclosure_date"),
                 "top_holdings_covered_portfolio_pct": round(holding_contribution, 8),
+                "underlying_fund_code": payload.get("underlying_fund_code"),
+                "look_through_status": payload.get("look_through_status"),
+                "look_through_covered_portfolio_pct": round(
+                    look_through_contribution, 8
+                ),
             }
         )
 
@@ -7155,13 +7391,13 @@ def get_portfolio_exposure_data(
         "fund_reported_industry_exposure": reported_fund_industries,
         "fund_reported_industry_exposure_scope": "portfolio-weighted broad industry allocations reported by each fund; direct stocks are excluded because their classification level is not comparable",
         "underlying_exposure": top_exposures,
-        "underlying_exposure_scope": "direct stocks plus each fund's latest publicly disclosed top holdings; undisclosed holdings are not inferred",
+        "underlying_exposure_scope": "direct stocks, each fund's public top holdings, and one explicitly linked underlying fund's public top holdings; undisclosed holdings are not inferred",
         "overlapping_underlyings": overlaps if detail_level == "raw" else overlaps[:10],
         "concentration": {
             "top_1_disclosed_underlying_pct": round(sum(top_values[:1]), 8),
             "top_5_disclosed_underlyings_pct": round(sum(top_values[:5]), 8),
             "top_10_disclosed_underlyings_pct": round(sum(top_values[:10]), 8),
-            "scope": "known direct stocks and disclosed fund top holdings only",
+            "scope": "known direct stocks and disclosed top holdings, including one explicit underlying-fund hop",
         },
         "fund_disclosure_dates": fund_disclosure_dates,
         "component_status": component_status,
@@ -8180,7 +8416,7 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
 @mcp.tool(
     name="get_a_share_quote",
     title="Get a stock or listed-fund quote",
-    description="Get the latest available price, daily change, trading range, volume, and turnover for one A-share stock, ETF, or LOF code.",
+    description="Get the latest available price, daily change, trading range, volume, turnover, and available market values for one A-share stock, ETF, or LOF code. Monetary fields carry explicit CNY units.",
     annotations=READ_ONLY_TOOL,
 )
 def get_a_share_quote(symbol: str) -> dict[str, Any]:
@@ -8487,7 +8723,9 @@ def get_ipo_subscription_status(
     description=(
         "Get the latest publicly disclosed top holdings, provider industry distribution, stock/bond/cash/other "
         "allocation, disclosure dates, and coverage limits for one six-digit ETF, LOF, or public fund code. "
-        "Holdings can lag and may not cover the complete portfolio; missing data is not inferred."
+        "When the provider explicitly identifies a feeder fund's underlying fund, make one bounded look-through "
+        "hop and scale that underlying fund's public top holdings. Holdings can lag and may not cover the "
+        "complete portfolio; missing data is not inferred."
     ),
     annotations=READ_ONLY_TOOL,
 )
