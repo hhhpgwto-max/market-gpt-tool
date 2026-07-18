@@ -1852,7 +1852,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "candidate_evidence_gate_history_cache_v1"
+    assert health["routing_revision"] == "candidate_evidence_gate_history_cache_v2"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2080,9 +2080,11 @@ def test_candidate_research_screen_evidence_gates() -> None:
     original_filter = market_app.filter_a_share_securities_data
     original_history = market_app.get_cached_historical_context_data
     history_calls = []
+    filter_calls = []
     try:
-        market_app.filter_a_share_securities_data = lambda **_: {
-            "results": [
+        def filtered_universe(**_: object) -> dict:
+            filter_calls.append(True)
+            return {"results": [
                 {
                     "symbol": "600001",
                     "name": "Lower Turnover",
@@ -2095,10 +2097,12 @@ def test_candidate_research_screen_evidence_gates() -> None:
                     "turnover": 1_200_000_000,
                     "change_pct": 2.0,
                 },
-            ],
-            "source": ["test_filter"],
-            "market_time": "2026-07-10T15:00:00+08:00",
-        }
+                ],
+                "source": ["test_filter"],
+                "market_time": "2026-07-10T15:00:00+08:00",
+            }
+
+        market_app.filter_a_share_securities_data = filtered_universe
         market_app.get_market_overview_data = lambda _limit: {
             "market_activity_facts": {
                 "rise_count": 100,
@@ -2118,7 +2122,8 @@ def test_candidate_research_screen_evidence_gates() -> None:
         assert blocked["no_candidate"] is True
         assert blocked["selection_status"] == "no_candidate_due_to_market_breadth_gate"
         assert history_calls == []
-        assert blocked["preselected_candidates"][0]["symbol"] == "600002"
+        assert filter_calls == []
+        assert blocked["preselected_count"] == 0
 
         market_app.get_market_overview_data = lambda _limit: {
             "market_activity_facts": {
@@ -2154,6 +2159,7 @@ def test_candidate_research_screen_evidence_gates() -> None:
             5, 8, 0.5, [20, 60], 0.0, "raw",
         )
         assert accepted["no_candidate"] is False
+        assert filter_calls == [True]
         assert accepted["research_candidates"][0]["symbol"] == "600002"
         assert accepted["research_candidates"][0]["evidence_gate_passed"] is True
         assert accepted["rejected_candidates"][0]["symbol"] == "600001"
@@ -2816,7 +2822,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "candidate_evidence_gate_history_cache_v1"
+        assert health.json()["routing_revision"] == "candidate_evidence_gate_history_cache_v2"
 
         for legacy_path in (
             "/search?keyword=600000",
