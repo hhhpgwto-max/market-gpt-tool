@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "fund_look_through_explicit_units_v1"
+ROUTING_REVISION = "candidate_evidence_gate_history_cache_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -43,6 +43,9 @@ MCP_INSTRUCTIONS = (
     "not available unless the tool explicitly says so. "
     "When get_a_share_decision_context returns recommended_follow_up_tools, use those exact tool names and "
     "arguments to refill relevant components that missed the packet response budget before answering. "
+    "For stock-screening or stock-selection requests, use screen_a_share_research_candidates before naming any "
+    "security. Treat its results as research candidates, not recommendations. If it returns no_candidate=true, "
+    "do not force a ticker; report the failed market, history, or data-completeness gate instead. "
     "Use get_ipo_subscription_status for current IPO schedules, subscription codes, dates, issuer limits, and "
     "exchange rules. Never infer the user's account market value, board permissions, application, or winning status. "
     "For current company news, use get_a_share_news before broad web search; use get_a_share_announcements for "
@@ -2786,6 +2789,7 @@ def filter_a_share_securities_data(
                 "turnover_unit": "CNY",
                 "turnover_rate": turnover_rate,
                 "total_market_value": market_cap,
+                "total_market_value_unit": "CNY",
                 "average_price": average_price,
                 "price_above_average_pct": percentage_change(price, average_price),
                 "market_time": row.get("market_time"),
@@ -2814,6 +2818,250 @@ def filter_a_share_securities_data(
         "queried_at": now_iso(),
         "scope": "Mechanical conditions only; ordinary A shares only, excluding ETFs, funds, B shares, and delisting-arrangement securities.",
         "note": "No hidden weights, scores, recommendations, or trading conclusions are applied.",
+    }
+
+
+def candidate_history_gate(
+    context: dict[str, Any] | None,
+    required_windows: list[int],
+    minimum_return_pct: float,
+) -> tuple[dict[str, Any], list[str]]:
+    if not context:
+        return {}, ["historical_context_unavailable"]
+    windows = context.get("windows") or {}
+    selected: dict[str, Any] = {}
+    rejections = []
+    for window in required_windows:
+        metrics = windows.get(str(window)) or {}
+        selected[str(window)] = {
+            key: metrics.get(key)
+            for key in (
+                "window_complete",
+                "start_date",
+                "end_date",
+                "return_pct",
+                "annualized_volatility_pct",
+                "maximum_drawdown_pct",
+                "distance_from_high_pct",
+                "distance_from_low_pct",
+            )
+        }
+        if not metrics.get("window_complete"):
+            rejections.append(f"history_window_incomplete:{window}")
+            continue
+        return_pct = to_number(metrics.get("return_pct"))
+        if return_pct is None:
+            rejections.append(f"history_return_unavailable:{window}")
+        elif return_pct < minimum_return_pct:
+            rejections.append(f"history_return_below_minimum:{window}")
+    return {
+        "latest_trade_date": context.get("latest_trade_date"),
+        "source_sessions": context.get("source_sessions"),
+        "windows": selected,
+        "latest_volume_vs_20_session_average_ratio": (
+            ((windows.get("20") or {}).get("volume") or {}).get(
+                "latest_vs_prior_average_ratio"
+            )
+        ),
+        "source": context.get("source"),
+        "served_from_stale_cache": context.get("served_from_stale_cache", False),
+        "stale_cache_age_seconds": context.get("stale_cache_age_seconds"),
+    }, rejections
+
+
+def screen_a_share_research_candidates_data(
+    change_pct_min: float,
+    change_pct_max: float,
+    turnover_min: float,
+    turnover_rate_min: float,
+    market_cap_max: float,
+    candidate_limit: int,
+    history_pool_limit: int,
+    minimum_market_rise_to_fall_ratio: float,
+    required_positive_history_windows: list[int],
+    minimum_history_return_pct: float,
+    detail_level: str,
+) -> dict[str, Any]:
+    started_at = perf_counter()
+    base_loaders = {
+        "market_overview": lambda: get_market_overview_data(10),
+        "all_market_filter": lambda: filter_a_share_securities_data(
+            security_type="stock",
+            exclude_st=True,
+            change_pct_min=change_pct_min,
+            change_pct_max=change_pct_max,
+            turnover_min=turnover_min,
+            turnover_rate_min=turnover_rate_min,
+            above_average_price=True,
+            market_cap_max=market_cap_max,
+            limit=200,
+        ),
+    }
+    base_results, base_status, base_errors = collect_components(
+        base_loaders, 12, COMPOSITE_TOOL_EXECUTOR
+    )
+    overview = base_results.get("market_overview") or {}
+    filtered = base_results.get("all_market_filter") or {}
+    activity = overview.get("market_activity_facts") or {}
+    rise_to_fall_ratio = to_number(activity.get("rise_to_fall_ratio"))
+    market_gate = {
+        "minimum_rise_to_fall_ratio": minimum_market_rise_to_fall_ratio,
+        "observed_rise_to_fall_ratio": rise_to_fall_ratio,
+        "rise_count": activity.get("rise_count"),
+        "fall_count": activity.get("fall_count"),
+        "limit_up_count": activity.get("limit_up_count"),
+        "limit_down_count": activity.get("limit_down_count"),
+        "passed": (
+            rise_to_fall_ratio is not None
+            and rise_to_fall_ratio >= minimum_market_rise_to_fall_ratio
+        ),
+    }
+    preselected = sorted(
+        filtered.get("results") or [],
+        key=lambda item: (
+            -(to_number(item.get("turnover")) or 0),
+            str(item.get("symbol") or ""),
+        ),
+    )[:history_pool_limit]
+    screen_conditions = {
+        "exclude_st": True,
+        "change_pct_min": change_pct_min,
+        "change_pct_max": change_pct_max,
+        "turnover_min_cny": turnover_min,
+        "turnover_rate_min_pct": turnover_rate_min,
+        "above_average_price": True,
+        "market_cap_max_cny": market_cap_max,
+        "preselection_sort": "turnover_desc_then_symbol",
+        "minimum_market_rise_to_fall_ratio": minimum_market_rise_to_fall_ratio,
+        "required_positive_history_windows": required_positive_history_windows,
+        "minimum_history_return_pct": minimum_history_return_pct,
+    }
+    if not overview or not filtered:
+        return {
+            "selection_status": "no_candidate_due_to_incomplete_base_evidence",
+            "no_candidate": True,
+            "research_candidates": [],
+            "preselected_candidates": preselected if detail_level == "raw" else [],
+            "preselected_count": len(preselected),
+            "accepted_count": 0,
+            "market_gate": market_gate,
+            "screen_conditions": screen_conditions,
+            "component_status": base_status,
+            "source_errors": base_errors,
+            "missing_fields": [
+                name for name in base_loaders if name not in base_results
+            ],
+            "data_status": "partial_data",
+            "queried_at": now_iso(),
+            "latency_ms": int((perf_counter() - started_at) * 1000),
+            "note": "No ticker is forced when the market snapshot or candidate universe is unavailable.",
+        }
+    if not market_gate["passed"]:
+        return {
+            "selection_status": "no_candidate_due_to_market_breadth_gate",
+            "no_candidate": True,
+            "research_candidates": [],
+            "preselected_candidates": preselected if detail_level == "raw" else [],
+            "preselected_count": len(preselected),
+            "accepted_count": 0,
+            "market_gate": market_gate,
+            "screen_conditions": screen_conditions,
+            "component_status": base_status,
+            "source": sorted(
+                {
+                    *normalize_sources(overview.get("source")),
+                    *normalize_sources(filtered.get("source")),
+                }
+            ),
+            "source_errors": base_errors,
+            "missing_fields": [],
+            "data_status": "full_data" if not base_errors else "partial_data",
+            "market_time": overview.get("market_time") or filtered.get("market_time"),
+            "queried_at": now_iso(),
+            "latency_ms": int((perf_counter() - started_at) * 1000),
+            "note": "The transparent caller-configurable market-breadth gate failed, so no ticker is promoted. This is a mechanical research screen, not a buy/sell decision.",
+        }
+
+    history_loaders = {
+        f"history:{item['symbol']}": lambda item=item: get_cached_historical_context_data(
+            str(item["symbol"])
+        )
+        for item in preselected
+    }
+    histories, history_status, history_errors = (
+        collect_components(history_loaders, 15, COMPOSITE_TOOL_EXECUTOR)
+        if history_loaders
+        else ({}, {}, [])
+    )
+    accepted = []
+    rejected = []
+    for candidate in preselected:
+        symbol = str(candidate["symbol"])
+        context = histories.get(f"history:{symbol}")
+        persistence, rejection_reasons = candidate_history_gate(
+            context,
+            required_positive_history_windows,
+            minimum_history_return_pct,
+        )
+        item = {
+            **candidate,
+            "history_persistence": persistence,
+            "evidence_gate_passed": not rejection_reasons,
+            "rejection_reasons": rejection_reasons,
+            "research_status": (
+                "advance_to_deeper_research"
+                if not rejection_reasons
+                else "screen_rejected_or_incomplete"
+            ),
+        }
+        (accepted if not rejection_reasons else rejected).append(item)
+    accepted = accepted[:candidate_limit]
+    unavailable_history = any(
+        "historical_context_unavailable" in item["rejection_reasons"]
+        for item in rejected
+    )
+    selection_status = (
+        "research_candidates_available"
+        if accepted
+        else (
+            "no_candidate_due_to_incomplete_history_evidence"
+            if unavailable_history
+            else "no_candidate_due_to_history_gate"
+        )
+    )
+    all_errors = [*base_errors, *history_errors]
+    return {
+        "selection_status": selection_status,
+        "no_candidate": not accepted,
+        "research_candidates": accepted,
+        "rejected_candidates": rejected if detail_level == "raw" else rejected[:5],
+        "preselected_count": len(preselected),
+        "accepted_count": len(accepted),
+        "market_gate": market_gate,
+        "screen_conditions": screen_conditions,
+        "component_status": {**base_status, **history_status},
+        "source": sorted(
+            {
+                *normalize_sources(overview.get("source")),
+                *normalize_sources(filtered.get("source")),
+                *[
+                    source
+                    for context in histories.values()
+                    for source in normalize_sources(context.get("source"))
+                ],
+            }
+        ),
+        "source_errors": all_errors,
+        "missing_fields": [
+            key
+            for key, status in history_status.items()
+            if status.get("status") in {"unavailable", "unavailable_within_response_budget"}
+        ],
+        "data_status": "full_data" if not all_errors else "partial_data",
+        "market_time": overview.get("market_time") or filtered.get("market_time"),
+        "queried_at": now_iso(),
+        "latency_ms": int((perf_counter() - started_at) * 1000),
+        "note": "Candidates passed transparent market, liquidity, and multi-window history gates for deeper research only. They are not recommendations or instructions to trade.",
     }
 
 
@@ -3926,7 +4174,35 @@ def historical_window_metrics(
 
 def get_historical_context_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
-    payload = get_kline_data(symbol, "daily", 260)
+    payload, _, source_errors = race_public_sources(
+        (
+            (
+                "tencent",
+                lambda: get_tencent_kline(symbol, "daily", 260),
+            ),
+            (
+                "eastmoney",
+                lambda: get_eastmoney_kline(
+                    symbol,
+                    "daily",
+                    KLINE_PERIODS["daily"],
+                    260,
+                ),
+            ),
+        ),
+        6,
+    )
+    payload["source_errors"] = [
+        *normalize_source_errors(payload.get("source_errors")),
+        *normalize_source_errors(source_errors),
+    ]
+    security = security_metadata(symbol)
+    payload.update(
+        {
+            "security_type": security["security_type"],
+            "exchange": security["exchange"],
+        }
+    )
     items = payload["items"]
     if not items:
         raise HTTPException(status_code=404, detail=f"Historical context not found: {symbol}")
@@ -3962,6 +4238,19 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
         ),
         "note": "Historical values are mechanical forward-adjusted facts. Percentiles describe location within each window and are not scores or recommendations.",
     }
+
+
+def get_cached_historical_context_data(symbol: str) -> dict[str, Any]:
+    normalized_symbol = normalize_symbol(symbol)
+    return get_cached_component_with_stale(
+        cache_key(
+            "historical_context_internal",
+            {"symbol": normalized_symbol, "adjust": "forward", "sessions": 260},
+        ),
+        300,
+        604800,
+        lambda: get_historical_context_data(normalized_symbol),
+    )
 
 
 def parse_yyyymmdd(value: Any) -> str | None:
@@ -4353,7 +4642,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
     loaders: dict[str, Any] = {
         "quote": lambda: get_quote_data(symbol),
         "intraday": lambda: get_intraday_data(symbol, 60),
-        "historical_context": lambda: get_historical_context_data(symbol),
+        "historical_context": lambda: get_cached_historical_context_data(symbol),
         "security_reference": lambda: get_resilient_security_reference_data(symbol),
         "relative_strength": lambda: get_relative_strength_data(symbol, benchmark, None),
         "market_overview": lambda: get_market_overview_data(5),
@@ -8637,6 +8926,90 @@ def filter_a_share_securities(
 
 
 @mcp.tool(
+    name="screen_a_share_research_candidates",
+    title="Screen auditable A-share research candidates",
+    description=(
+        "Build an auditable ordinary-A-share research candidate funnel with explicit liquidity, market-breadth, "
+        "and 20/60/120/250-session history gates. Preselection uses turnover rather than top daily gain. "
+        "Returns no_candidate=true instead of forcing a ticker when evidence or gates fail. Results are research "
+        "priorities only, never buy/sell recommendations."
+    ),
+    annotations=READ_ONLY_TOOL,
+)
+def screen_a_share_research_candidates(
+    change_pct_min: float = 0.5,
+    change_pct_max: float = 6.0,
+    turnover_min: float = 500_000_000,
+    turnover_rate_min: float = 2.0,
+    market_cap_max: float = 100_000_000_000,
+    candidate_limit: int = 5,
+    history_pool_limit: int = 8,
+    minimum_market_rise_to_fall_ratio: float = 0.5,
+    required_positive_history_windows: list[int] | None = None,
+    minimum_history_return_pct: float = 0.0,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
+    if change_pct_min > change_pct_max:
+        return mcp_error(
+            None,
+            HTTPException(
+                status_code=400,
+                detail="change_pct_min cannot be greater than change_pct_max.",
+            ),
+        )
+    if any(
+        value < 0
+        for value in (
+            turnover_min,
+            turnover_rate_min,
+            market_cap_max,
+            minimum_market_rise_to_fall_ratio,
+        )
+    ):
+        return mcp_error(
+            None,
+            HTTPException(
+                status_code=400,
+                detail="Turnover, market-cap, turnover-rate, and market-breadth thresholds must be non-negative.",
+            ),
+        )
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(
+            None,
+            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+        )
+    windows = required_positive_history_windows or [20, 60]
+    if not windows or any(window not in HISTORICAL_CONTEXT_WINDOWS for window in windows):
+        return mcp_error(
+            None,
+            HTTPException(
+                status_code=400,
+                detail="required_positive_history_windows must contain only 20, 60, 120, or 250.",
+            ),
+        )
+    parameters = {
+        "change_pct_min": change_pct_min,
+        "change_pct_max": change_pct_max,
+        "turnover_min": turnover_min,
+        "turnover_rate_min": turnover_rate_min,
+        "market_cap_max": market_cap_max,
+        "candidate_limit": max(1, min(candidate_limit, 10)),
+        "history_pool_limit": max(1, min(history_pool_limit, 8)),
+        "minimum_market_rise_to_fall_ratio": minimum_market_rise_to_fall_ratio,
+        "required_positive_history_windows": sorted(set(windows)),
+        "minimum_history_return_pct": minimum_history_return_pct,
+        "detail_level": detail_level,
+    }
+    return run_cached_tool(
+        "screen_a_share_research_candidates",
+        parameters,
+        30,
+        lambda: screen_a_share_research_candidates_data(**parameters),
+        max_stale_age_seconds=300,
+    )
+
+
+@mcp.tool(
     name="get_a_share_fund_flow",
     title="Get A-share fund flow",
     description="Get up to 10 recent daily public fund-flow estimates for one A-share stock.",
@@ -8915,7 +9288,7 @@ def get_a_share_historical_context(symbol: str) -> dict[str, Any]:
         "get_a_share_historical_context",
         {"symbol": symbol},
         300,
-        lambda: get_historical_context_data(symbol),
+        lambda: get_cached_historical_context_data(symbol),
         symbol,
     )
 
