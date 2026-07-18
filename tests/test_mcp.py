@@ -1852,7 +1852,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "candidate_evidence_gate_history_cache_v2"
+    assert health["routing_revision"] == "challenge_stability_cross_checks_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2531,6 +2531,41 @@ def test_decision_context_follow_up_recommendations() -> None:
     }
 
 
+def test_market_cross_checks_preserve_coexisting_signals() -> None:
+    checks = market_app.build_market_cross_checks(
+        [
+            {"symbol": "000001", "change_pct": -1.0},
+            {"symbol": "399001", "change_pct": -1.4},
+        ],
+        [
+            {"symbol": "BK0475", "name": "银行", "change_pct": -0.2},
+            {"symbol": "BK0428", "name": "电力", "change_pct": -0.5},
+        ],
+        {"all_market": {"rise_count": 500, "fall_count": 4500}},
+    )
+
+    assert checks["breadth_counts"]["fall_to_rise_ratio"] == 9.0
+    assert checks["primary_index_equal_weight_change_pct"] == -1.2
+    assert checks["relationship_status"] == "broad_weakness_and_relative_resilience_coexist"
+    assert checks["coexisting_signals"] == [
+        "falling_stocks_outnumber_rising_stocks",
+        "returned_industry_boards_outperform_primary_index_equal_weight_change",
+    ]
+    assert [item["name"] for item in checks["relative_resilience_candidates"]] == [
+        "银行",
+        "电力",
+    ]
+    assert checks["missing_inputs"] == []
+
+    incomplete = market_app.build_market_cross_checks([], [], None)
+    assert incomplete["relationship_status"] == "coexistence_not_observed_in_returned_snapshot"
+    assert incomplete["missing_inputs"] == [
+        "market_breadth",
+        "primary_index_changes",
+        "industry_boards",
+    ]
+
+
 def test_ipo_subscription_status_contract() -> None:
     original_json = market_app.read_public_json
     captured: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
@@ -2785,6 +2820,7 @@ def main() -> None:
     test_rotation_overnight_and_event_helpers()
     test_fund_and_portfolio_exposure_calculations()
     test_decision_context_follow_up_recommendations()
+    test_market_cross_checks_preserve_coexisting_signals()
     test_ipo_subscription_status_contract()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
@@ -2822,7 +2858,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "candidate_evidence_gate_history_cache_v2"
+        assert health.json()["routing_revision"] == "challenge_stability_cross_checks_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
