@@ -51,6 +51,9 @@ def fake_get_quote_data(symbol: str) -> dict:
             "turnover_unit": "CNY",
             "pe_dynamic": 99.9,
             "total_market_value": 999999999,
+            "total_market_value_unit": "CNY",
+            "circulating_market_value": 888888888,
+            "circulating_market_value_unit": "CNY",
             "trade_date": "2026-07-10",
             "quote_time": "2026-07-10T15:00:00+08:00",
             "source_updated_at": "2026-07-10T16:14:42+08:00",
@@ -183,7 +186,10 @@ def fake_get_financial_data(symbol: str, limit: int) -> dict:
 
 
 def fake_get_fund_exposure_data(
-    fund_code: str, holdings_limit: int, detail_level: str
+    fund_code: str,
+    holdings_limit: int,
+    detail_level: str,
+    look_through_depth: int = 1,
 ) -> dict:
     return {
         "fund_code": fund_code,
@@ -825,12 +831,22 @@ def test_etf_market_routing_and_search() -> None:
 
 def test_quote_unit_normalization() -> None:
     result = market_app.normalize_quote_units(
-        {"volume": 2603164, "turnover": 458798}, "tencent"
+        {
+            "volume": 2603164,
+            "turnover": 458798,
+            "total_market_value": 111.61,
+            "circulating_market_value": 100.5,
+        },
+        "tencent",
     )
     assert result["volume"] == 260316400
     assert result["volume_unit"] == "share"
     assert result["turnover"] == 4587980000
     assert result["turnover_unit"] == "CNY"
+    assert result["total_market_value"] == 11_161_000_000
+    assert result["total_market_value_unit"] == "CNY"
+    assert result["circulating_market_value"] == 10_050_000_000
+    assert result["circulating_market_value_unit"] == "CNY"
 
 
 def test_quote_timestamp_semantics() -> None:
@@ -1815,7 +1831,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "explicit_time_semantics_lazy_startup_v1"
+    assert health["routing_revision"] == "fund_look_through_explicit_units_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2192,6 +2208,8 @@ def test_rotation_overnight_and_event_helpers() -> None:
     assert parsed is not None
     assert parsed["change_pct"] == 10.0
     assert parsed["market_time"] == "2026-07-10T10:00:00+08:00"
+    assert market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["price_unit"] == "US_cent_per_pound"
+    assert market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["contract_size"] == 25_000
 
     bars = [
         {"date": "2026-07-10", "close": 100},
@@ -2250,6 +2268,48 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
     finally:
         market_app.get_eastmoney_fund_component = original_component
 
+    market_app.get_eastmoney_fund_component = lambda code, endpoint: (
+        {
+            "Datas": {
+                "fundStocks": (
+                    [{"GPDM": "600050", "GPJC": "China Unicom", "JZBL": "8", "TEXCH": "1"}]
+                    if code == "515050"
+                    else [{"GPDM": "600519", "GPJC": "Direct holding", "JZBL": "0.2", "TEXCH": "1"}]
+                ),
+                **(
+                    {"ETFCODE": "515050", "ETFSHORTNAME": "Communication ETF"}
+                    if code == "008087"
+                    else {}
+                ),
+            },
+            "Expansion": "2026-03-31",
+        }
+        if endpoint == "FundMNInverstPosition"
+        else {
+            "Datas": [
+                {
+                    "GP": "2.2" if code == "008087" else "90",
+                    "JJ": "92.7" if code == "008087" else "0",
+                    "FSRQ": "2026-03-31",
+                }
+            ]
+        }
+        if endpoint == "FundMNAssetAllocationNew"
+        else {"Datas": {"SHORTNAME": f"Fund {code}"}}
+        if endpoint == "FundMNNBasicInformation"
+        else {"Datas": []}
+    )
+    try:
+        feeder = market_app.get_fund_exposure_data("008087", 10, "raw")
+        assert feeder["underlying_fund_code"] == "515050"
+        assert feeder["underlying_fund_weight_pct"] == 92.7
+        assert feeder["top_holdings_reported_weight_pct"] == 0.2
+        assert feeder["look_through_holdings"][0]["symbol"] == "600050"
+        assert feeder["look_through_holdings"][0]["underlying_fund_holding_weight_pct"] == 8
+        assert feeder["look_through_holdings"][0]["weight_pct"] == 7.416
+    finally:
+        market_app.get_eastmoney_fund_component = original_component
+
     original_fund = market_app.get_fund_exposure_data
     original_reference = market_app.get_fast_portfolio_security_reference
     market_app.get_fund_exposure_data = fake_get_fund_exposure_data
@@ -2278,7 +2338,9 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         assert result["industry_exposure"][0]["exposure_pct"] == 46.0
         assert result["fund_reported_industry_exposure"][0]["exposure_pct"] == 48.0
 
-        def partial_fund(code: str, limit: int, level: str) -> dict:
+        def partial_fund(
+            code: str, limit: int, level: str, look_through_depth: int = 1
+        ) -> dict:
             payload = fake_get_fund_exposure_data(code, limit, level)
             payload["data_status"] = "partial_data"
             payload["missing_fields"] = ["industry_distribution"]
@@ -2636,7 +2698,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "explicit_time_semantics_lazy_startup_v1"
+        assert health.json()["routing_revision"] == "fund_look_through_explicit_units_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -2742,7 +2804,10 @@ def main() -> None:
         assert result["volume_unit"] == "share"
         assert result["turnover_unit"] == "CNY"
         assert "pe_dynamic" not in result
-        assert "total_market_value" not in result
+        assert result["total_market_value"] == 999999999
+        assert result["total_market_value_unit"] == "CNY"
+        assert result["circulating_market_value"] == 888888888
+        assert result["circulating_market_value_unit"] == "CNY"
 
         for request_id, tool_name, arguments in (
             (5, "get_a_share_kline", {"symbol": "600519"}),
