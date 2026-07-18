@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "candidate_evidence_gate_history_cache_v1"
+ROUTING_REVISION = "candidate_evidence_gate_history_cache_v2"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -2883,25 +2883,12 @@ def screen_a_share_research_candidates_data(
     detail_level: str,
 ) -> dict[str, Any]:
     started_at = perf_counter()
-    base_loaders = {
-        "market_overview": lambda: get_market_overview_data(10),
-        "all_market_filter": lambda: filter_a_share_securities_data(
-            security_type="stock",
-            exclude_st=True,
-            change_pct_min=change_pct_min,
-            change_pct_max=change_pct_max,
-            turnover_min=turnover_min,
-            turnover_rate_min=turnover_rate_min,
-            above_average_price=True,
-            market_cap_max=market_cap_max,
-            limit=200,
-        ),
-    }
-    base_results, base_status, base_errors = collect_components(
-        base_loaders, 12, COMPOSITE_TOOL_EXECUTOR
+    overview_results, overview_status, overview_errors = collect_components(
+        {"market_overview": lambda: get_market_overview_data(10)},
+        10,
+        COMPOSITE_TOOL_EXECUTOR,
     )
-    overview = base_results.get("market_overview") or {}
-    filtered = base_results.get("all_market_filter") or {}
+    overview = overview_results.get("market_overview") or {}
     activity = overview.get("market_activity_facts") or {}
     rise_to_fall_ratio = to_number(activity.get("rise_to_fall_ratio"))
     market_gate = {
@@ -2916,13 +2903,6 @@ def screen_a_share_research_candidates_data(
             and rise_to_fall_ratio >= minimum_market_rise_to_fall_ratio
         ),
     }
-    preselected = sorted(
-        filtered.get("results") or [],
-        key=lambda item: (
-            -(to_number(item.get("turnover")) or 0),
-            str(item.get("symbol") or ""),
-        ),
-    )[:history_pool_limit]
     screen_conditions = {
         "exclude_st": True,
         "change_pct_min": change_pct_min,
@@ -2936,21 +2916,19 @@ def screen_a_share_research_candidates_data(
         "required_positive_history_windows": required_positive_history_windows,
         "minimum_history_return_pct": minimum_history_return_pct,
     }
-    if not overview or not filtered:
+    if not overview:
         return {
             "selection_status": "no_candidate_due_to_incomplete_base_evidence",
             "no_candidate": True,
             "research_candidates": [],
-            "preselected_candidates": preselected if detail_level == "raw" else [],
-            "preselected_count": len(preselected),
+            "preselected_candidates": [],
+            "preselected_count": 0,
             "accepted_count": 0,
             "market_gate": market_gate,
             "screen_conditions": screen_conditions,
-            "component_status": base_status,
-            "source_errors": base_errors,
-            "missing_fields": [
-                name for name in base_loaders if name not in base_results
-            ],
+            "component_status": overview_status,
+            "source_errors": overview_errors,
+            "missing_fields": ["market_overview"],
             "data_status": "partial_data",
             "queried_at": now_iso(),
             "latency_ms": int((perf_counter() - started_at) * 1000),
@@ -2961,26 +2939,69 @@ def screen_a_share_research_candidates_data(
             "selection_status": "no_candidate_due_to_market_breadth_gate",
             "no_candidate": True,
             "research_candidates": [],
-            "preselected_candidates": preselected if detail_level == "raw" else [],
-            "preselected_count": len(preselected),
+            "preselected_candidates": [],
+            "preselected_count": 0,
             "accepted_count": 0,
             "market_gate": market_gate,
             "screen_conditions": screen_conditions,
-            "component_status": base_status,
-            "source": sorted(
-                {
-                    *normalize_sources(overview.get("source")),
-                    *normalize_sources(filtered.get("source")),
-                }
-            ),
-            "source_errors": base_errors,
+            "component_status": overview_status,
+            "source": normalize_sources(overview.get("source")),
+            "source_errors": overview_errors,
             "missing_fields": [],
-            "data_status": "full_data" if not base_errors else "partial_data",
-            "market_time": overview.get("market_time") or filtered.get("market_time"),
+            "data_status": "full_data" if not overview_errors else "partial_data",
+            "market_time": overview.get("market_time"),
             "queried_at": now_iso(),
             "latency_ms": int((perf_counter() - started_at) * 1000),
             "note": "The transparent caller-configurable market-breadth gate failed, so no ticker is promoted. This is a mechanical research screen, not a buy/sell decision.",
         }
+
+    filter_results, filter_status, filter_errors = collect_components(
+        {
+            "all_market_filter": lambda: filter_a_share_securities_data(
+                security_type="stock",
+                exclude_st=True,
+                change_pct_min=change_pct_min,
+                change_pct_max=change_pct_max,
+                turnover_min=turnover_min,
+                turnover_rate_min=turnover_rate_min,
+                above_average_price=True,
+                market_cap_max=market_cap_max,
+                limit=200,
+            )
+        },
+        12,
+        COMPOSITE_TOOL_EXECUTOR,
+    )
+    filtered = filter_results.get("all_market_filter") or {}
+    base_status = {**overview_status, **filter_status}
+    base_errors = [*overview_errors, *filter_errors]
+    if not filtered:
+        return {
+            "selection_status": "no_candidate_due_to_incomplete_base_evidence",
+            "no_candidate": True,
+            "research_candidates": [],
+            "preselected_candidates": [],
+            "preselected_count": 0,
+            "accepted_count": 0,
+            "market_gate": market_gate,
+            "screen_conditions": screen_conditions,
+            "component_status": base_status,
+            "source": normalize_sources(overview.get("source")),
+            "source_errors": base_errors,
+            "missing_fields": ["all_market_filter"],
+            "data_status": "partial_data",
+            "market_time": overview.get("market_time"),
+            "queried_at": now_iso(),
+            "latency_ms": int((perf_counter() - started_at) * 1000),
+            "note": "No ticker is forced when the candidate universe is unavailable.",
+        }
+    preselected = sorted(
+        filtered.get("results") or [],
+        key=lambda item: (
+            -(to_number(item.get("turnover")) or 0),
+            str(item.get("symbol") or ""),
+        ),
+    )[:history_pool_limit]
 
     history_loaders = {
         f"history:{item['symbol']}": lambda item=item: get_cached_historical_context_data(
