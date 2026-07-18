@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "candidate_evidence_gate_history_cache_v2"
+ROUTING_REVISION = "challenge_stability_cross_checks_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -43,6 +43,8 @@ MCP_INSTRUCTIONS = (
     "not available unless the tool explicitly says so. "
     "When get_a_share_decision_context returns recommended_follow_up_tools, use those exact tool names and "
     "arguments to refill relevant components that missed the packet response budget before answering. "
+    "For broad-market interpretation, read market_cross_checks and preserve simultaneous breadth weakness and "
+    "sector relative resilience instead of collapsing them into one directional story. "
     "For stock-screening or stock-selection requests, use screen_a_share_research_candidates before naming any "
     "security. Treat its results as research candidates, not recommendations. If it returns no_candidate=true, "
     "do not force a ticker; report the failed market, history, or data-completeness gate instead. "
@@ -4724,6 +4726,9 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
     recommended_follow_ups = decision_context_follow_up_tools(
         symbol, benchmark, statuses
     )
+    market_cross_checks = (
+        (decision_inputs.get("market_overview") or {}).get("market_cross_checks")
+    )
     return {
         "snapshot_id": snapshot_id,
         "symbol": symbol,
@@ -4742,6 +4747,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
             if recommended_follow_ups
             else None
         ),
+        "market_cross_checks": market_cross_checks,
         "decision_inputs": decision_inputs,
         "excluded_components": {},
         "source": sorted(
@@ -7996,6 +8002,85 @@ def get_overview_breadth_component() -> dict[str, Any]:
         ) from exc
 
 
+def build_market_cross_checks(
+    indices: list[dict[str, Any]],
+    industry_boards: list[dict[str, Any]],
+    breadth: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Expose mechanical facts that a one-direction narrative can hide."""
+    all_market = (breadth or {}).get("all_market") or {}
+    rise_count = _to_int(all_market.get("rise_count"))
+    fall_count = _to_int(all_market.get("fall_count"))
+    fall_to_rise_ratio = (
+        round(fall_count / rise_count, 4)
+        if fall_count is not None and rise_count not in (None, 0)
+        else None
+    )
+
+    index_changes = [
+        change
+        for index in indices
+        if (change := to_number(index.get("change_pct"))) is not None
+    ]
+    primary_index_equal_weight_change_pct = (
+        round(sum(index_changes) / len(index_changes), 4) if index_changes else None
+    )
+
+    relative_resilience_candidates = []
+    if primary_index_equal_weight_change_pct is not None:
+        for board in industry_boards:
+            change_pct = to_number(board.get("change_pct"))
+            if change_pct is None or change_pct <= primary_index_equal_weight_change_pct:
+                continue
+            relative_resilience_candidates.append(
+                {
+                    "symbol": board.get("symbol"),
+                    "name": board.get("industry_name") or board.get("name"),
+                    "change_pct": change_pct,
+                    "relative_to_primary_index_equal_weight_pct_points": round(
+                        change_pct - primary_index_equal_weight_change_pct, 4
+                    ),
+                }
+            )
+
+    coexisting_signals = []
+    if rise_count is not None and fall_count is not None and fall_count > rise_count:
+        coexisting_signals.append("falling_stocks_outnumber_rising_stocks")
+    if relative_resilience_candidates:
+        coexisting_signals.append(
+            "returned_industry_boards_outperform_primary_index_equal_weight_change"
+        )
+    coexistence_observed = len(coexisting_signals) == 2
+    return {
+        "breadth_counts": {
+            "rise_count": rise_count,
+            "fall_count": fall_count,
+            "fall_to_rise_ratio": fall_to_rise_ratio,
+        },
+        "primary_index_equal_weight_change_pct": primary_index_equal_weight_change_pct,
+        "relative_resilience_candidates": relative_resilience_candidates,
+        "coexisting_signals": coexisting_signals,
+        "relationship_status": (
+            "broad_weakness_and_relative_resilience_coexist"
+            if coexistence_observed
+            else "coexistence_not_observed_in_returned_snapshot"
+        ),
+        "missing_inputs": [
+            name
+            for name, missing in (
+                ("market_breadth", rise_count is None or fall_count is None),
+                ("primary_index_changes", not index_changes),
+                ("industry_boards", not industry_boards),
+            )
+            if missing
+        ],
+        "scope": (
+            "Mechanical cross-check over the returned breadth, primary indices, and top industry boards only. "
+            "Broad weakness and relative sector resilience may coexist; neither fact cancels the other or implies a trade."
+        ),
+    }
+
+
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     started_at = perf_counter()
     response_budget_seconds = 9.0
@@ -8214,6 +8299,12 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             "scope": "Mechanical market activity facts; no bullish, bearish, hot, cold, or trading judgement is assigned.",
         }
 
+    market_cross_checks = build_market_cross_checks(
+        primary_indices,
+        boards,
+        breadth,
+    )
+
     return {
         "market_status": market_status_at(),
         "trade_date": market_time.split("T", 1)[0] if market_time else None,
@@ -8249,6 +8340,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             else "unavailable"
         ),
         "market_activity_facts": market_activity_facts,
+        "market_cross_checks": market_cross_checks,
         "component_status": component_status,
         "response_budget_ms": int(response_budget_seconds * 1000),
         "source": sources,
@@ -9344,7 +9436,8 @@ def get_a_share_security_status(symbol: str) -> dict[str, Any]:
     title="Get a multi-source market evidence packet",
     description=(
         "Concurrently gather quote, compact intraday structure, historical context, security status, relative strength, "
-        "official announcements, financials, and market overview. Returns evidence and missing-data reasons only; "
+        "official announcements, financials, and market overview, including market_cross_checks that preserve "
+        "simultaneous breadth weakness and sector relative resilience. Returns evidence and missing-data reasons only; "
         "when a component misses the response budget it also returns exact recommended follow-up tool calls. "
         "It does not produce a recommendation, score, trade, or automated financial decision."
     ),
@@ -9614,7 +9707,8 @@ def get_a_share_market_snapshot(
     title="Get A-share market overview",
     description=(
         "Get major and style index quotes, all-market A-share breadth, turnover, limit statistics, "
-        "and leading industry-board performance."
+        "leading industry-board performance, and mechanical market_cross_checks so broad weakness and relative "
+        "sector resilience remain visible at the same time."
     ),
     annotations=READ_ONLY_TOOL,
 )
