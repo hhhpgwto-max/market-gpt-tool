@@ -115,6 +115,27 @@ def fake_filter_a_share_securities_data(**_: object) -> dict:
     }
 
 
+def fake_screen_a_share_research_candidates_data(**_: object) -> dict:
+    return {
+        "selection_status": "research_candidates_available",
+        "no_candidate": False,
+        "accepted_count": 1,
+        "research_candidates": [
+            {
+                "symbol": "600519",
+                "name": "Test Stock",
+                "research_status": "advance_to_deeper_research",
+            }
+        ],
+        "market_gate": {"passed": True},
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+        "market_time": "2026-07-10T15:00:00+08:00",
+    }
+
+
 def fake_search_stock_data(keyword: str, limit: int) -> dict:
     return {
         "keyword": keyword,
@@ -1831,7 +1852,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "fund_look_through_explicit_units_v1"
+    assert health["routing_revision"] == "candidate_evidence_gate_history_cache_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -1935,7 +1956,8 @@ def test_reliability_envelope_cache_and_health() -> None:
 
 
 def test_historical_context_and_security_status_facts() -> None:
-    original_kline = market_app.get_kline_data
+    original_tencent_kline = market_app.get_tencent_kline
+    original_eastmoney_kline = market_app.get_eastmoney_kline
     original_json = market_app.read_public_json
     try:
         base = market_app.datetime(2025, 1, 1)
@@ -1953,7 +1975,7 @@ def test_historical_context_and_security_status_facts() -> None:
             }
             for index in range(260)
         ]
-        market_app.get_kline_data = lambda *_: {
+        historical_payload = {
             "symbol": "600519",
             "security_type": "a_share",
             "exchange": "SSE",
@@ -1963,6 +1985,10 @@ def test_historical_context_and_security_status_facts() -> None:
             "source": "test",
             "source_errors": [],
         }
+        market_app.get_tencent_kline = lambda *_args, **_kwargs: historical_payload
+        market_app.get_eastmoney_kline = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="test primary blocked")
+        )
         historical = market_app.get_historical_context_data("600519")
         assert historical["adjustment"] == "forward_adjusted"
         assert list(historical["windows"]) == ["20", "60", "120", "250"]
@@ -2044,8 +2070,98 @@ def test_historical_context_and_security_status_facts() -> None:
             == "live_sources_failed_using_slow_changing_reference_cache"
         )
     finally:
-        market_app.get_kline_data = original_kline
+        market_app.get_tencent_kline = original_tencent_kline
+        market_app.get_eastmoney_kline = original_eastmoney_kline
         market_app.read_public_json = original_json
+
+
+def test_candidate_research_screen_evidence_gates() -> None:
+    original_overview = market_app.get_market_overview_data
+    original_filter = market_app.filter_a_share_securities_data
+    original_history = market_app.get_cached_historical_context_data
+    history_calls = []
+    try:
+        market_app.filter_a_share_securities_data = lambda **_: {
+            "results": [
+                {
+                    "symbol": "600001",
+                    "name": "Lower Turnover",
+                    "turnover": 600_000_000,
+                    "change_pct": 5.0,
+                },
+                {
+                    "symbol": "600002",
+                    "name": "Higher Turnover",
+                    "turnover": 1_200_000_000,
+                    "change_pct": 2.0,
+                },
+            ],
+            "source": ["test_filter"],
+            "market_time": "2026-07-10T15:00:00+08:00",
+        }
+        market_app.get_market_overview_data = lambda _limit: {
+            "market_activity_facts": {
+                "rise_count": 100,
+                "fall_count": 500,
+                "rise_to_fall_ratio": 0.2,
+                "limit_up_count": 10,
+                "limit_down_count": 30,
+            },
+            "market_time": "2026-07-10T15:00:00+08:00",
+            "source": ["test_overview"],
+        }
+        market_app.get_cached_historical_context_data = lambda symbol: history_calls.append(symbol)
+        blocked = market_app.screen_a_share_research_candidates_data(
+            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
+            5, 8, 0.5, [20, 60], 0.0, "raw",
+        )
+        assert blocked["no_candidate"] is True
+        assert blocked["selection_status"] == "no_candidate_due_to_market_breadth_gate"
+        assert history_calls == []
+        assert blocked["preselected_candidates"][0]["symbol"] == "600002"
+
+        market_app.get_market_overview_data = lambda _limit: {
+            "market_activity_facts": {
+                "rise_count": 600,
+                "fall_count": 500,
+                "rise_to_fall_ratio": 1.2,
+            },
+            "market_time": "2026-07-10T15:00:00+08:00",
+            "source": ["test_overview"],
+        }
+
+        def history(symbol: str) -> dict:
+            return_pct = 3.0 if symbol == "600002" else -1.0
+            return {
+                "latest_trade_date": "2026-07-10",
+                "source_sessions": 260,
+                "windows": {
+                    str(window): {
+                        "window_complete": True,
+                        "return_pct": return_pct,
+                        "annualized_volatility_pct": 20.0,
+                        "maximum_drawdown_pct": -5.0,
+                        "volume": {"latest_vs_prior_average_ratio": 1.1},
+                    }
+                    for window in (20, 60, 120, 250)
+                },
+                "source": "test_history",
+            }
+
+        market_app.get_cached_historical_context_data = history
+        accepted = market_app.screen_a_share_research_candidates_data(
+            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
+            5, 8, 0.5, [20, 60], 0.0, "raw",
+        )
+        assert accepted["no_candidate"] is False
+        assert accepted["research_candidates"][0]["symbol"] == "600002"
+        assert accepted["research_candidates"][0]["evidence_gate_passed"] is True
+        assert accepted["rejected_candidates"][0]["symbol"] == "600001"
+        assert "history_return_below_minimum:20" in accepted["rejected_candidates"][0]["rejection_reasons"]
+    finally:
+        market_app.get_market_overview_data = original_overview
+        market_app.filter_a_share_securities_data = original_filter
+        market_app.get_cached_historical_context_data = original_history
 
 
 def test_news_relevance_deduplication_and_source_metadata() -> None:
@@ -2659,6 +2775,7 @@ def main() -> None:
     test_news_relevance_deduplication_and_source_metadata()
     test_reliability_envelope_cache_and_health()
     test_historical_context_and_security_status_facts()
+    test_candidate_research_screen_evidence_gates()
     test_rotation_overnight_and_event_helpers()
     test_fund_and_portfolio_exposure_calculations()
     test_decision_context_follow_up_recommendations()
@@ -2671,6 +2788,7 @@ def main() -> None:
     market_app.get_intraday_data = fake_get_intraday_data
     market_app.get_auction_data = fake_get_auction_data
     market_app.filter_a_share_securities_data = fake_filter_a_share_securities_data
+    market_app.screen_a_share_research_candidates_data = fake_screen_a_share_research_candidates_data
     market_app.get_fund_flow_data = fake_get_fund_flow_data
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_fund_exposure_data = fake_get_fund_exposure_data
@@ -2698,7 +2816,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "fund_look_through_explicit_units_v1"
+        assert health.json()["routing_revision"] == "candidate_evidence_gate_history_cache_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -2742,6 +2860,7 @@ def main() -> None:
             "get_a_share_intraday",
             "get_a_share_auction",
             "filter_a_share_securities",
+            "screen_a_share_research_candidates",
             "get_a_share_fund_flow",
             "get_a_share_financials",
             "get_fund_exposure",
@@ -2856,6 +2975,7 @@ def main() -> None:
                 },
             ),
             (29, "get_ipo_subscription_status", {"symbol_or_name": "301707"}),
+            (30, "screen_a_share_research_candidates", {}),
         ):
             response = client.post(
                 "/mcp",
