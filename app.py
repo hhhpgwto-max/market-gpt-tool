@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v2"
+ROUTING_REVISION = "capital_timeline_sector_history_v3"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -94,7 +94,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.0",
+    version="0.14.1",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -491,6 +491,7 @@ def get_cached_tool_data(
     loader: Any,
     *,
     inflight_wait_timeout_seconds: float | None = None,
+    partial_ttl_seconds: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     while True:
         now = datetime.now(timezone.utc)
@@ -498,7 +499,13 @@ def get_cached_tool_data(
             cached = TOOL_CACHE.get(key)
             if cached is not None:
                 age_seconds = (now - cached["created_at"]).total_seconds()
-                if age_seconds <= ttl_seconds:
+                effective_ttl_seconds = (
+                    partial_ttl_seconds
+                    if partial_ttl_seconds is not None
+                    and cached["data"].get("data_status") in {"partial_data", "no_data"}
+                    else ttl_seconds
+                )
+                if age_seconds <= effective_ttl_seconds:
                     return (
                         deepcopy(cached["data"]),
                         {
@@ -6561,7 +6568,7 @@ def get_sector_rotation_data(
         boards = deduplicate_industry_boards(boards, len(boards))
         if normalized_level != "all":
             boards = [board for board in boards if board.get("level") == int(normalized_level)]
-    candidate_count = min(max(limit * 2, 8), 16)
+    candidate_count = min(max(limit + 3, 8), 12)
     by_change = sorted(
         boards,
         key=lambda item: (
@@ -6598,7 +6605,7 @@ def get_sector_rotation_data(
     history_limit = max(normalized_lookbacks) + 6
     history_route = "eastmoney_sector_daily_history"
     route_degraded = preferred_route_is_temporarily_degraded(
-        history_route, min_consecutive_failures=1, cooldown_seconds=600
+        history_route, min_consecutive_failures=2, cooldown_seconds=90
     )
     first_board_symbol = (
         str(candidates[0].get("symbol")) if candidates else None
@@ -6624,7 +6631,7 @@ def get_sector_rotation_data(
             }
         )
     initial_results, _, initial_errors = collect_components(
-        initial_loaders, 4, COMPOSITE_TOOL_EXECUTOR
+        initial_loaders, 6, COMPOSITE_TOOL_EXECUTOR
     )
     source_errors.extend(
         f"{error['source']}: {error['message']}" for error in initial_errors
@@ -6662,7 +6669,7 @@ def get_sector_rotation_data(
             if board.get("symbol")
         }
         remaining_results, _, remaining_errors = collect_components(
-            remaining_loaders, 4, COMPOSITE_TOOL_EXECUTOR
+            remaining_loaders, 6, COMPOSITE_TOOL_EXECUTOR
         )
         source_errors.extend(
             f"{error['source']}: {error['message']}" for error in remaining_errors
@@ -9613,6 +9620,7 @@ def run_cached_tool(
     loader: Any,
     symbol: str | None = None,
     max_stale_age_seconds: int | None = None,
+    partial_ttl_seconds: int | None = None,
 ) -> dict[str, Any]:
     started_at = perf_counter()
     key = cache_key(tool_name, parameters)
@@ -9621,6 +9629,7 @@ def run_cached_tool(
             key,
             ttl_seconds,
             loader,
+            partial_ttl_seconds=partial_ttl_seconds,
         )
     except HTTPException as exc:
         stale_snapshot = (
@@ -10494,6 +10503,7 @@ def get_a_share_sector_rotation(
         300,
         lambda: get_sector_rotation_data(**parameters),
         max_stale_age_seconds=3600,
+        partial_ttl_seconds=15,
     )
 
 

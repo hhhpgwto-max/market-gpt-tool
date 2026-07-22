@@ -1855,6 +1855,24 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert first_cache["cache_hit"] is False
     assert second_cache["cache_hit"] is True
 
+    partial_calls = 0
+    partial_key = market_app.cache_key("partial-test", {})
+
+    def partial_loader() -> dict:
+        nonlocal partial_calls
+        partial_calls += 1
+        return {"data_status": "partial_data", "attempt": partial_calls}
+
+    market_app.get_cached_tool_data(
+        partial_key, 300, partial_loader, partial_ttl_seconds=15
+    )
+    market_app.TOOL_CACHE[partial_key]["created_at"] -= market_app.timedelta(seconds=16)
+    refreshed, refreshed_cache = market_app.get_cached_tool_data(
+        partial_key, 300, partial_loader, partial_ttl_seconds=15
+    )
+    assert refreshed["attempt"] == 2
+    assert refreshed_cache["cache_hit"] is False
+
     original_market_status_at = market_app.market_status_at
     market_app.market_status_at = lambda *_: "closed"
     try:
@@ -1932,7 +1950,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_v2"
+    assert health["routing_revision"] == "capital_timeline_sector_history_v3"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -3071,7 +3089,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v2"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v3"
 
         for legacy_path in (
             "/search?keyword=600000",
