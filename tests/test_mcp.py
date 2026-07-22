@@ -1950,7 +1950,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_v3"
+    assert health["routing_revision"] == "capital_timeline_sector_history_v4"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2529,6 +2529,45 @@ def test_rotation_overnight_and_event_helpers() -> None:
     assert sector_history["items"][0]["close"] == 101
     assert sector_history["source"] == "7.push2his.eastmoney.com"
 
+    original_sws_json = market_app.read_swsresearch_json
+
+    def sws_json(path: str, parameters: dict) -> dict:
+        if path.endswith("current/"):
+            return {
+                "code": "200",
+                "data": {
+                    "results": [
+                        {"swindexcode": "801016", "swindexname": "种植业"}
+                    ]
+                },
+            }
+        return {
+            "code": "200",
+            "data": [
+                {
+                    "swindexcode": "801016",
+                    "bargaindate": "2026-07-20",
+                    "openindex": 100,
+                    "maxindex": 102,
+                    "minindex": 99,
+                    "closeindex": 101,
+                    "markup": 1,
+                    "bargainamount": 10,
+                    "bargainsum": 1000,
+                }
+            ],
+        }
+
+    market_app.read_swsresearch_json = sws_json
+    market_app.TOOL_CACHE.pop(market_app.cache_key("swsresearch_industry_code_map", {}), None)
+    try:
+        sws_history = market_app.get_swsresearch_industry_daily_kline("种植业Ⅱ", 30)
+    finally:
+        market_app.read_swsresearch_json = original_sws_json
+    assert sws_history["provider_identifier"] == "801016"
+    assert sws_history["items"][0]["close"] == 101
+    assert sws_history["source"] == "swsresearch_official_index_history"
+
 
 def test_fund_and_portfolio_exposure_calculations() -> None:
     normalized, input_total = market_app.normalized_portfolio_positions(
@@ -3089,7 +3128,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v3"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v4"
 
         for legacy_path in (
             "/search?keyword=600000",
