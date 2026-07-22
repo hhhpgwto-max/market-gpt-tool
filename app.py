@@ -13,7 +13,7 @@ from html import unescape
 from math import ceil, sqrt
 from threading import Event, Lock
 from time import perf_counter, perf_counter_ns
-from typing import Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -24,10 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v7"
+ROUTING_REVISION = "capital_timeline_sector_history_filter_schema_v8"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -95,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.5",
+    version="0.14.6",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -9986,15 +9987,42 @@ def get_a_share_auction(symbol: str) -> dict[str, Any]:
     annotations=READ_ONLY_TOOL,
 )
 def filter_a_share_securities(
-    security_type: str = "stock",
-    exclude_st: bool = True,
-    change_pct_min: float | None = None,
-    change_pct_max: float | None = None,
-    turnover_min: float | None = None,
-    turnover_rate_min: float | None = None,
-    above_average_price: bool | None = None,
-    market_cap_max: float | None = None,
-    limit: int = 50,
+    security_type: Annotated[
+        Literal["stock", "a_share"],
+        Field(description="Security universe. Both accepted values mean ordinary exchange-listed A-share stocks; ETFs, funds and B shares are excluded."),
+    ] = "stock",
+    exclude_st: Annotated[
+        bool,
+        Field(description="When true, exclude ST and *ST securities. Defaults to true."),
+    ] = True,
+    change_pct_min: Annotated[
+        float | None,
+        Field(description="Minimum current-day price change in percentage points; for example, 1.5 means +1.5%. Null disables this lower bound."),
+    ] = None,
+    change_pct_max: Annotated[
+        float | None,
+        Field(description="Maximum current-day price change in percentage points; for example, 6 means +6%. Null disables this upper bound."),
+    ] = None,
+    turnover_min: Annotated[
+        float | None,
+        Field(description="Minimum current-day turnover amount in CNY yuan; for example, 500000000 means CNY 500 million. Null disables this filter."),
+    ] = None,
+    turnover_rate_min: Annotated[
+        float | None,
+        Field(description="Minimum current-day turnover rate in percentage points; for example, 2 means 2%. Null disables this filter."),
+    ] = None,
+    above_average_price: Annotated[
+        bool | None,
+        Field(description="When true, require the latest price to be above the current-day volume-weighted average transaction price. False or null disables this filter."),
+    ] = None,
+    market_cap_max: Annotated[
+        float | None,
+        Field(description="Maximum total market capitalization in CNY yuan; for example, 100000000000 means CNY 100 billion. Null disables this filter."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=200, description="Maximum number of matching securities to return, from 1 to 200."),
+    ] = 50,
 ) -> dict[str, Any]:
     normalized_limit = max(1, min(limit, 200))
     parameters = {
