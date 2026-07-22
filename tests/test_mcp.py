@@ -3189,6 +3189,14 @@ def main() -> None:
             "get_a_share_market_overview",
             "get_market_data_health",
         }
+        registered_by_name = {tool["name"]: tool for tool in registered_tools}
+        filter_properties = registered_by_name["filter_a_share_securities"]["inputSchema"]["properties"]
+        assert filter_properties["security_type"]["enum"] == ["stock", "a_share"]
+        assert "percentage points" in filter_properties["change_pct_min"]["description"]
+        assert "CNY yuan" in filter_properties["turnover_min"]["description"]
+        assert "volume-weighted average" in filter_properties["above_average_price"]["description"]
+        assert filter_properties["limit"]["minimum"] == 1
+        assert filter_properties["limit"]["maximum"] == 200
         assert all(tool["annotations"]["readOnlyHint"] is True for tool in registered_tools)
 
         search = client.post(
