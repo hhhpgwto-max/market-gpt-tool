@@ -1950,7 +1950,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_v5"
+    assert health["routing_revision"] == "capital_timeline_sector_history_v6"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2532,36 +2532,29 @@ def test_rotation_overnight_and_event_helpers() -> None:
     original_sws_json = market_app.read_swsresearch_json
 
     def sws_json(path: str, parameters: dict) -> dict:
-        if path.endswith("current/"):
-            return {
-                "code": "200",
-                "data": {
-                    "results": [
-                        {"swindexcode": "801016", "swindexname": "种植业"}
-                    ]
-                },
-            }
         return {
             "code": "200",
-            "data": [
-                {
-                    "swindexcode": "801016",
-                    "bargaindate": "2026-07-20",
-                    "openindex": 100,
-                    "maxindex": 102,
-                    "minindex": 99,
-                    "closeindex": 101,
-                    "markup": 1,
-                    "bargainamount": 10,
-                    "bargainsum": 1000,
-                }
-            ],
+            "data": {
+                "results": [
+                    {
+                        "swindexcode": "801016",
+                        "swindexname": "Planting",
+                        "bargaindate": parameters["start_date"],
+                        "closeindex": 101,
+                        "markup": 1,
+                        "bargainamount": 10,
+                        "turnoverrate": 2,
+                    }
+                ]
+            },
         }
 
     market_app.read_swsresearch_json = sws_json
-    market_app.TOOL_CACHE.pop(market_app.cache_key("swsresearch_industry_code_map", {}), None)
+    market_app.TOOL_CACHE.pop(
+        market_app.cache_key("swsresearch_recent_level2_history", {"limit": 30}), None
+    )
     try:
-        sws_history = market_app.get_swsresearch_industry_daily_kline("种植业Ⅱ", 30)
+        sws_history = market_app.get_swsresearch_industry_daily_kline("Planting\u2161", 30)
     finally:
         market_app.read_swsresearch_json = original_sws_json
     assert sws_history["provider_identifier"] == "801016"
@@ -3128,7 +3121,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v5"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v6"
 
         for legacy_path in (
             "/search?keyword=600000",
