@@ -1932,7 +1932,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "calendar_capital_activity_v1"
+    assert health["routing_revision"] == "capital_timeline_sector_history_v2"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2477,6 +2477,40 @@ def test_rotation_overnight_and_event_helpers() -> None:
     assert feedback["return_after_5_sessions_pct"] == 10.0
     assert market_app.event_titles_match("公司回购股份方案", "关于公司回购股份方案的公告") is True
 
+    capital_records = market_app.capital_activity_timeline_records(
+        {
+            "components": {
+                "block_trades": {
+                    "institution_related_items": [
+                        {"trade_date": "2026-07-13", "deal_amount_cny": 500}
+                    ]
+                },
+                "institutional_research": {
+                    "items": [
+                        {"research_start_date": "2026-07-09", "participant_count": 12}
+                    ]
+                },
+            }
+        }
+    )
+    nearby = market_app.nearby_capital_activity("2026-07-10", capital_records)
+    assert len(nearby) == 2
+    assert {item["calendar_days_from_event"] for item in nearby} == {-1, 3}
+    assert all(item["relationship_status"] == "temporal_proximity_only_not_causation" for item in nearby)
+
+    original_json = market_app.read_public_json
+    def sector_json(url: str, *args, **kwargs) -> dict:
+        if "7.push2his" not in url:
+            raise market_app.HTTPException(status_code=502, detail="test node failure")
+        return {"data": {"name": "Test board", "klines": ["2026-07-20,100,101,102,99,10,1000,3,1,1,2"]}}
+    market_app.read_public_json = sector_json
+    try:
+        sector_history = market_app.get_eastmoney_generic_daily_kline("90.BK0001", 30)
+    finally:
+        market_app.read_public_json = original_json
+    assert sector_history["items"][0]["close"] == 101
+    assert sector_history["source"] == "7.push2his.eastmoney.com"
+
 
 def test_fund_and_portfolio_exposure_calculations() -> None:
     normalized, input_total = market_app.normalized_portfolio_positions(
@@ -2956,6 +2990,16 @@ def test_trading_calendar_and_capital_activity_contracts() -> None:
     assert result["components"]["dragon_tiger"]["latest_institution_net_amount_cny"] == 20
     assert result["components"]["block_trades"]["institution_buy_amount_cny"] == 500
     assert result["components"]["block_trades"]["items"][0]["premium_discount_pct"] == 1.0
+    assert result["historical_comparisons"]["block_trades"]["institution_buy_amount_cny"]["recent_total"] == 500
+    comparison = market_app.dated_window_totals(
+        [
+            {"date": market_app.datetime.now(market_app.MARKET_TIMEZONE).date().isoformat(), "amount": 20},
+            {"date": (market_app.datetime.now(market_app.MARKET_TIMEZONE).date() - market_app.timedelta(days=31)).isoformat(), "amount": 10},
+        ],
+        "date",
+        ("amount",),
+    )
+    assert comparison["amount"]["change_pct"] == 100.0
 
 
 def main() -> None:
@@ -3027,7 +3071,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "calendar_capital_activity_v1"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v2"
 
         for legacy_path in (
             "/search?keyword=600000",
