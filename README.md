@@ -1,5 +1,7 @@
 # Market GPT Tool MCP
 
+> 2026-07-22 新增：`get_a_share_trading_calendar` 提供上交所官方 2026 交易日、休市日和交易时段口径；`get_a_share_capital_activity` 分项返回龙虎榜机构席位、大宗交易机构席位、机构调研、两融及股东人数变化，不合成为“主力流入/吸筹/出货”结论。
+
 这是给普通 ChatGPT 对话使用的只读 A 股及交易所基金行情 MCP 服务。
 
 ```text

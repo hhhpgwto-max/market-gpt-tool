@@ -279,6 +279,16 @@ def fake_get_ipo_subscription_status_data(
     }
 
 
+def fake_get_a_share_trading_calendar_data(start_date, end_date, detail_level) -> dict:
+    return {"start_date": start_date, "end_date": end_date, "items": [], "detail_level": detail_level,
+            "source": ["test"], "source_errors": [], "missing_fields": [], "data_status": "full_data"}
+
+
+def fake_get_a_share_capital_activity_data(symbol, lookback_days, limit, detail_level) -> dict:
+    return {"symbol": symbol, "components": {}, "source": ["test"], "source_errors": [],
+            "missing_fields": [], "data_status": "full_data", "detail_level": detail_level}
+
+
 def fake_get_news_data(
     symbol: str,
     limit: int,
@@ -1922,7 +1932,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "session_snapshot_health_hardening_v2"
+    assert health["routing_revision"] == "calendar_capital_activity_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2913,6 +2923,41 @@ def test_ipo_subscription_status_contract() -> None:
         market_app.TOOL_CACHE.pop(fast_cache_key, None)
 
 
+def test_trading_calendar_and_capital_activity_contracts() -> None:
+    calendar = market_app.get_a_share_trading_calendar_data("2026-02-13", "2026-02-25", "raw")
+    by_date = {item["date"]: item for item in calendar["items"]}
+    assert by_date["2026-02-16"]["session_type"] == "closed_official_holiday"
+    assert by_date["2026-02-24"]["is_trading_day"] is True
+    assert market_app.market_status_at(market_app.datetime(2026, 2, 16, 10, 0,
+        tzinfo=market_app.MARKET_TIMEZONE)) == "closed"
+    assert market_app.get_a_share_trading_calendar_data("2027-01-04", "2027-01-04", "summary")["data_status"] == "partial_data"
+    original = market_app.get_eastmoney_datacenter_rows
+    def rows(report, row_filter, sort, page_size=20):
+        if report == "RPT_DAILYBILLBOARD_DETAILSNEW":
+            return [{"TRADE_DATE": "2026-07-20", "BILLBOARD_NET_AMT": 20}]
+        if report in {"RPT_BILLBOARD_DAILYDETAILSBUY", "RPT_BILLBOARD_DAILYDETAILSSELL"}:
+            return [{"OPERATEDEPT_CODE": "0", "OPERATEDEPT_NAME": "机构专用", "BUY": 60, "SELL": 40, "NET": 20}]
+        if report == "RPT_DATA_BLOCKTRADE":
+            return [{"TRADE_DATE": "2026-07-19", "DEAL_PRICE": 101, "CLOSE_PRICE": 100, "DEAL_AMT": 500,
+                     "BUYER_CODE": "0", "BUYER_NAME": "机构专用", "SELLER_CODE": "1"}]
+        if report == "RPT_ORG_SURVEYNEW":
+            return [{"NOTICE_DATE": "2026-07-18", "SUM": 12}]
+        if report == "RPTA_WEB_RZRQ_GGMX":
+            return [{"DATE": "2026-07-21", "RZYE": 1000}]
+        if report == "RPT_HOLDERNUMLATEST":
+            return [{"END_DATE": "2026-06-30", "HOLDER_NUM": 100}]
+        raise AssertionError(report)
+    market_app.get_eastmoney_datacenter_rows = rows
+    try:
+        result = market_app.get_a_share_capital_activity_data("600519", 90, 10, "raw")
+    finally:
+        market_app.get_eastmoney_datacenter_rows = original
+    assert result["data_status"] == "full_data"
+    assert result["components"]["dragon_tiger"]["latest_institution_net_amount_cny"] == 20
+    assert result["components"]["block_trades"]["institution_buy_amount_cny"] == 500
+    assert result["components"]["block_trades"]["items"][0]["premium_discount_pct"] == 1.0
+
+
 def main() -> None:
     test_kline_source_parsers()
     test_kline_range_and_pagination()
@@ -2943,6 +2988,7 @@ def main() -> None:
     test_decision_context_follow_up_recommendations()
     test_market_cross_checks_preserve_coexisting_signals()
     test_ipo_subscription_status_contract()
+    test_trading_calendar_and_capital_activity_contracts()
     market_app.TOOL_CACHE.clear()
     market_app.search_stock_data = fake_search_stock_data
     market_app.get_quote_data = fake_get_quote_data
@@ -2971,6 +3017,8 @@ def main() -> None:
     market_app.get_sector_rotation_data = fake_get_sector_rotation_data
     market_app.get_overnight_risk_packet_data = fake_get_overnight_risk_packet_data
     market_app.get_ipo_subscription_status_data = fake_get_ipo_subscription_status_data
+    market_app.get_a_share_trading_calendar_data = fake_get_a_share_trading_calendar_data
+    market_app.get_a_share_capital_activity_data = fake_get_a_share_capital_activity_data
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -2979,7 +3027,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "session_snapshot_health_hardening_v2"
+        assert health.json()["routing_revision"] == "calendar_capital_activity_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -3029,6 +3077,8 @@ def main() -> None:
             "get_fund_exposure",
             "get_portfolio_exposure",
             "get_ipo_subscription_status",
+            "get_a_share_trading_calendar",
+            "get_a_share_capital_activity",
             "get_a_share_news",
             "get_a_share_announcements",
             "get_a_share_event_timeline",
@@ -3139,6 +3189,8 @@ def main() -> None:
             ),
             (29, "get_ipo_subscription_status", {"symbol_or_name": "301707"}),
             (30, "screen_a_share_research_candidates", {}),
+            (31, "get_a_share_trading_calendar", {"start_date": "2026-07-20", "end_date": "2026-07-24"}),
+            (32, "get_a_share_capital_activity", {"symbol": "600519"}),
         ):
             response = client.post(
                 "/mcp",
