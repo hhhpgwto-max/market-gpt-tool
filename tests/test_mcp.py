@@ -1950,7 +1950,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_v7"
+    assert health["routing_revision"] == "capital_timeline_sector_history_filter_schema_v8"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -3121,7 +3121,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_v7"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_schema_v8"
 
         for legacy_path in (
             "/search?keyword=600000",
