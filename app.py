@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from math import ceil, sqrt
 from threading import Event, Lock
-from time import perf_counter
+from time import perf_counter, perf_counter_ns
 from typing import Any
 from urllib.parse import urlencode
 from urllib.error import URLError
@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "calendar_capital_activity_v1"
+ROUTING_REVISION = "capital_timeline_sector_history_v2"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -57,6 +57,8 @@ MCP_INSTRUCTIONS = (
     "Use get_a_share_limit_activity for public limit-up, limit-down, open-board, and consecutive-board facts. "
     "Use get_a_share_capital_activity for disclosed institution activity. Keep its categories separate; never infer "
     "main-force inflow, accumulation, or distribution from them. "
+    "When an event may overlap disclosed activity, use get_a_share_event_timeline and treat its date links as "
+    "temporal proximity only, never causation. "
     "Do not convert those mechanical counts into sentiment or trading labels. Never place trades, access brokerage "
     "accounts, issue buy/sell recommendations, or make automated financial decisions. All data is informational only "
     "and is not investment advice."
@@ -92,7 +94,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.13.0",
+    version="0.14.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -3967,6 +3969,63 @@ def event_price_feedback(
     return result
 
 
+def capital_activity_timeline_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    components = payload.get("components") or {}
+    records: list[dict[str, Any]] = []
+    dragon = components.get("dragon_tiger") or {}
+    latest_seat_date = dragon.get("latest_seat_trade_date")
+    for item in dragon.get("items") or []:
+        records.append({
+            "activity_type": "dragon_tiger_disclosure",
+            "activity_date": item.get("trade_date"),
+            "scope": "abnormal_trading_day_only",
+            "facts": {
+                "reason": item.get("reason"),
+                "total_buy_amount_cny": item.get("total_buy_amount_cny"),
+                "total_sell_amount_cny": item.get("total_sell_amount_cny"),
+                "total_net_amount_cny": item.get("total_net_amount_cny"),
+                "institution_seats": dragon.get("latest_institution_seats") if item.get("trade_date") == latest_seat_date else None,
+            },
+        })
+    for item in (components.get("block_trades") or {}).get("institution_related_items") or []:
+        records.append({"activity_type": "institution_labelled_block_trade", "activity_date": item.get("trade_date"),
+                        "scope": "disclosed_counterparty_seat_not_ultimate_owner", "facts": item})
+    for item in (components.get("institutional_research") or {}).get("items") or []:
+        records.append({"activity_type": "institutional_research_visit", "activity_date": item.get("research_start_date") or item.get("notice_date"),
+                        "scope": "contact_activity_not_purchase_evidence", "facts": item})
+    margin_items = (components.get("margin") or {}).get("items") or []
+    if margin_items:
+        records.append({"activity_type": "margin_balance_observation", "activity_date": margin_items[0].get("trade_date"),
+                        "scope": "mixed_investor_categories_not_institution_exclusive", "facts": margin_items[0]})
+    for item in ((components.get("shareholder_count") or {}).get("items") or [])[:2]:
+        records.append({"activity_type": "shareholder_count_disclosure", "activity_date": item.get("period_end"),
+                        "scope": "aggregate_holder_count_not_institution_position", "facts": item})
+    records = [item for item in records if item.get("activity_date")]
+    records.sort(key=lambda item: str(item.get("activity_date")), reverse=True)
+    return records[:40]
+
+
+def nearby_capital_activity(event_date: str | None, records: list[dict[str, Any]],
+                            window_days: int = 3) -> list[dict[str, Any]]:
+    if not event_date:
+        return []
+    try:
+        anchor = datetime.fromisoformat(event_date).date()
+    except ValueError:
+        return []
+    nearby = []
+    for record in records:
+        try:
+            activity_date = datetime.fromisoformat(str(record.get("activity_date"))).date()
+        except ValueError:
+            continue
+        distance = (activity_date - anchor).days
+        if abs(distance) <= window_days:
+            nearby.append({**record, "calendar_days_from_event": distance,
+                           "relationship_status": "temporal_proximity_only_not_causation"})
+    return nearby[:10]
+
+
 def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     # Use one stable fetch size so different timeline display limits can share
@@ -4007,9 +4066,18 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
             86400,
             lambda: get_kline_data(symbol, "daily", kline_limit),
         ),
+        "capital_activity": lambda: get_cached_component_with_stale(
+            cache_key(
+                "get_a_share_capital_activity",
+                {"symbol": symbol, "lookback_days": min(max(days, 30), 365), "limit": 20, "detail_level": "raw"},
+            ),
+            300,
+            86400,
+            lambda: get_a_share_capital_activity_data(symbol, min(max(days, 30), 365), 20, "raw"),
+        ),
     }
     results, component_status, source_errors = collect_components(
-        loaders, 7, COMPOSITE_TOOL_EXECUTOR
+        loaders, 10, COMPOSITE_TOOL_EXECUTOR
     )
     if not results.get("official_announcements") and not results.get("news"):
         raise HTTPException(status_code=502, detail="Both official announcements and news timeline sources failed.")
@@ -4107,6 +4175,12 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
                 "price_feedback": event_price_feedback(min(dates) if dates else None, bars),
             }
         )
+    capital_records = capital_activity_timeline_records(results.get("capital_activity") or {})
+    for event in events:
+        event["nearby_disclosed_capital_activity"] = nearby_capital_activity(
+            event.get("event_date"), capital_records
+        )
+        event["nearby_activity_count"] = len(event["nearby_disclosed_capital_activity"])
     events.sort(key=lambda item: str(item.get("event_date") or ""), reverse=True)
     events = events[:limit]
     nested_errors = [
@@ -4120,6 +4194,10 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
         "period_days": days,
         "count": len(events),
         "events": events,
+        "capital_activity_count": len(capital_records),
+        "capital_activity_timeline": capital_records,
+        "capital_event_link_window_calendar_days": 3,
+        "capital_event_relationship_status": "temporal_proximity_only_not_causation",
         "price_feedback_method": "Forward-adjusted close-to-close return from the first trading session on or after the disclosed/publication date.",
         "component_status": component_status,
         "source": sorted(
@@ -4133,11 +4211,11 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
         "source_errors": [*source_errors, *nested_errors],
         "data_status": (
             "full_data"
-            if len(results) == 3 and not source_errors and not nested_errors
+            if len(results) == 4 and not source_errors and not nested_errors
             else "partial_data"
         ),
         "queried_at": now_iso(),
-        "note": "Records are clustered mechanically by title similarity. Publication time is not silently relabelled as the real-world event time, and price feedback is not a good/bad or trading judgement.",
+        "note": "Records are clustered mechanically by title similarity. Nearby capital activity means date proximity only, not causation or event impact. Publication time is not silently relabelled as event time, and price feedback is not a trading judgement.",
     }
 
 
@@ -6253,54 +6331,185 @@ def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
     )
-    errors = []
-    # The delayed quote host identifies boards but currently returns an empty K-line
-    # array. Avoid a second serial wait after the dedicated history route fails.
-    for host in ("push2his.eastmoney.com",):
-        try:
-            payload = read_public_json(
-                f"https://{host}/api/qt/stock/kline/get?{query}",
-                "https://quote.eastmoney.com/",
-                timeout=3,
-                attempts=1,
+    def load_host(host: str) -> dict[str, Any]:
+        payload = read_public_json(
+            f"https://{host}/api/qt/stock/kline/get?{query}",
+            "https://quote.eastmoney.com/",
+            timeout=4,
+            attempts=1,
+        )
+        data = payload.get("data") or {}
+        rows = []
+        for raw in data.get("klines") or []:
+            values = str(raw).split(",")
+            if len(values) < 11:
+                continue
+            rows.append(
+                {
+                    "date": clean_value(values[0]),
+                    "open": to_number(values[1]),
+                    "close": to_number(values[2]),
+                    "high": to_number(values[3]),
+                    "low": to_number(values[4]),
+                    "volume": to_number(values[5]),
+                    "turnover": to_number(values[6]),
+                    "change_pct": to_number(values[8]),
+                    "turnover_rate": to_number(values[10]),
+                }
             )
-            data = payload.get("data") or {}
-            rows = []
-            for raw in data.get("klines") or []:
-                values = str(raw).split(",")
-                if len(values) < 11:
-                    continue
-                rows.append(
-                    {
-                        "date": clean_value(values[0]),
-                        "open": to_number(values[1]),
-                        "close": to_number(values[2]),
-                        "high": to_number(values[3]),
-                        "low": to_number(values[4]),
-                        "volume": to_number(values[5]),
-                        "turnover": to_number(values[6]),
-                        "change_pct": to_number(values[8]),
-                        "turnover_rate": to_number(values[10]),
-                    }
-                )
-            if rows:
-                return {"name": clean_value(data.get("name")), "items": rows, "source": host}
-            errors.append(f"{host}: no daily rows")
+        if not rows:
+            raise HTTPException(status_code=502, detail=f"{host}: no daily rows")
+        return {"name": clean_value(data.get("name")), "items": rows, "source": host}
+
+    errors = []
+    for host in ("91.push2his.eastmoney.com", "7.push2his.eastmoney.com"):
+        try:
+            payload = load_host(host)
+            payload["source_errors"] = errors
+            return payload
         except HTTPException as exc:
             errors.append(f"{host}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def get_10jqka_industry_code_map() -> dict[str, str]:
+    key = cache_key("10jqka_industry_code_map", {})
+    def load() -> dict[str, Any]:
+        text = read_market_text(
+            "https://q.10jqka.com.cn/thshy/",
+            "https://q.10jqka.com.cn/thshy/",
+            timeout=4,
+        )
+        mapping = {
+            unescape(name).strip(): code
+            for code, name in re.findall(r'/thshy/detail/code/(\d+)/[^>]*>([^<]+)', text)
+        }
+        if not mapping:
+            raise HTTPException(status_code=502, detail="No 10jqka industry mapping rows.")
+        return {"mapping": mapping}
+    component, _ = get_cached_tool_data(key, 21600, load)
+    return component["mapping"]
+
+
+def matched_10jqka_industry_code(board_name: str) -> tuple[str, str] | None:
+    normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
+    mapping = get_10jqka_industry_code_map()
+    if normalized_name in mapping:
+        return normalized_name, mapping[normalized_name]
+    matches = [
+        (name, code)
+        for name, code in mapping.items()
+        if len(normalized_name) >= 3 and len(name) >= 3
+        and (normalized_name in name or name in normalized_name)
+    ]
+    return min(matches, key=lambda item: len(item[0])) if matches else None
+
+
+def get_10jqka_industry_daily_kline(board_name: str, limit: int) -> dict[str, Any]:
+    normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
+    matched = matched_10jqka_industry_code(board_name)
+    if not matched:
+        raise HTTPException(status_code=404, detail=f"No matched 10jqka industry code: {normalized_name}")
+    matched_name, code = matched
+    rows = []
+    current_year = datetime.now(MARKET_TIMEZONE).year
+    for year in (current_year, current_year - 1):
+        text = read_market_text(
+            f"https://d.10jqka.com.cn/v4/line/bk_{code}/01/{year}.js",
+            "http://q.10jqka.com.cn",
+            timeout=4,
+        )
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            continue
+        try:
+            data = json.loads(text[start : end + 1]).get("data") or ""
+        except json.JSONDecodeError:
+            continue
+        for raw in str(data).split(";"):
+            values = raw.split(",")
+            if len(values) < 7:
+                continue
+            try:
+                trade_date = datetime.strptime(values[0], "%Y%m%d").date().isoformat()
+            except ValueError:
+                continue
+            rows.append({"date": trade_date, "open": to_number(values[1]), "high": to_number(values[2]),
+                         "low": to_number(values[3]), "close": to_number(values[4]),
+                         "volume": to_number(values[5]), "turnover": to_number(values[6]),
+                         "turnover_rate": None})
+        if len(rows) >= limit + 1:
+            break
+    rows.sort(key=lambda item: str(item.get("date")))
+    previous_close = None
+    for row in rows:
+        row["change_pct"] = value_change_pct(row.get("close"), previous_close)
+        previous_close = row.get("close")
+    if not rows:
+        raise HTTPException(status_code=502, detail=f"No 10jqka history rows: {normalized_name}")
+    return {"name": normalized_name, "matched_provider_name": matched_name,
+            "items": rows[-limit:], "source": "10jqka_industry_daily_history"}
+
+
+def get_tencent_index_daily_kline(symbol: str, limit: int) -> dict[str, Any]:
+    market_code = "sh" if symbol.startswith("000") else "sz"
+    url = (
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+        + urlencode({"param": f"{market_code}{symbol},day,,,{limit},qfq"})
+    )
+    payload = read_public_json(url, "https://stockapp.finance.qq.com/", timeout=4, attempts=1)
+    data = (payload.get("data") or {}).get(f"{market_code}{symbol}") or {}
+    raw_rows = data.get("qfqday") or data.get("day") or []
+    rows = []
+    for values in raw_rows:
+        if not isinstance(values, list) or len(values) < 6:
+            continue
+        rows.append({"date": clean_value(values[0]), "open": to_number(values[1]), "close": to_number(values[2]),
+                     "high": to_number(values[3]), "low": to_number(values[4]), "volume": to_number(values[5]),
+                     "turnover": None, "turnover_rate": None})
+    previous_close = None
+    for row in rows:
+        row["change_pct"] = value_change_pct(row.get("close"), previous_close)
+        previous_close = row.get("close")
+    if not rows:
+        raise HTTPException(status_code=502, detail=f"No Tencent index history rows: {symbol}")
+    return {"name": clean_value((data.get("qt") or {}).get(f"{market_code}{symbol}", [None, None])[1]),
+            "items": rows, "source": "tencent_index_daily_history"}
 
 
 def sector_history_cache_key(secid: str, limit: int) -> str:
     return cache_key("sector_daily_history", {"secid": secid, "limit": limit})
 
 
-def get_cached_sector_daily_kline(secid: str, limit: int) -> dict[str, Any]:
+def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None = None,
+                                  sector_type: str | None = None) -> dict[str, Any]:
+    def load() -> dict[str, Any]:
+        if secid == "1.000300":
+            payload, _, errors = race_public_sources(
+                (
+                    ("eastmoney_index_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
+                    ("tencent_index_history", lambda: get_tencent_index_daily_kline("000300", limit)),
+                ),
+                5,
+            )
+            payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
+            return payload
+        if board_name and sector_type == "industry":
+            payload, _, errors = race_public_sources(
+                (
+                    ("eastmoney_sector_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
+                    ("10jqka_industry_history", lambda: get_10jqka_industry_daily_kline(board_name, limit)),
+                ),
+                5,
+            )
+            payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
+            return payload
+        return get_eastmoney_generic_daily_kline(secid, limit)
     return get_cached_component_with_stale(
         sector_history_cache_key(secid, limit),
         300,
         3600,
-        lambda: get_eastmoney_generic_daily_kline(secid, limit),
+        load,
     )
 
 
@@ -6371,6 +6580,17 @@ def get_sector_rotation_data(
             continue
         seen_board_symbols.add(board_symbol)
         candidates.append(board)
+    if normalized_type == "industry":
+        try:
+            representative = next(
+                (board for board in candidates if matched_10jqka_industry_code(str(board.get("name") or ""))),
+                None,
+            )
+            if representative is not None:
+                candidates.remove(representative)
+                candidates.insert(0, representative)
+        except HTTPException:
+            pass
     history_results: dict[str, dict[str, Any]] = {}
     source_errors: list[str | dict[str, Any]] = normalize_source_errors(
         board_component.get("source_errors")
@@ -6398,7 +6618,8 @@ def get_sector_rotation_data(
                     "1.000300", history_limit
                 ),
                 f"sector_history:{first_board_symbol}": lambda: get_cached_sector_daily_kline(
-                    f"90.{first_board_symbol}", history_limit
+                    f"90.{first_board_symbol}", history_limit,
+                    candidates[0].get("name"), normalized_type,
                 ),
             }
         )
@@ -6434,7 +6655,8 @@ def get_sector_rotation_data(
     if live_probe_succeeded:
         remaining_loaders = {
             f"sector_history:{board['symbol']}": lambda board=board: get_cached_sector_daily_kline(
-                f"90.{board['symbol']}", history_limit
+                f"90.{board['symbol']}", history_limit,
+                board.get("name"), normalized_type,
             )
             for board in candidates[1:]
             if board.get("symbol")
@@ -6501,6 +6723,14 @@ def get_sector_rotation_data(
                 ),
                 "history_status": "available" if rows else "unavailable",
                 "history_source": history.get("source"),
+                "history_provider_name": history.get("matched_provider_name") or history.get("name"),
+                "history_name_match_status": (
+                    "cross_provider_normalized_name_match_definitions_may_differ"
+                    if history.get("source") == "10jqka_industry_daily_history"
+                    else "same_provider_identifier"
+                    if rows
+                    else "unavailable"
+                ),
                 "history_is_stale": bool(history.get("served_from_stale_cache")),
                 "history_cache_age_seconds": history.get("stale_cache_age_seconds"),
                 "turnover_share_of_a_share_market_pct": (
@@ -6537,6 +6767,9 @@ def get_sector_rotation_data(
         "ranking_basis": f"{ranking_window}-session relative return when available, otherwise current change_pct",
         "count": len(items),
         "history_available_count": histories_available,
+        "cross_provider_history_count": sum(
+            item.get("history_source") == "10jqka_industry_daily_history" for item in items
+        ),
         "items": items,
         "source": sorted(
             {
@@ -6840,8 +7073,45 @@ def is_disclosed_institution_seat(code: Any, name: Any) -> bool:
     return str(code or "").strip() == "0" or "机构专用" in str(name or "")
 
 
+def value_change_pct(current: Any, previous: Any) -> float | None:
+    current_value, previous_value = to_number(current), to_number(previous)
+    if current_value is None or previous_value in (None, 0):
+        return None
+    return round((current_value / previous_value - 1) * 100, 4)
+
+
+def dated_window_totals(
+    items: list[dict[str, Any]], date_field: str, amount_fields: tuple[str, ...], window_days: int = 30
+) -> dict[str, Any]:
+    today = datetime.now(MARKET_TIMEZONE).date()
+    recent_start = (today - timedelta(days=window_days - 1)).isoformat()
+    previous_start = (today - timedelta(days=window_days * 2 - 1)).isoformat()
+    recent = [item for item in items if str(item.get(date_field) or "") >= recent_start]
+    previous = [
+        item
+        for item in items
+        if previous_start <= str(item.get(date_field) or "") < recent_start
+    ]
+    result: dict[str, Any] = {
+        "window_days": window_days,
+        "recent_range": {"start": recent_start, "end": today.isoformat()},
+        "previous_range": {"start": previous_start, "end": (today - timedelta(days=window_days)).isoformat()},
+        "recent_record_count": len(recent),
+        "previous_record_count": len(previous),
+    }
+    for field in amount_fields:
+        recent_total = round(sum(to_number(item.get(field)) or 0 for item in recent), 2)
+        previous_total = round(sum(to_number(item.get(field)) or 0 for item in previous), 2)
+        result[field] = {
+            "recent_total": recent_total,
+            "previous_total": previous_total,
+            "change_pct": value_change_pct(recent_total, previous_total),
+        }
+    return result
+
+
 def capital_activity_margin(symbol: str, start: str, limit: int) -> dict[str, Any]:
-    rows = get_eastmoney_datacenter_rows("RPTA_WEB_RZRQ_GGMX", f'(SCODE="{symbol}")', "DATE", max(limit, 20))
+    rows = get_eastmoney_datacenter_rows("RPTA_WEB_RZRQ_GGMX", f'(SCODE="{symbol}")', "DATE", max(limit, 30))
     items = []
     for row in rows:
         day = datacenter_date(row.get("DATE"))
@@ -6855,7 +7125,24 @@ def capital_activity_margin(symbol: str, start: str, limit: int) -> dict[str, An
                           "securities_lending_sold_shares": to_number(row.get("RQMCL")),
                           "margin_total_balance_cny": to_number(row.get("RZRQYE")),
                           "close_price_cny": to_number(row.get("SPJ")), "change_pct": to_number(row.get("ZDF"))})
-    return {"items": items[:limit], "source": "eastmoney_margin_detail"}
+    latest = items[0] if items else {}
+    comparisons = {}
+    for sessions in (5, 20):
+        previous = items[sessions] if len(items) > sessions else {}
+        comparisons[str(sessions)] = {
+            "comparison_trade_date": previous.get("trade_date"),
+            "financing_balance_change_pct": value_change_pct(
+                latest.get("financing_balance_cny"), previous.get("financing_balance_cny")
+            ),
+            "securities_lending_balance_change_pct": value_change_pct(
+                latest.get("securities_lending_balance_cny"), previous.get("securities_lending_balance_cny")
+            ),
+            "margin_total_balance_change_pct": value_change_pct(
+                latest.get("margin_total_balance_cny"), previous.get("margin_total_balance_cny")
+            ),
+        }
+    return {"items": items[:limit], "historical_comparison_by_sessions": comparisons,
+            "source": "eastmoney_margin_detail"}
 
 
 def capital_activity_block_trades(symbol: str, start: str, limit: int) -> dict[str, Any]:
@@ -6873,11 +7160,16 @@ def capital_activity_block_trades(symbol: str, start: str, limit: int) -> dict[s
                       "deal_amount_cny": to_number(row.get("DEAL_AMT")),
                       "premium_discount_pct": percentage_change(price, close),
                       "buyer_name": clean_value(row.get("BUYER_NAME")), "seller_name": clean_value(row.get("SELLER_NAME")),
-                      "buyer_is_disclosed_institution_seat": buyer, "seller_is_disclosed_institution_seat": seller})
+                      "buyer_is_disclosed_institution_seat": buyer, "seller_is_disclosed_institution_seat": seller,
+                      "institution_buy_amount_cny": to_number(row.get("DEAL_AMT")) if buyer else 0,
+                      "institution_sell_amount_cny": to_number(row.get("DEAL_AMT")) if seller else 0})
     institution = [item for item in items if item["buyer_is_disclosed_institution_seat"] or item["seller_is_disclosed_institution_seat"]]
     return {"items": items[:limit], "institution_related_items": institution[:limit],
             "institution_buy_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["buyer_is_disclosed_institution_seat"]),
             "institution_sell_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["seller_is_disclosed_institution_seat"]),
+            "historical_comparison": dated_window_totals(
+                institution, "trade_date", ("institution_buy_amount_cny", "institution_sell_amount_cny")
+            ),
             "source": "eastmoney_block_trade_disclosure"}
 
 
@@ -6891,20 +7183,36 @@ def capital_activity_shareholders(symbol: str, limit: int) -> dict[str, Any]:
               "shareholder_count_change_pct": to_number(row.get("HOLDER_NUM_RATIO")),
               "average_shares_per_holder": to_number(row.get("AVG_HOLD_NUM")),
               "average_market_value_per_holder_cny": to_number(row.get("AVG_MARKET_CAP"))} for row in rows[:limit]]
-    return {"items": items, "source": "eastmoney_shareholder_count_disclosure"}
+    latest, previous = (items + [{}, {}])[:2]
+    return {
+        "items": items,
+        "historical_comparison": {
+            "latest_period_end": latest.get("period_end"),
+            "previous_period_end": previous.get("period_end"),
+            "shareholder_count_change_pct_from_returned_points": value_change_pct(
+                latest.get("shareholder_count"), previous.get("shareholder_count")
+            ),
+        },
+        "source": "eastmoney_shareholder_count_disclosure",
+    }
 
 
 def capital_activity_research(symbol: str, start: str, limit: int) -> dict[str, Any]:
     query = f'(NUMBERNEW="1")(IS_SOURCE="1")(NOTICE_DATE>\'{start}\')(SECURITY_CODE="{symbol}")'
-    rows = get_eastmoney_datacenter_rows("RPT_ORG_SURVEYNEW", query, "NOTICE_DATE", max(limit, 20))
+    rows = get_eastmoney_datacenter_rows("RPT_ORG_SURVEYNEW", query, "NOTICE_DATE", max(limit, 50))
     items = [{"notice_date": datacenter_date(row.get("NOTICE_DATE")),
               "research_start_date": datacenter_date(row.get("RECEIVE_START_DATE")),
               "research_end_date": datacenter_date(row.get("RECEIVE_END_DATE")),
               "participant_count": int(to_number(row.get("SUM")) or 0) or None,
               "participant_example": clean_value(row.get("RECEIVE_OBJECT")),
               "method": clean_value(row.get("RECEIVE_WAY_EXPLAIN")), "place": clean_value(row.get("RECEIVE_PLACE")),
-              "company_representatives": clean_value(row.get("RECEPTIONIST"))} for row in rows[:limit]]
-    return {"items": items, "source": "eastmoney_institutional_research_disclosure"}
+              "company_representatives": clean_value(row.get("RECEPTIONIST"))} for row in rows]
+    return {
+        "items": items[:limit],
+        "historical_comparison": dated_window_totals(items, "notice_date", ("participant_count",)),
+        "historical_comparison_scope": "first_page_up_to_50_disclosures",
+        "source": "eastmoney_institutional_research_disclosure",
+    }
 
 
 def capital_activity_dragon_tiger(symbol: str, start: str, limit: int) -> dict[str, Any]:
@@ -6919,7 +7227,6 @@ def capital_activity_dragon_tiger(symbol: str, start: str, limit: int) -> dict[s
                             "total_net_amount_cny": to_number(row.get("BILLBOARD_NET_AMT")),
                             "close_price_cny": to_number(row.get("CLOSE_PRICE")),
                             "change_pct": to_number(row.get("CHANGE_RATE")), "turnover_rate_pct": to_number(row.get("TURNOVERRATE"))})
-    records = records[:limit]
     if not records:
         return {"items": [], "latest_institution_seats": [], "source": "eastmoney_dragon_tiger_disclosure"}
     latest = records[0]["trade_date"]
@@ -6938,11 +7245,13 @@ def capital_activity_dragon_tiger(symbol: str, start: str, limit: int) -> dict[s
             item["appears_in"].append(f"{side}_ranking")
     seats = list(merged.values())
     institutions = [item for item in seats if item["is_disclosed_institution_seat"]]
-    return {"items": records, "latest_seat_trade_date": latest, "latest_disclosed_seats": seats,
+    return {"items": records[:limit], "latest_seat_trade_date": latest, "latest_disclosed_seats": seats,
             "latest_institution_seats": institutions,
             "latest_institution_buy_amount_cny": sum(item["buy_amount_cny"] or 0 for item in institutions),
             "latest_institution_sell_amount_cny": sum(item["sell_amount_cny"] or 0 for item in institutions),
             "latest_institution_net_amount_cny": sum(item["net_amount_cny"] or 0 for item in institutions),
+            "historical_comparison": dated_window_totals(records, "trade_date", ("total_buy_amount_cny", "total_sell_amount_cny", "total_net_amount_cny")),
+            "historical_comparison_scope": "all_disclosed_dragon_tiger_totals_not_institution_only; first_page_up_to_30_disclosures",
             "seat_source_errors": errors, "source": "eastmoney_dragon_tiger_disclosure"}
 
 
@@ -6964,16 +7273,22 @@ def get_a_share_capital_activity_data(symbol: str, lookback_days: int, limit: in
         research, margin, holders = (components.get("institutional_research", {}), components.get("margin", {}),
                                      components.get("shareholder_count", {}))
         components = {
-            "dragon_tiger": {key: dragon.get(key) for key in ("latest_seat_trade_date", "latest_institution_seats", "latest_institution_buy_amount_cny", "latest_institution_sell_amount_cny", "latest_institution_net_amount_cny", "source")},
-            "block_trades": {key: block.get(key) for key in ("institution_related_items", "institution_buy_amount_cny", "institution_sell_amount_cny", "source")},
-            "institutional_research": {"items": (research.get("items") or [])[:3], "source": research.get("source")},
-            "margin": {"latest": next(iter(margin.get("items") or []), None), "source": margin.get("source")},
-            "shareholder_count": {"latest": next(iter(holders.get("items") or []), None), "source": holders.get("source")}}
+            "dragon_tiger": {key: dragon.get(key) for key in ("latest_seat_trade_date", "latest_institution_seats", "latest_institution_buy_amount_cny", "latest_institution_sell_amount_cny", "latest_institution_net_amount_cny", "historical_comparison", "source")},
+            "block_trades": {key: block.get(key) for key in ("institution_related_items", "institution_buy_amount_cny", "institution_sell_amount_cny", "historical_comparison", "source")},
+            "institutional_research": {"items": (research.get("items") or [])[:3], "historical_comparison": research.get("historical_comparison"), "source": research.get("source")},
+            "margin": {"latest": next(iter(margin.get("items") or []), None), "historical_comparison_by_sessions": margin.get("historical_comparison_by_sessions"), "source": margin.get("source")},
+            "shareholder_count": {"latest": next(iter(holders.get("items") or []), None), "historical_comparison": holders.get("historical_comparison"), "source": holders.get("source")}}
     missing = [name for name, status in statuses.items() if status["status"] != "available"]
     return {"symbol": symbol, "security_type": security["security_type"], "exchange": security["exchange"],
             "lookback_start_date": start, "lookback_days": lookback_days, "components": components,
             "component_status": statuses, "missing_fields": missing,
             "source": sorted({value.get("source") for value in components.values() if isinstance(value, dict) and value.get("source")}),
+            "historical_comparisons": {
+                name: payload.get("historical_comparison") or payload.get("historical_comparison_by_sessions")
+                for name, payload in components.items()
+                if isinstance(payload, dict)
+                and (payload.get("historical_comparison") or payload.get("historical_comparison_by_sessions"))
+            },
             "source_urls": CAPITAL_ACTIVITY_SOURCE_URLS, "source_errors": errors,
             "data_status": "full_data" if not missing else "partial_data", "detail_level": detail_level, "queried_at": now_iso(),
             "interpretation_boundary": {
@@ -9041,7 +9356,10 @@ def get_market_snapshot_data(
     source_updated_at = (target_quote or {}).get("source_updated_at") or latest_time
     completed_at = now_iso()
     return {
-        "snapshot_id": f"market-snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+        "snapshot_id": (
+            f"market-snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            f"-{perf_counter_ns()}"
+        ),
         "requested_as_of": requested_as_of,
         "as_of_status": "captured_now_from_current_or_latest_public_snapshots",
         "snapshot_started_at": started_iso,
@@ -9270,7 +9588,10 @@ def mcp_error(
         "cache_hit": False,
         "cache_created_at": None,
         "cache_age_seconds": None,
-        "snapshot_id": f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+        "snapshot_id": (
+            f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+            f"-{perf_counter_ns()}"
+        ),
         "source_updated_at": None,
         "missing_fields": [],
         "conflicts": [],
@@ -9707,7 +10028,8 @@ def get_a_share_trading_calendar(start_date: str | None = None, end_date: str | 
     title="Get disclosed A-share capital and institution activity",
     description=(
         "Return disclosed Dragon-Tiger institution seats, institution-labelled block trades, institutional research, "
-        "margin balances, and shareholder-count changes. Categories stay separate; no main-force or trading conclusion is inferred."
+        "margin balances, shareholder-count changes, and category-specific historical comparisons. Categories stay "
+        "separate; no main-force or trading conclusion is inferred."
     ), annotations=READ_ONLY_TOOL,
 )
 def get_a_share_capital_activity(symbol: str, lookback_days: int = 90, limit: int = 10,
@@ -9923,7 +10245,8 @@ def get_a_share_announcements(
     description=(
         "Mechanically cluster recent official announcements and attributed media reports for one company, preserve "
         "the distinction between disclosure/publication time and real-world event time, and attach 1/3/5-session "
-        "forward-adjusted price feedback where enough trading sessions exist. No sentiment or impact judgement is made."
+        "forward-adjusted price feedback plus nearby disclosed capital activity where available. Date proximity is "
+        "not causation; no sentiment or impact judgement is made."
     ),
     annotations=READ_ONLY_TOOL,
 )
