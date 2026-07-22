@@ -5,7 +5,7 @@ import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -26,14 +26,15 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "session_snapshot_health_hardening_v2"
+ROUTING_REVISION = "calendar_capital_activity_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
     "official announcements, fund flows, financial metrics, batch quotes, auction facts, market overview, mechanical "
     "anomaly scans, relative strength, historical context, security status, multi-source market evidence packets, "
     "sector rankings and rotation history, overnight cross-market observations, company event timelines, fund "
-    "look-through holdings, portfolio exposure aggregation, and "
+    "look-through holdings, portfolio exposure aggregation, official trading-calendar facts, disclosed capital and "
+    "institution-activity evidence, and "
     "public IPO subscription schedules and eligibility rules, and "
     "operational data-route health. "
     "Use search_a_share when the stock code is unclear. "
@@ -54,6 +55,8 @@ MCP_INSTRUCTIONS = (
     "official exchange filings. Do not use Wikipedia, encyclopedia pages, or academic-paper indexes as evidence "
     "for current company events. News results are evidence with provenance, not positive/negative judgements. "
     "Use get_a_share_limit_activity for public limit-up, limit-down, open-board, and consecutive-board facts. "
+    "Use get_a_share_capital_activity for disclosed institution activity. Keep its categories separate; never infer "
+    "main-force inflow, accumulation, or distribution from them. "
     "Do not convert those mechanical counts into sentiment or trading labels. Never place trades, access brokerage "
     "accounts, issue buy/sell recommendations, or make automated financial decisions. All data is informational only "
     "and is not investment advice."
@@ -89,7 +92,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.12.0",
+    version="0.13.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -305,6 +308,20 @@ SECTOR_TYPE_CONFIG = {
     "concept": "m:90+t:3",
 }
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
+A_SHARE_CALENDAR_SOURCES = {
+    "closure_schedule": "https://www.sse.com.cn/disclosure/dealinstruc/closed/",
+    "trading_rules": "https://www.sse.com.cn/lawandrules/sselawsrules2025/trade/universal/c/c_20260424_10816492.shtml",
+}
+A_SHARE_CALENDAR_REVISION = "sse_2026_schedule_published_2025-12-22"
+A_SHARE_2026_HOLIDAYS = {
+    date(2026, 1, 1): "New Year's Day", date(2026, 1, 2): "New Year's Day",
+    **{date(2026, 2, day): "Spring Festival" for day in range(16, 24)},
+    date(2026, 4, 6): "Qingming Festival",
+    **{date(2026, 5, day): "Labour Day" for day in range(1, 6)},
+    date(2026, 6, 19): "Dragon Boat Festival", date(2026, 9, 25): "Mid-Autumn Festival",
+    **{date(2026, 10, day): "National Day" for day in range(1, 8)},
+}
+A_SHARE_SUPPORTED_CALENDAR_YEARS = {2026}
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
 INDUSTRY_LEVEL_PATTERN = re.compile(r"^(?P<industry_name>.+?)(?P<industry_level>[ⅠⅡⅢ])$")
@@ -4249,7 +4266,8 @@ def completed_daily_history(
     latest_date = clean_value(items[-1].get("date"))
     if latest_date != now.date().isoformat():
         return items, False
-    session_is_complete = (now.hour, now.minute) >= (15, 5)
+    trading_day = is_confirmed_a_share_trading_day(now.date())
+    session_is_complete = trading_day is not False and (now.hour, now.minute) >= (15, 5)
     return (items if session_is_complete else items[:-1]), not session_is_complete
 
 
@@ -5715,9 +5733,81 @@ def parse_market_datetime(value: Any) -> datetime | None:
     return result.replace(tzinfo=MARKET_TIMEZONE) if result.tzinfo is None else result.astimezone(MARKET_TIMEZONE)
 
 
+def parse_calendar_date(value: str, field: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{field} must use YYYY-MM-DD format.") from exc
+
+
+def a_share_calendar_day(day: date) -> dict[str, Any]:
+    if day.year not in A_SHARE_SUPPORTED_CALENDAR_YEARS:
+        status, kind, closure = None, "calendar_year_not_loaded", None
+    elif day.weekday() >= 5:
+        status, kind, closure = False, "closed_weekend", "Weekend"
+    elif day in A_SHARE_2026_HOLIDAYS:
+        status, kind, closure = False, "closed_official_holiday", A_SHARE_2026_HOLIDAYS[day]
+    else:
+        status, kind, closure = True, "full_day", None
+    sessions = []
+    if status:
+        sessions = [
+            {"phase": "opening_call_auction", "start": "09:15", "end": "09:25"},
+            {"phase": "continuous_trading", "start": "09:30", "end": "11:30"},
+            {"phase": "continuous_trading", "start": "13:00", "end": "14:57"},
+            {"phase": "closing_call_auction", "start": "14:57", "end": "15:00"},
+        ]
+    return {"date": day.isoformat(), "weekday": day.strftime("%A"), "is_trading_day": status,
+            "session_type": kind, "closure_name": closure, "sessions": sessions}
+
+
+def is_confirmed_a_share_trading_day(day: date) -> bool | None:
+    return a_share_calendar_day(day)["is_trading_day"]
+
+
+def nearest_confirmed_trading_day(day: date, direction: int) -> str | None:
+    for _ in range(370):
+        day += timedelta(days=direction)
+        status = is_confirmed_a_share_trading_day(day)
+        if status is True:
+            return day.isoformat()
+        if status is None:
+            return None
+    return None
+
+
+def get_a_share_trading_calendar_data(start_date: str | None, end_date: str | None,
+                                      detail_level: str) -> dict[str, Any]:
+    today = datetime.now(MARKET_TIMEZONE).date()
+    start = parse_calendar_date(start_date, "start_date") if start_date else today - timedelta(days=7)
+    end = parse_calendar_date(end_date, "end_date") if end_date else today + timedelta(days=14)
+    if end < start or (end - start).days > 366:
+        raise HTTPException(status_code=400, detail="Calendar range must be ordered and no longer than 366 days.")
+    items = [a_share_calendar_day(start + timedelta(days=i)) for i in range((end - start).days + 1)]
+    unsupported = sorted({int(item["date"][:4]) for item in items if item["is_trading_day"] is None})
+    if detail_level == "summary":
+        items = [{key: item[key] for key in ("date", "weekday", "is_trading_day", "session_type", "closure_name")}
+                 for item in items]
+    return {
+        "start_date": start.isoformat(), "end_date": end.isoformat(),
+        "calendar_revision": A_SHARE_CALENDAR_REVISION,
+        "supported_years": sorted(A_SHARE_SUPPORTED_CALENDAR_YEARS), "unsupported_years": unsupported,
+        "trading_day_count": sum(item["is_trading_day"] is True for item in items),
+        "closed_day_count": sum(item["is_trading_day"] is False for item in items), "items": items,
+        "previous_trading_day_before_range": nearest_confirmed_trading_day(start, -1),
+        "next_trading_day_after_range": nearest_confirmed_trading_day(end, 1),
+        "source": ["sse_official_closure_schedule", "sse_official_trading_rules"],
+        "source_urls": A_SHARE_CALENDAR_SOURCES, "source_updated_at": "2025-12-22", "source_errors": [],
+        "data_status": "partial_data" if unsupported else "full_data", "detail_level": detail_level,
+        "queried_at": now_iso(),
+        "note": "Exchange calendar only; it does not establish an individual security suspension. Unsupported years remain unknown.",
+    }
+
+
 def market_status_at(now: datetime | None = None) -> str:
     now = now or datetime.now(MARKET_TIMEZONE)
-    if now.weekday() >= 5:
+    trading_day = is_confirmed_a_share_trading_day(now.date())
+    if trading_day is False or (trading_day is None and now.weekday() >= 5):
         return "closed"
     minute = now.hour * 60 + now.minute
     if minute < 9 * 60 + 30:
@@ -6710,7 +6800,193 @@ def get_overnight_risk_packet_data(detail_level: str) -> dict[str, Any]:
     }
 
 
-IPO_CALENDAR_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+EASTMONEY_DATACENTER_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+CAPITAL_ACTIVITY_SOURCE_URLS = {
+    "margin_sse": "https://www.sse.com.cn/market/othersdata/margin/detail/",
+    "margin_szse": "https://www.szse.cn/marketServices/deal/finance/index.html",
+    "public_disclosures_szse": "https://investor.szse.cn/disclosure/index/index.html",
+    "provider": "https://data.eastmoney.com/",
+}
+
+
+def datacenter_date(value: Any) -> str | None:
+    try:
+        return datetime.strptime(str(value or "")[:10], "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+def get_eastmoney_datacenter_rows(report: str, row_filter: str, sort: str,
+                                  page_size: int = 20) -> list[dict[str, Any]]:
+    params = {"reportName": report, "columns": "ALL", "filter": row_filter, "pageNumber": 1,
+              "pageSize": max(1, min(page_size, 100)), "sortColumns": sort, "sortTypes": -1,
+              "source": "WEB", "client": "WEB"}
+    payload = read_public_json(f"{EASTMONEY_DATACENTER_API}?{urlencode(params)}",
+                               "https://data.eastmoney.com/", timeout=4, attempts=1)
+    if isinstance(payload, dict) and payload.get("success") is False and payload.get("code") == 9201:
+        return []
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        raise HTTPException(status_code=502, detail=f"Unexpected {report} response.")
+    result = payload.get("result")
+    if result is None:
+        return []
+    rows = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail=f"Unexpected {report} rows.")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def is_disclosed_institution_seat(code: Any, name: Any) -> bool:
+    return str(code or "").strip() == "0" or "机构专用" in str(name or "")
+
+
+def capital_activity_margin(symbol: str, start: str, limit: int) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows("RPTA_WEB_RZRQ_GGMX", f'(SCODE="{symbol}")', "DATE", max(limit, 20))
+    items = []
+    for row in rows:
+        day = datacenter_date(row.get("DATE"))
+        if day and day >= start:
+            items.append({"trade_date": day, "financing_balance_cny": to_number(row.get("RZYE")),
+                          "financing_purchase_cny": to_number(row.get("RZMRE")),
+                          "financing_repayment_cny": to_number(row.get("RZCHE")),
+                          "financing_net_purchase_cny": to_number(row.get("RZJME")),
+                          "securities_lending_balance_cny": to_number(row.get("RQYE")),
+                          "securities_lending_remaining_shares": to_number(row.get("RQYL")),
+                          "securities_lending_sold_shares": to_number(row.get("RQMCL")),
+                          "margin_total_balance_cny": to_number(row.get("RZRQYE")),
+                          "close_price_cny": to_number(row.get("SPJ")), "change_pct": to_number(row.get("ZDF"))})
+    return {"items": items[:limit], "source": "eastmoney_margin_detail"}
+
+
+def capital_activity_block_trades(symbol: str, start: str, limit: int) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows("RPT_DATA_BLOCKTRADE", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 50)
+    items = []
+    for row in rows:
+        day = datacenter_date(row.get("TRADE_DATE"))
+        if not day or day < start:
+            continue
+        buyer = is_disclosed_institution_seat(row.get("BUYER_CODE"), row.get("BUYER_NAME"))
+        seller = is_disclosed_institution_seat(row.get("SELLER_CODE"), row.get("SELLER_NAME"))
+        price, close = to_number(row.get("DEAL_PRICE")), to_number(row.get("CLOSE_PRICE"))
+        items.append({"trade_date": day, "deal_price_cny": price, "close_price_cny": close,
+                      "deal_volume_shares": to_number(row.get("DEAL_VOLUME")),
+                      "deal_amount_cny": to_number(row.get("DEAL_AMT")),
+                      "premium_discount_pct": percentage_change(price, close),
+                      "buyer_name": clean_value(row.get("BUYER_NAME")), "seller_name": clean_value(row.get("SELLER_NAME")),
+                      "buyer_is_disclosed_institution_seat": buyer, "seller_is_disclosed_institution_seat": seller})
+    institution = [item for item in items if item["buyer_is_disclosed_institution_seat"] or item["seller_is_disclosed_institution_seat"]]
+    return {"items": items[:limit], "institution_related_items": institution[:limit],
+            "institution_buy_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["buyer_is_disclosed_institution_seat"]),
+            "institution_sell_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["seller_is_disclosed_institution_seat"]),
+            "source": "eastmoney_block_trade_disclosure"}
+
+
+def capital_activity_shareholders(symbol: str, limit: int) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows("RPT_HOLDERNUMLATEST", f'(SECURITY_CODE="{symbol}")', "END_DATE", max(limit, 8))
+    items = [{"period_end": datacenter_date(row.get("END_DATE")),
+              "notice_date": datacenter_date(row.get("HOLD_NOTICE_DATE")),
+              "shareholder_count": to_number(row.get("HOLDER_NUM")),
+              "previous_shareholder_count": to_number(row.get("PRE_HOLDER_NUM")),
+              "shareholder_count_change": to_number(row.get("HOLDER_NUM_CHANGE")),
+              "shareholder_count_change_pct": to_number(row.get("HOLDER_NUM_RATIO")),
+              "average_shares_per_holder": to_number(row.get("AVG_HOLD_NUM")),
+              "average_market_value_per_holder_cny": to_number(row.get("AVG_MARKET_CAP"))} for row in rows[:limit]]
+    return {"items": items, "source": "eastmoney_shareholder_count_disclosure"}
+
+
+def capital_activity_research(symbol: str, start: str, limit: int) -> dict[str, Any]:
+    query = f'(NUMBERNEW="1")(IS_SOURCE="1")(NOTICE_DATE>\'{start}\')(SECURITY_CODE="{symbol}")'
+    rows = get_eastmoney_datacenter_rows("RPT_ORG_SURVEYNEW", query, "NOTICE_DATE", max(limit, 20))
+    items = [{"notice_date": datacenter_date(row.get("NOTICE_DATE")),
+              "research_start_date": datacenter_date(row.get("RECEIVE_START_DATE")),
+              "research_end_date": datacenter_date(row.get("RECEIVE_END_DATE")),
+              "participant_count": int(to_number(row.get("SUM")) or 0) or None,
+              "participant_example": clean_value(row.get("RECEIVE_OBJECT")),
+              "method": clean_value(row.get("RECEIVE_WAY_EXPLAIN")), "place": clean_value(row.get("RECEIVE_PLACE")),
+              "company_representatives": clean_value(row.get("RECEPTIONIST"))} for row in rows[:limit]]
+    return {"items": items, "source": "eastmoney_institutional_research_disclosure"}
+
+
+def capital_activity_dragon_tiger(symbol: str, start: str, limit: int) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows("RPT_DAILYBILLBOARD_DETAILSNEW", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 30)
+    records = []
+    for row in rows:
+        day = datacenter_date(row.get("TRADE_DATE"))
+        if day and day >= start:
+            records.append({"trade_date": day, "reason": clean_value(row.get("EXPLANATION") or row.get("EXPLAIN")),
+                            "total_buy_amount_cny": to_number(row.get("BILLBOARD_BUY_AMT")),
+                            "total_sell_amount_cny": to_number(row.get("BILLBOARD_SELL_AMT")),
+                            "total_net_amount_cny": to_number(row.get("BILLBOARD_NET_AMT")),
+                            "close_price_cny": to_number(row.get("CLOSE_PRICE")),
+                            "change_pct": to_number(row.get("CHANGE_RATE")), "turnover_rate_pct": to_number(row.get("TURNOVERRATE"))})
+    records = records[:limit]
+    if not records:
+        return {"items": [], "latest_institution_seats": [], "source": "eastmoney_dragon_tiger_disclosure"}
+    latest = records[0]["trade_date"]
+    seat_filter = f'(TRADE_DATE=\'{latest}\')(SECURITY_CODE="{symbol}")'
+    loaders = {"buy": lambda: get_eastmoney_datacenter_rows("RPT_BILLBOARD_DAILYDETAILSBUY", seat_filter, "BUY", 10),
+               "sell": lambda: get_eastmoney_datacenter_rows("RPT_BILLBOARD_DAILYDETAILSSELL", seat_filter, "SELL", 10)}
+    results, _, errors = collect_components(loaders, 5, COMPOSITE_TOOL_EXECUTOR)
+    merged = {}
+    for side, seat_rows in results.items():
+        for row in seat_rows:
+            key = (str(row.get("OPERATEDEPT_CODE") or ""), str(row.get("OPERATEDEPT_NAME") or ""))
+            item = merged.setdefault(key, {"seat_code": clean_value(row.get("OPERATEDEPT_CODE")),
+                "seat_name": clean_value(row.get("OPERATEDEPT_NAME")), "buy_amount_cny": to_number(row.get("BUY")),
+                "sell_amount_cny": to_number(row.get("SELL")), "net_amount_cny": to_number(row.get("NET")),
+                "is_disclosed_institution_seat": is_disclosed_institution_seat(row.get("OPERATEDEPT_CODE"), row.get("OPERATEDEPT_NAME")), "appears_in": []})
+            item["appears_in"].append(f"{side}_ranking")
+    seats = list(merged.values())
+    institutions = [item for item in seats if item["is_disclosed_institution_seat"]]
+    return {"items": records, "latest_seat_trade_date": latest, "latest_disclosed_seats": seats,
+            "latest_institution_seats": institutions,
+            "latest_institution_buy_amount_cny": sum(item["buy_amount_cny"] or 0 for item in institutions),
+            "latest_institution_sell_amount_cny": sum(item["sell_amount_cny"] or 0 for item in institutions),
+            "latest_institution_net_amount_cny": sum(item["net_amount_cny"] or 0 for item in institutions),
+            "seat_source_errors": errors, "source": "eastmoney_dragon_tiger_disclosure"}
+
+
+def get_a_share_capital_activity_data(symbol: str, lookback_days: int, limit: int,
+                                      detail_level: str) -> dict[str, Any]:
+    symbol = normalize_symbol(symbol)
+    security = security_metadata(symbol)
+    if security["security_type"] != "a_share":
+        raise HTTPException(status_code=400, detail="capital activity currently supports ordinary A-share company codes only.")
+    start = (datetime.now(MARKET_TIMEZONE).date() - timedelta(days=lookback_days)).isoformat()
+    loaders = {"dragon_tiger": lambda: capital_activity_dragon_tiger(symbol, start, limit),
+               "block_trades": lambda: capital_activity_block_trades(symbol, start, limit),
+               "institutional_research": lambda: capital_activity_research(symbol, start, limit),
+               "margin": lambda: capital_activity_margin(symbol, start, limit),
+               "shareholder_count": lambda: capital_activity_shareholders(symbol, min(limit, 8))}
+    components, statuses, errors = collect_components(loaders, 10, COMPOSITE_TOOL_EXECUTOR)
+    if detail_level == "summary":
+        dragon, block = components.get("dragon_tiger", {}), components.get("block_trades", {})
+        research, margin, holders = (components.get("institutional_research", {}), components.get("margin", {}),
+                                     components.get("shareholder_count", {}))
+        components = {
+            "dragon_tiger": {key: dragon.get(key) for key in ("latest_seat_trade_date", "latest_institution_seats", "latest_institution_buy_amount_cny", "latest_institution_sell_amount_cny", "latest_institution_net_amount_cny", "source")},
+            "block_trades": {key: block.get(key) for key in ("institution_related_items", "institution_buy_amount_cny", "institution_sell_amount_cny", "source")},
+            "institutional_research": {"items": (research.get("items") or [])[:3], "source": research.get("source")},
+            "margin": {"latest": next(iter(margin.get("items") or []), None), "source": margin.get("source")},
+            "shareholder_count": {"latest": next(iter(holders.get("items") or []), None), "source": holders.get("source")}}
+    missing = [name for name, status in statuses.items() if status["status"] != "available"]
+    return {"symbol": symbol, "security_type": security["security_type"], "exchange": security["exchange"],
+            "lookback_start_date": start, "lookback_days": lookback_days, "components": components,
+            "component_status": statuses, "missing_fields": missing,
+            "source": sorted({value.get("source") for value in components.values() if isinstance(value, dict) and value.get("source")}),
+            "source_urls": CAPITAL_ACTIVITY_SOURCE_URLS, "source_errors": errors,
+            "data_status": "full_data" if not missing else "partial_data", "detail_level": detail_level, "queried_at": now_iso(),
+            "interpretation_boundary": {
+                "dragon_tiger": "Only abnormal-trading days and named seats; not all institutional trading or holdings.",
+                "block_trades": "Named seats do not establish the ultimate beneficial owner or future direction.",
+                "institutional_research": "A research visit is contact activity, not evidence of a purchase or endorsement.",
+                "margin": "Margin data are investor-category mixed and not institution-exclusive.",
+                "shareholder_count": "Aggregate holder-count changes do not prove institutional accumulation or distribution.",
+                "overall": "Categories remain separate; no unified real-time institutional net position or trading conclusion is inferred."},
+            "related_tools": ["get_a_share_announcements", "get_fund_exposure"]}
+
+
+IPO_CALENDAR_API = EASTMONEY_DATACENTER_API
 IPO_CALENDAR_FAST_API = "https://datapc.eastmoney.com/da/purchase/list2"
 IPO_RULE_SOURCES = {
     "sse": "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/issue/c/c_20250515_10778982.shtml",
@@ -9407,6 +9683,44 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
         "get_a_share_financials", {"symbol": symbol, "limit": normalized_limit}, 21600,
         lambda: get_financial_data(symbol, normalized_limit), symbol,
     )
+
+
+@mcp.tool(
+    name="get_a_share_trading_calendar",
+    title="Get the official A-share trading calendar",
+    description=(
+        "Return exchange trading-day, weekend, official holiday-closure, and session facts for a bounded range. "
+        "The embedded official schedule supports 2026; unsupported years remain unknown."
+    ), annotations=READ_ONLY_TOOL,
+)
+def get_a_share_trading_calendar(start_date: str | None = None, end_date: str | None = None,
+                                 detail_level: str = "summary") -> dict[str, Any]:
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(None, HTTPException(status_code=400, detail="detail_level must be summary or raw."))
+    params = {"start_date": start_date, "end_date": end_date, "detail_level": detail_level}
+    return run_cached_tool("get_a_share_trading_calendar", params, 86400,
+                           lambda: get_a_share_trading_calendar_data(**params), max_stale_age_seconds=604800)
+
+
+@mcp.tool(
+    name="get_a_share_capital_activity",
+    title="Get disclosed A-share capital and institution activity",
+    description=(
+        "Return disclosed Dragon-Tiger institution seats, institution-labelled block trades, institutional research, "
+        "margin balances, and shareholder-count changes. Categories stay separate; no main-force or trading conclusion is inferred."
+    ), annotations=READ_ONLY_TOOL,
+)
+def get_a_share_capital_activity(symbol: str, lookback_days: int = 90, limit: int = 10,
+                                 detail_level: str = "summary") -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+    if detail_level not in {"summary", "raw"}:
+        return mcp_error(symbol, HTTPException(status_code=400, detail="detail_level must be summary or raw."))
+    params = {"symbol": symbol, "lookback_days": max(7, min(lookback_days, 365)),
+              "limit": max(1, min(limit, 20)), "detail_level": detail_level}
+    return run_cached_tool("get_a_share_capital_activity", params, 300,
+                           lambda: get_a_share_capital_activity_data(**params), symbol, max_stale_age_seconds=86400)
 
 
 @mcp.tool(
