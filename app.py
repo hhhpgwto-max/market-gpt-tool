@@ -27,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v5"
+ROUTING_REVISION = "capital_timeline_sector_history_v6"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -95,7 +95,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.3",
+    version="0.14.4",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -6432,69 +6432,102 @@ def read_swsresearch_json(path: str, parameters: dict[str, Any]) -> dict[str, An
         ) from exc
 
 
-def get_swsresearch_industry_code_map() -> dict[str, tuple[str, str]]:
-    key = cache_key("swsresearch_industry_code_map", {})
+def get_swsresearch_recent_level2_history(limit: int) -> dict[str, Any]:
+    key = cache_key("swsresearch_recent_level2_history", {"limit": limit})
 
     def load() -> dict[str, Any]:
-        payload = read_swsresearch_json(
-            "/institute-sw/api/index_publish/current/",
-            {"page": 1, "page_size": 200, "indextype": "二级行业"},
-        )
-        rows = ((payload.get("data") or {}).get("results") or [])
-        mapping = {
-            re.sub(r"[ⅠⅡⅢ]$", "", str(row.get("swindexname") or "")).strip(): (
-                str(row.get("swindexcode") or "").strip(),
-                str(row.get("swindexname") or "").strip(),
-            )
-            for row in rows
-            if row.get("swindexcode") and row.get("swindexname")
-        }
-        if not mapping:
-            raise HTTPException(status_code=502, detail="No official SWS Research industry rows.")
-        return {"mapping": mapping}
+        today = datetime.now(MARKET_TIMEZONE).date()
+        queried_dates = [
+            today - timedelta(days=offset)
+            for offset in range(max(42, limit * 2))
+            if (today - timedelta(days=offset)).weekday() < 5
+        ][: limit + 8]
 
-    component, _ = get_cached_tool_data(key, 21600, load)
-    return component["mapping"]
+        def load_date(day: date) -> tuple[str, list[dict[str, Any]]]:
+            value = day.isoformat()
+            payload = read_swsresearch_json(
+                "/institute-sw/api/index_analysis/index_analysis_report/",
+                {
+                    "page": 1,
+                    "page_size": 200,
+                    "index_type": "二级行业",
+                    "start_date": value,
+                    "end_date": value,
+                    "type": "DAY",
+                    "swindexcode": "all",
+                },
+            )
+            return value, ((payload.get("data") or {}).get("results") or [])
+
+        dated_rows: dict[str, list[dict[str, Any]]] = {}
+        errors = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(load_date, day): day for day in queried_dates}
+            for future in as_completed(futures):
+                day = futures[future]
+                try:
+                    value, rows = future.result()
+                    dated_rows[value] = rows
+                except HTTPException as exc:
+                    errors.append(f"{day.isoformat()}: {exc.detail}")
+
+        histories: dict[str, dict[str, Any]] = {}
+        for day in sorted(dated_rows):
+            for row in dated_rows[day]:
+                provider_name = str(row.get("swindexname") or "").strip()
+                normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", provider_name).strip()
+                code = str(row.get("swindexcode") or "").strip()
+                close = to_number(row.get("closeindex"))
+                if not normalized_name or not code or close is None:
+                    continue
+                history = histories.setdefault(
+                    normalized_name,
+                    {"provider_name": provider_name, "provider_identifier": code, "items": []},
+                )
+                history["items"].append(
+                    {
+                        "date": str(row.get("bargaindate") or day)[:10],
+                        "open": None,
+                        "close": close,
+                        "high": None,
+                        "low": None,
+                        "volume": to_number(row.get("bargainamount")),
+                        "turnover": None,
+                        "change_pct": to_number(row.get("markup")),
+                        "turnover_rate": to_number(row.get("turnoverrate")),
+                    }
+                )
+        if not histories:
+            raise HTTPException(
+                status_code=502,
+                detail="No recent official SWS Research level-2 industry history rows.",
+            )
+        return {"histories": histories, "source_errors": errors}
+
+    return get_cached_component_with_stale(key, 300, 3600, load)
 
 
 def get_swsresearch_industry_daily_kline(board_name: str, limit: int) -> dict[str, Any]:
     normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
-    matched = get_swsresearch_industry_code_map().get(normalized_name)
+    component = get_swsresearch_recent_level2_history(limit)
+    matched = (component.get("histories") or {}).get(normalized_name)
     if not matched:
         raise HTTPException(
             status_code=404, detail=f"No exact official SWS Research industry match: {normalized_name}"
         )
-    code, provider_name = matched
-    payload = read_swsresearch_json(
-        "/institute-sw/api/index_publish/trend/",
-        {"swindexcode": code, "period": "DAY"},
-    )
-    rows = [
-        {
-            "date": clean_value(row.get("bargaindate")),
-            "open": to_number(row.get("openindex")),
-            "close": to_number(row.get("closeindex")),
-            "high": to_number(row.get("maxindex")),
-            "low": to_number(row.get("minindex")),
-            "volume": to_number(row.get("bargainamount")),
-            "turnover": to_number(row.get("bargainsum")),
-            "change_pct": to_number(row.get("markup")),
-            "turnover_rate": None,
-        }
-        for row in payload.get("data") or []
-        if row.get("bargaindate") and to_number(row.get("closeindex")) is not None
-    ]
-    rows.sort(key=lambda item: str(item.get("date")))
-    if not rows:
+    rows = matched.get("items") or []
+    if len(rows) <= max(5, limit - 6):
         raise HTTPException(
-            status_code=502, detail=f"No official SWS Research history rows: {normalized_name}"
+            status_code=502,
+            detail=f"Insufficient recent official SWS Research history rows: {normalized_name}",
         )
     return {
         "name": normalized_name,
-        "matched_provider_name": provider_name,
-        "provider_identifier": code,
+        "matched_provider_name": matched.get("provider_name"),
+        "provider_identifier": matched.get("provider_identifier"),
         "items": rows[-limit:],
         "source": "swsresearch_official_index_history",
+        "source_errors": component.get("source_errors") or [],
         "transport_security_note": (
             "Fixed official public host; certificate-chain verification unavailable at source; "
             "response schema, code, and exact industry name are validated."
@@ -6606,19 +6639,22 @@ def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None
             payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
             return payload
         if board_name and sector_type == "industry":
-            payload, _, errors = race_public_sources(
-                (
-                    ("eastmoney_sector_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
+            try:
+                return get_swsresearch_industry_daily_kline(board_name, limit)
+            except HTTPException as official_error:
+                payload, _, errors = race_public_sources(
                     (
-                        "swsresearch_official_history",
-                        lambda: get_swsresearch_industry_daily_kline(board_name, limit),
+                        ("eastmoney_sector_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
+                        ("10jqka_industry_history", lambda: get_10jqka_industry_daily_kline(board_name, limit)),
                     ),
-                    ("10jqka_industry_history", lambda: get_10jqka_industry_daily_kline(board_name, limit)),
-                ),
-                6,
-            )
-            payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
-            return payload
+                    5,
+                )
+                payload["source_errors"] = [
+                    *normalize_source_errors(payload.get("source_errors")),
+                    f"swsresearch_official_history: {official_error.detail}",
+                    *errors,
+                ]
+                return payload
         return get_eastmoney_generic_daily_kline(secid, limit)
     return get_cached_component_with_stale(
         sector_history_cache_key(secid, limit),
