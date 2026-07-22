@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "session_snapshot_health_hardening_v1"
+ROUTING_REVISION = "session_snapshot_health_hardening_v2"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -8538,18 +8538,98 @@ def get_market_snapshot_data(
             inflight_wait_timeout_seconds=3,
         )
     results, component_status, source_errors = collect_components(loaders, 9)
-    if requested_identifiers and "batch_quotes" not in results:
+    initial_batch = results.get("batch_quotes") or {}
+    initial_batch_rows = initial_batch.get("results") or []
+    initial_batch_keys = {
+        str(value)
+        for item in initial_batch_rows
+        for value in (item.get("identifier"), item.get("symbol"))
+        if value
+    }
+    missing_batch_identifiers = [
+        identifier
+        for identifier in requested_identifiers
+        if identifier not in initial_batch_keys
+    ]
+    if missing_batch_identifiers:
         initial_status = component_status.get("batch_quotes", {}).get("status")
         recovery_results, recovery_status, recovery_errors = collect_components(
-            {"batch_quotes": loaders["batch_quotes"]}, 3
+            {"batch_quotes": lambda: get_batch_quote_data(requested_identifiers)}, 4.5
         )
-        source_errors = [
-            error for error in source_errors if error.get("source") != "batch_quotes"
+        recovery_batch = recovery_results.get("batch_quotes") or {}
+        recovery_rows = recovery_batch.get("results") or []
+        merged_by_identifier = {
+            str(item.get("identifier") or item.get("symbol")): item
+            for item in [*initial_batch_rows, *recovery_rows]
+            if item.get("identifier") or item.get("symbol")
+        }
+        merged_rows = list(merged_by_identifier.values())
+        merged_keys = {
+            str(value)
+            for item in merged_rows
+            for value in (item.get("identifier"), item.get("symbol"))
+            if value
+        }
+        still_missing = [
+            identifier for identifier in requested_identifiers if identifier not in merged_keys
         ]
-        if "batch_quotes" in recovery_results:
-            results["batch_quotes"] = recovery_results["batch_quotes"]
+        if merged_rows:
+            merged_batch = deepcopy(recovery_batch or initial_batch)
+            merged_batch["requested_count"] = len(requested_identifiers)
+            merged_batch["count"] = len(merged_rows)
+            merged_batch["results"] = merged_rows
+            merged_batch["errors"] = [
+                error
+                for error in [
+                    *(initial_batch.get("errors") or []),
+                    *(recovery_batch.get("errors") or []),
+                ]
+                if str(error.get("identifier") or error.get("symbol")) in still_missing
+            ]
+            merged_batch["source"] = sorted(
+                set(normalize_sources(initial_batch.get("source")))
+                | set(normalize_sources(recovery_batch.get("source")))
+            )
+            merged_batch["source_errors"] = [
+                *normalize_source_errors(initial_batch.get("source_errors")),
+                *normalize_source_errors(recovery_batch.get("source_errors")),
+            ]
+            merged_market_times = sorted(
+                item["market_time"] for item in merged_rows if item.get("market_time")
+            )
+            merged_source_updates = sorted(
+                item["source_updated_at"]
+                for item in merged_rows
+                if item.get("source_updated_at")
+            )
+            merged_batch["market_time"] = (
+                merged_market_times[-1] if merged_market_times else None
+            )
+            merged_batch["effective_market_time"] = merged_batch["market_time"]
+            merged_batch["market_time_range"] = (
+                {"earliest": merged_market_times[0], "latest": merged_market_times[-1]}
+                if merged_market_times
+                else None
+            )
+            merged_batch["source_updated_at"] = (
+                merged_source_updates[-1] if merged_source_updates else None
+            )
+            merged_batch["source_updated_at_range"] = (
+                {"earliest": merged_source_updates[0], "latest": merged_source_updates[-1]}
+                if merged_source_updates
+                else None
+            )
+            merged_batch["data_status"] = "full_data" if not still_missing else "partial_data"
+            results["batch_quotes"] = merged_batch
+        elif recovery_batch:
+            results["batch_quotes"] = recovery_batch
+
+        if not still_missing:
+            source_errors = [
+                error for error in source_errors if error.get("source") != "batch_quotes"
+            ]
             component_status["batch_quotes"] = {
-                **recovery_status["batch_quotes"],
+                **recovery_status.get("batch_quotes", {}),
                 "status": "recovered_within_compensation_budget",
                 "initial_status": initial_status,
                 "recovery_attempted": True,
@@ -8560,8 +8640,14 @@ def get_market_snapshot_data(
                     "batch_quotes",
                     {"status": "unavailable_within_response_budget", "latency_ms": None},
                 ),
+                "status": (
+                    "partial_after_compensation"
+                    if merged_rows
+                    else "unavailable_after_compensation"
+                ),
                 "initial_status": initial_status,
                 "recovery_attempted": True,
+                "still_missing_identifiers": still_missing,
             }
             source_errors.extend(recovery_errors)
     if not results:

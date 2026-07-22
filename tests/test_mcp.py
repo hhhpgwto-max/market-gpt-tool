@@ -773,16 +773,22 @@ def test_snapshot_compensates_for_a_late_batch_component() -> None:
                     {
                         "market_overview": fake_get_market_overview_data(5),
                         "target_quote": fake_get_quote_data("600519"),
+                        "batch_quotes": {
+                            "requested_count": 1,
+                            "count": 0,
+                            "results": [],
+                            "errors": [],
+                            "source": [],
+                            "source_errors": [],
+                            "data_status": "no_data",
+                        },
                     },
                     {
                         "market_overview": {"status": "available", "latency_ms": 10},
                         "target_quote": {"status": "available", "latency_ms": 10},
-                        "batch_quotes": {
-                            "status": "unavailable_within_response_budget",
-                            "latency_ms": None,
-                        },
+                        "batch_quotes": {"status": "available", "latency_ms": 10},
                     },
-                    [{"source": "batch_quotes", "error_type": "timeout", "message": "late"}],
+                    [],
                 )
             return (
                 {"batch_quotes": fake_get_batch_quote_data(["600519"])},
@@ -1916,7 +1922,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "session_snapshot_health_hardening_v1"
+    assert health["routing_revision"] == "session_snapshot_health_hardening_v2"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2973,7 +2979,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "session_snapshot_health_hardening_v1"
+        assert health.json()["routing_revision"] == "session_snapshot_health_hardening_v2"
 
         for legacy_path in (
             "/search?keyword=600000",
