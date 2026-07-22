@@ -27,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v6"
+ROUTING_REVISION = "capital_timeline_sector_history_v7"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -95,7 +95,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.4",
+    version="0.14.5",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -6461,7 +6461,7 @@ def get_swsresearch_recent_level2_history(limit: int) -> dict[str, Any]:
 
         dated_rows: dict[str, list[dict[str, Any]]] = {}
         errors = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {executor.submit(load_date, day): day for day in queried_dates}
             for future in as_completed(futures):
                 day = futures[future]
@@ -6774,6 +6774,28 @@ def get_sector_rotation_data(
     for key, payload in history_components.items():
         if key.startswith("sector_history:"):
             history_results[key.split(":", 1)[1]] = payload
+    recovered_symbols = set()
+    if normalized_type == "industry":
+        for board in candidates:
+            board_symbol = str(board.get("symbol") or "")
+            if not board_symbol or board_symbol in history_results:
+                continue
+            try:
+                history_results[board_symbol] = get_swsresearch_industry_daily_kline(
+                    str(board.get("name") or ""), history_limit
+                )
+                recovered_symbols.add(board_symbol)
+            except HTTPException:
+                pass
+    if recovered_symbols:
+        source_errors = [
+            error
+            for error in source_errors
+            if not (
+                isinstance(error, str)
+                and any(f"sector_history:{symbol}:" in error for symbol in recovered_symbols)
+            )
+        ]
     if not benchmark_history.get("items"):
         benchmark_history = get_recent_sector_history_snapshot(
             "1.000300", history_limit
