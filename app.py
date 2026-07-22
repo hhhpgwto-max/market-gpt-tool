@@ -2,6 +2,7 @@ import os
 import base64
 import json
 import re
+import ssl
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -26,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v3"
+ROUTING_REVISION = "capital_timeline_sector_history_v4"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -94,7 +95,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.1",
+    version="0.14.2",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -6398,6 +6399,109 @@ def get_10jqka_industry_code_map() -> dict[str, str]:
     return component["mapping"]
 
 
+def read_swsresearch_json(path: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    """Read a fixed official public endpoint whose server omits an intermediate certificate."""
+    if not path.startswith("/institute-sw/api/"):
+        raise HTTPException(status_code=400, detail="Invalid SWS Research public endpoint path.")
+    url = f"https://www.swsresearch.com{path}?{urlencode(parameters)}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; MarketSentinel/0.14)",
+            "Referer": "https://www.swsresearch.com/institute_sw/allIndex/releasedIndex",
+            "Accept": "application/json",
+        },
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    started_at = perf_counter()
+    try:
+        with urlopen(request, timeout=6, context=context) as response:  # nosec B310
+            payload = json.loads(response.read().decode("utf-8"))
+        if str(payload.get("code")) != "200":
+            raise ValueError(str(payload.get("message") or "unexpected response code"))
+        record_source_health("swsresearch", True, int((perf_counter() - started_at) * 1000))
+        return payload
+    except (URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+        record_source_health(
+            "swsresearch", False, int((perf_counter() - started_at) * 1000), str(exc)
+        )
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch official SWS Research public data: {exc}"
+        ) from exc
+
+
+def get_swsresearch_industry_code_map() -> dict[str, tuple[str, str]]:
+    key = cache_key("swsresearch_industry_code_map", {})
+
+    def load() -> dict[str, Any]:
+        payload = read_swsresearch_json(
+            "/institute-sw/api/index_publish/current/",
+            {"page": 1, "page_size": 200, "indextype": "二级行业"},
+        )
+        rows = ((payload.get("data") or {}).get("results") or [])
+        mapping = {
+            re.sub(r"[ⅠⅡⅢ]$", "", str(row.get("swindexname") or "")).strip(): (
+                str(row.get("swindexcode") or "").strip(),
+                str(row.get("swindexname") or "").strip(),
+            )
+            for row in rows
+            if row.get("swindexcode") and row.get("swindexname")
+        }
+        if not mapping:
+            raise HTTPException(status_code=502, detail="No official SWS Research industry rows.")
+        return {"mapping": mapping}
+
+    component, _ = get_cached_tool_data(key, 21600, load)
+    return component["mapping"]
+
+
+def get_swsresearch_industry_daily_kline(board_name: str, limit: int) -> dict[str, Any]:
+    normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
+    matched = get_swsresearch_industry_code_map().get(normalized_name)
+    if not matched:
+        raise HTTPException(
+            status_code=404, detail=f"No exact official SWS Research industry match: {normalized_name}"
+        )
+    code, provider_name = matched
+    payload = read_swsresearch_json(
+        "/institute-sw/api/index_publish/trend/",
+        {"swindexcode": code, "period": "DAY"},
+    )
+    rows = [
+        {
+            "date": clean_value(row.get("bargaindate")),
+            "open": to_number(row.get("openindex")),
+            "close": to_number(row.get("closeindex")),
+            "high": to_number(row.get("maxindex")),
+            "low": to_number(row.get("minindex")),
+            "volume": to_number(row.get("bargainamount")),
+            "turnover": to_number(row.get("bargainsum")),
+            "change_pct": to_number(row.get("markup")),
+            "turnover_rate": None,
+        }
+        for row in payload.get("data") or []
+        if row.get("bargaindate") and to_number(row.get("closeindex")) is not None
+    ]
+    rows.sort(key=lambda item: str(item.get("date")))
+    if not rows:
+        raise HTTPException(
+            status_code=502, detail=f"No official SWS Research history rows: {normalized_name}"
+        )
+    return {
+        "name": normalized_name,
+        "matched_provider_name": provider_name,
+        "provider_identifier": code,
+        "items": rows[-limit:],
+        "source": "swsresearch_official_index_history",
+        "transport_security_note": (
+            "Fixed official public host; certificate-chain verification unavailable at source; "
+            "response schema, code, and exact industry name are validated."
+        ),
+    }
+
+
 def matched_10jqka_industry_code(board_name: str) -> tuple[str, str] | None:
     normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
     mapping = get_10jqka_industry_code_map()
@@ -6505,9 +6609,13 @@ def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None
             payload, _, errors = race_public_sources(
                 (
                     ("eastmoney_sector_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
+                    (
+                        "swsresearch_official_history",
+                        lambda: get_swsresearch_industry_daily_kline(board_name, limit),
+                    ),
                     ("10jqka_industry_history", lambda: get_10jqka_industry_daily_kline(board_name, limit)),
                 ),
-                5,
+                6,
             )
             payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
             return payload
@@ -6731,8 +6839,12 @@ def get_sector_rotation_data(
                 "history_status": "available" if rows else "unavailable",
                 "history_source": history.get("source"),
                 "history_provider_name": history.get("matched_provider_name") or history.get("name"),
+                "history_provider_identifier": history.get("provider_identifier"),
+                "history_transport_security_note": history.get("transport_security_note"),
                 "history_name_match_status": (
-                    "cross_provider_normalized_name_match_definitions_may_differ"
+                    "exact_name_match_to_official_sw_industry_index"
+                    if history.get("source") == "swsresearch_official_index_history"
+                    else "cross_provider_normalized_name_match_definitions_may_differ"
                     if history.get("source") == "10jqka_industry_daily_history"
                     else "same_provider_identifier"
                     if rows
@@ -6776,6 +6888,9 @@ def get_sector_rotation_data(
         "history_available_count": histories_available,
         "cross_provider_history_count": sum(
             item.get("history_source") == "10jqka_industry_daily_history" for item in items
+        ),
+        "official_sw_history_count": sum(
+            item.get("history_source") == "swsresearch_official_index_history" for item in items
         ),
         "items": items,
         "source": sorted(
