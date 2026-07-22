@@ -26,7 +26,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "challenge_stability_cross_checks_v1"
+ROUTING_REVISION = "session_snapshot_health_hardening_v1"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -467,7 +467,11 @@ def prune_tool_cache_locked(incoming_key: str) -> None:
 
 
 def get_cached_tool_data(
-    key: str, ttl_seconds: int, loader: Any
+    key: str,
+    ttl_seconds: int,
+    loader: Any,
+    *,
+    inflight_wait_timeout_seconds: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     while True:
         now = datetime.now(timezone.utc)
@@ -492,7 +496,17 @@ def get_cached_tool_data(
             entry["waiters"] += 1
         # The owner runs its loader without holding a cache lock. Exact-key
         # duplicates wait, while nested loaders for other keys stay independent.
-        entry["event"].wait()
+        completed = entry["event"].wait(timeout=inflight_wait_timeout_seconds)
+        if not completed:
+            with TOOL_CACHE_LOCK:
+                entry["waiters"] -= 1
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "An in-flight cache refresh exceeded the "
+                    f"{inflight_wait_timeout_seconds:g} second component wait budget."
+                ),
+            )
         with TOOL_CACHE_LOCK:
             error = entry["error"]
             entry["waiters"] -= 1
@@ -559,10 +573,17 @@ def get_cached_component_with_stale(
     ttl_seconds: int,
     max_stale_age_seconds: int,
     loader: Any,
+    *,
+    inflight_wait_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Share component refreshes and preserve a recent honest fallback on transient failure."""
     try:
-        data, _ = get_cached_tool_data(key, ttl_seconds, loader)
+        data, _ = get_cached_tool_data(
+            key,
+            ttl_seconds,
+            loader,
+            inflight_wait_timeout_seconds=inflight_wait_timeout_seconds,
+        )
         return data
     except HTTPException as exc:
         stale = get_cached_tool_snapshot(key, max_stale_age_seconds)
@@ -1456,12 +1477,16 @@ def search_sina_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    data_health = get_market_data_health_data()
     return {
         "ok": True,
+        "ok_scope": "service_process_and_protocol_entrypoint_only",
+        "service_status": "up",
+        "data_routes_status": data_health["overall_status"],
         "name": APP_NAME,
         "routing_revision": ROUTING_REVISION,
         "time": now_iso(),
-        "data_health": get_market_data_health_data(),
+        "data_health": data_health,
     }
 
 
@@ -1624,7 +1649,8 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
 
 def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]) -> dict[str, Any]:
     volume = to_number(row.get("f5"))
-    market_time = format_unix_market_time(row.get("f124"))
+    source_updated_at = format_unix_market_time(row.get("f124"))
+    timestamps = derive_quote_timestamps(source_updated_at)
     return {
         "identifier": security["identifier"],
         "symbol": security["symbol"],
@@ -1649,7 +1675,11 @@ def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]
         "total_market_value_unit": "CNY",
         "circulating_market_value": to_number(row.get("f21")),
         "circulating_market_value_unit": "CNY",
-        "market_time": market_time,
+        "trade_date": timestamps["trade_date"],
+        "quote_time": timestamps["quote_time"],
+        "market_time": timestamps["quote_time"],
+        "effective_market_time": timestamps["quote_time"],
+        "source_updated_at": source_updated_at,
         "source": "eastmoney_batch",
     }
 
@@ -1693,6 +1723,10 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
                 )
 
     market_times = sorted(item["market_time"] for item in results if item.get("market_time"))
+    source_update_times = sorted(
+        item["source_updated_at"] for item in results if item.get("source_updated_at")
+    )
+    completed_at = now_iso()
     return {
         "requested_count": len(symbols),
         "count": len(results),
@@ -1704,7 +1738,16 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         "market_time_range": (
             {"earliest": market_times[0], "latest": market_times[-1]} if market_times else None
         ),
-        "queried_at": now_iso(),
+        "effective_market_time": market_times[-1] if market_times else None,
+        "source_updated_at": source_update_times[-1] if source_update_times else None,
+        "source_updated_at_range": (
+            {"earliest": source_update_times[0], "latest": source_update_times[-1]}
+            if source_update_times
+            else None
+        ),
+        "source_fetch_time": completed_at,
+        "tool_queried_at": completed_at,
+        "queried_at": completed_at,
         "data_status": "full_data" if results and not errors else "partial_data" if results else "no_data",
         "note": "All successful quotes are requested from one public batch snapshot; no investment judgement is generated.",
     }
@@ -4195,6 +4238,21 @@ def historical_window_metrics(
     return metrics
 
 
+def completed_daily_history(
+    items: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Exclude today's daily bar until the continuous session has safely closed."""
+    if not items:
+        return items, False
+    now = (now or datetime.now(MARKET_TIMEZONE)).astimezone(MARKET_TIMEZONE)
+    latest_date = clean_value(items[-1].get("date"))
+    if latest_date != now.date().isoformat():
+        return items, False
+    session_is_complete = (now.hour, now.minute) >= (15, 5)
+    return (items if session_is_complete else items[:-1]), not session_is_complete
+
+
 def get_historical_context_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     payload, _, source_errors = race_public_sources(
@@ -4229,14 +4287,18 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
     items = payload["items"]
     if not items:
         raise HTTPException(status_code=404, detail=f"Historical context not found: {symbol}")
-    latest = items[-1]
+    latest_observation = items[-1]
+    latest_observation_date = clean_value(latest_observation.get("date"))
+    completed_items, is_incomplete_session = completed_daily_history(items)
+    if not completed_items:
+        raise HTTPException(
+            status_code=502,
+            detail="No completed daily session is available for historical metrics.",
+        )
+    latest = completed_items[-1]
     latest_date = clean_value(latest.get("date"))
-    is_incomplete_session = (
-        latest_date == datetime.now(MARKET_TIMEZONE).date().isoformat()
-        and market_status_at() == "open"
-    )
     windows = {
-        str(window): historical_window_metrics(items, window)
+        str(window): historical_window_metrics(completed_items, window)
         for window in HISTORICAL_CONTEXT_WINDOWS
     }
     return {
@@ -4248,8 +4310,14 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
         "adjustment_source_parameter": payload.get("adjustment_source_parameter"),
         "latest_trade_date": latest_date,
         "latest_close": to_number(latest.get("close")),
+        "latest_complete_trade_date": latest_date,
+        "latest_complete_close": to_number(latest.get("close")),
+        "latest_observation_trade_date": latest_observation_date,
+        "latest_observation_close": to_number(latest_observation.get("close")),
         "latest_session_may_be_incomplete": is_incomplete_session,
+        "excluded_incomplete_session": is_incomplete_session,
         "source_sessions": len(items),
+        "complete_sessions_used": len(completed_items),
         "windows": windows,
         "source": payload.get("source"),
         "source_errors": payload.get("source_errors", []),
@@ -4259,7 +4327,7 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
             if all(item["window_complete"] for item in windows.values())
             else "partial_data"
         ),
-        "note": "Historical values are mechanical forward-adjusted facts. Percentiles describe location within each window and are not scores or recommendations.",
+        "note": "Historical values use completed forward-adjusted daily sessions only. A current-day bar observed before 15:05 Asia/Shanghai is disclosed but excluded from exact return and percentile metrics. Percentiles are not scores or recommendations.",
     }
 
 
@@ -8447,6 +8515,7 @@ def get_market_snapshot_data(
             5,
             120,
             lambda: get_market_overview_data(sector_limit),
+            inflight_wait_timeout_seconds=4,
         ),
     }
     if requested_identifiers:
@@ -8458,6 +8527,7 @@ def get_market_snapshot_data(
             2,
             15,
             lambda: get_batch_quote_data(requested_identifiers),
+            inflight_wait_timeout_seconds=3,
         )
     if target_symbol:
         loaders["target_quote"] = lambda: get_cached_component_with_stale(
@@ -8465,8 +8535,35 @@ def get_market_snapshot_data(
             2,
             15,
             lambda: get_quote_data(target_symbol),
+            inflight_wait_timeout_seconds=3,
         )
-    results, component_status, source_errors = collect_components(loaders, 12)
+    results, component_status, source_errors = collect_components(loaders, 9)
+    if requested_identifiers and "batch_quotes" not in results:
+        initial_status = component_status.get("batch_quotes", {}).get("status")
+        recovery_results, recovery_status, recovery_errors = collect_components(
+            {"batch_quotes": loaders["batch_quotes"]}, 3
+        )
+        source_errors = [
+            error for error in source_errors if error.get("source") != "batch_quotes"
+        ]
+        if "batch_quotes" in recovery_results:
+            results["batch_quotes"] = recovery_results["batch_quotes"]
+            component_status["batch_quotes"] = {
+                **recovery_status["batch_quotes"],
+                "status": "recovered_within_compensation_budget",
+                "initial_status": initial_status,
+                "recovery_attempted": True,
+            }
+        else:
+            component_status["batch_quotes"] = {
+                **recovery_status.get(
+                    "batch_quotes",
+                    {"status": "unavailable_within_response_budget", "latency_ms": None},
+                ),
+                "initial_status": initial_status,
+                "recovery_attempted": True,
+            }
+            source_errors.extend(recovery_errors)
     if not results:
         raise HTTPException(status_code=502, detail="All synchronized snapshot components failed.")
 
@@ -8483,6 +8580,14 @@ def get_market_snapshot_data(
         ),
         None,
     )
+    target_quote_origin = "dedicated_target_quote" if target_quote else None
+    if target_quote is None and batch_target is not None:
+        target_quote = batch_target
+        target_quote_origin = "batch_snapshot_fallback"
+        component_status["target_quote"] = {
+            **component_status.get("target_quote", {}),
+            "status": "recovered_from_batch_snapshot",
+        }
 
     time_entries = [
         entry
@@ -8583,9 +8688,16 @@ def get_market_snapshot_data(
         "symbol": target_symbol,
         "requested_identifiers": requested_identifiers,
         "market_time": latest_time,
+        "effective_market_time": latest_time,
         "market_time_range": {"earliest": earliest_time, "latest": latest_time},
+        "component_effective_market_times": [
+            {"component": item["component"], "effective_market_time": item["market_time"]}
+            for item in sorted_times
+        ],
         "source_time_difference_seconds": time_difference_seconds,
         "source_updated_at": source_updated_at,
+        "source_fetch_time": completed_at,
+        "tool_queried_at": completed_at,
         "source_difference_pct": source_difference_pct,
         "recommended_source": recommended_source,
         "recommended_source_reason": (
@@ -8594,6 +8706,7 @@ def get_market_snapshot_data(
             else "The batch snapshot is the available synchronized security source."
         ),
         "target_quote": target_quote,
+        "target_quote_origin": target_quote_origin,
         "peer_quotes": [
             item for item in batch_results if str(item.get("symbol")) != target_symbol
         ],
@@ -8622,8 +8735,9 @@ def get_market_data_health_data() -> dict[str, Any]:
     with PREFERRED_ROUTE_HEALTH_LOCK:
         preferred_routes = deepcopy(PREFERRED_ROUTE_HEALTH)
 
+    core_source_names = ("eastmoney", "tencent", "sina")
     sources = []
-    for source in ("eastmoney", "tencent", "sina"):
+    for source in core_source_names:
         state = observed.get(source)
         if state is None:
             sources.append(
@@ -8642,7 +8756,13 @@ def get_market_data_health_data() -> dict[str, Any]:
             continue
         attempts = state["attempt_count"]
         success_rate = state["success_count"] / attempts if attempts else None
-        status = "healthy" if state["success_count"] >= state["failure_count"] else "degraded"
+        status = (
+            "healthy"
+            if state["success_count"] > 0 and state.get("consecutive_failures", 0) == 0
+            else "degraded"
+            if state["success_count"] > 0
+            else "unavailable"
+        )
         sources.append(
             {
                 "source": source,
@@ -8657,23 +8777,67 @@ def get_market_data_health_data() -> dict[str, Any]:
             }
         )
 
-    degraded = any(item["status"] == "degraded" for item in sources)
+    def observed_route_status(providers: list[str]) -> str:
+        states = [observed.get(provider) for provider in providers]
+        attempts = sum(state.get("attempt_count", 0) for state in states if state)
+        successes = sum(state.get("success_count", 0) for state in states if state)
+        active_failures = sum(
+            state.get("consecutive_failures", 0) for state in states if state
+        )
+        if attempts == 0:
+            return "configured_not_yet_observed"
+        if successes == 0:
+            return "unavailable_on_observed_requests"
+        if active_failures:
+            return "operational_with_observed_failures"
+        return "operational_on_observed_requests"
+
+    core_states = [observed.get(source) for source in core_source_names]
+    total_attempts = sum(state.get("attempt_count", 0) for state in core_states if state)
+    total_successes = sum(state.get("success_count", 0) for state in core_states if state)
+    total_failures = sum(state.get("failure_count", 0) for state in core_states if state)
+    active_failures = sum(
+        state.get("consecutive_failures", 0) for state in core_states if state
+    )
+    degraded = any(item["status"] in {"degraded", "unavailable"} for item in sources)
+    overall_status = (
+        "configured_not_yet_observed"
+        if total_attempts == 0
+        else "unavailable_on_observed_requests"
+        if total_successes == 0
+        else "operational_with_observed_failures"
+        if active_failures
+        else "operational_on_observed_requests"
+    )
     with TOOL_CACHE_LOCK:
         cache_entries = len(TOOL_CACHE)
     return {
         "sources": sources,
+        "overall_status": overall_status,
+        "observation_coverage": {
+            "scope": "requests_observed_by_this_process_only",
+            "is_exhaustive_component_probe": False,
+            "attempt_count": total_attempts,
+            "success_count": total_successes,
+            "failure_count": total_failures,
+            "observed_source_count": sum(item["attempt_count"] > 0 for item in sources),
+            "configured_source_count": len(sources),
+        },
         "quote_route": {
             "status": "configured",
+            "observed_status": observed_route_status(["eastmoney", "tencent", "sina"]),
             "providers": ["eastmoney", "tencent", "sina"],
             "strategy": "parallel_fastest_success_with_6_second_total_budget",
         },
         "intraday_route": {
             "status": "configured",
+            "observed_status": observed_route_status(["eastmoney", "tencent"]),
             "providers": ["eastmoney", "tencent"],
             "strategy": "parallel_fastest_success_with_9_second_total_budget_and_session_filter",
         },
         "kline_route": {
             "status": "configured",
+            "observed_status": observed_route_status(["eastmoney", "tencent"]),
             "providers": ["eastmoney", "tencent"],
             "strategy": "preferred_source_with_adaptive_fast_fallback_and_shared_source_payload_cache",
             "eastmoney_circuit": {
@@ -8688,6 +8852,7 @@ def get_market_data_health_data() -> dict[str, Any]:
         },
         "market_overview_route": {
             "status": "configured",
+            "observed_status": observed_route_status(["eastmoney", "tencent", "sina"]),
             "breadth_providers": [
                 "eastmoney_push2",
                 "eastmoney_push2delay",
@@ -8697,6 +8862,7 @@ def get_market_data_health_data() -> dict[str, Any]:
         },
         "etf_route": {
             "status": "configured",
+            "observed_status": observed_route_status(["eastmoney", "tencent", "sina"]),
             "providers": ["eastmoney", "tencent", "sina"],
             "note": "ETF and LOF code prefixes are classified before public-source routing.",
         },
@@ -8707,7 +8873,7 @@ def get_market_data_health_data() -> dict[str, Any]:
         },
         "routing_revision": ROUTING_REVISION,
         "degraded_mode": degraded,
-        "note": "Observed request health only; this endpoint does not fabricate a live probe or investment conclusion.",
+        "note": "Service availability, configured routes, and request observations are separate. Success rates cover only requests seen by this process and do not prove that every composite subcomponent is healthy. This endpoint does not fabricate a live probe or investment conclusion.",
         "source": ["in_process_observability"],
     }
 

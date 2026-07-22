@@ -761,6 +761,54 @@ def test_synchronized_market_snapshot_contract() -> None:
         market_app.TOOL_CACHE.clear()
 
 
+def test_snapshot_compensates_for_a_late_batch_component() -> None:
+    original_collect = market_app.collect_components
+    calls = 0
+    try:
+        def staged_collect(loaders: dict, _budget: float, _executor: object = None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return (
+                    {
+                        "market_overview": fake_get_market_overview_data(5),
+                        "target_quote": fake_get_quote_data("600519"),
+                    },
+                    {
+                        "market_overview": {"status": "available", "latency_ms": 10},
+                        "target_quote": {"status": "available", "latency_ms": 10},
+                        "batch_quotes": {
+                            "status": "unavailable_within_response_budget",
+                            "latency_ms": None,
+                        },
+                    },
+                    [{"source": "batch_quotes", "error_type": "timeout", "message": "late"}],
+                )
+            return (
+                {"batch_quotes": fake_get_batch_quote_data(["600519"])},
+                {"batch_quotes": {"status": "available", "latency_ms": 20}},
+                [],
+            )
+
+        market_app.collect_components = staged_collect
+        snapshot = market_app.get_market_snapshot_data(
+            "600519", [], None, 5, "summary"
+        )
+        assert calls == 2
+        assert snapshot["component_status"]["batch_quotes"]["status"] == (
+            "recovered_within_compensation_budget"
+        )
+        assert snapshot["component_status"]["batch_quotes"]["recovery_attempted"] is True
+        assert not any(
+            error.get("source") == "batch_quotes" for error in snapshot["source_errors"]
+        )
+        assert snapshot["effective_market_time"] == snapshot["market_time"]
+        assert snapshot["source_fetch_time"] == snapshot["tool_queried_at"]
+    finally:
+        market_app.collect_components = original_collect
+        market_app.TOOL_CACHE.clear()
+
+
 def test_search_source_parser() -> None:
     original_text_reader = market_app.read_market_text
     try:
@@ -1135,8 +1183,21 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         assert batch["results"][0]["security_type"] == "etf"
         assert batch["results"][0]["volume"] == 100000
         assert batch["results"][0]["volume_unit"] == "share"
+        assert batch["source_updated_at"] == batch["results"][0]["source_updated_at"]
+        assert batch["source_fetch_time"] == batch["tool_queried_at"]
         assert batch["errors"][0]["code"] == "invalid_symbol"
         assert market_app.batch_security_metadata("index:000300")["security_type"] == "index"
+
+        lunch_update = market_app.datetime(
+            2026, 7, 22, 11, 37, tzinfo=market_app.MARKET_TIMEZONE
+        )
+        lunch_quote = market_app.batch_quote_from_eastmoney_row(
+            {"f12": "512760", "f13": 1, "f14": "Test ETF", "f2": 1.23, "f124": lunch_update.timestamp()},
+            market_app.batch_security_metadata("512760"),
+        )
+        assert lunch_quote["source_updated_at"] == "2026-07-22T11:37:00+08:00"
+        assert lunch_quote["effective_market_time"] == "2026-07-22T11:30:00+08:00"
+        assert lunch_quote["market_time"] == "2026-07-22T11:30:00+08:00"
 
         market_app.get_eastmoney_batch_quote_rows = lambda _securities: (
             [
@@ -1852,7 +1913,10 @@ def test_reliability_envelope_cache_and_health() -> None:
     eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["routing_revision"] == "challenge_stability_cross_checks_v1"
+    assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
+    assert health["overall_status"] == "operational_on_observed_requests"
+    assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
+    assert health["routing_revision"] == "session_snapshot_health_hardening_v1"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -1882,6 +1946,35 @@ def test_reliability_envelope_cache_and_health() -> None:
 
     original_cache_limit = market_app.TOOL_CACHE_MAX_ENTRIES
     market_app.TOOL_CACHE.clear()
+    inflight_started = Event()
+    release_inflight = Event()
+
+    def blocked_cache_loader() -> dict:
+        inflight_started.set()
+        release_inflight.wait(1)
+        return {"value": "owner"}
+
+    with market_app.ThreadPoolExecutor(max_workers=1) as executor:
+        owner = executor.submit(
+            market_app.get_cached_tool_data,
+            "bounded-inflight-wait",
+            10,
+            blocked_cache_loader,
+        )
+        assert inflight_started.wait(0.5)
+        try:
+            market_app.get_cached_tool_data(
+                "bounded-inflight-wait",
+                10,
+                lambda: {"value": "waiter"},
+                inflight_wait_timeout_seconds=0.01,
+            )
+            raise AssertionError("Expected the duplicate in-flight wait to be bounded.")
+        except market_app.HTTPException as exc:
+            assert exc.status_code == 504
+        finally:
+            release_inflight.set()
+        assert owner.result(timeout=0.5)[0]["value"] == "owner"
     market_app.TOOL_CACHE_MAX_ENTRIES = 3
     try:
         for index in range(5):
@@ -2002,6 +2095,27 @@ def test_historical_context_and_security_status_facts() -> None:
             ]
             == 100.0
         )
+
+        sample_daily = [
+            {"date": "2026-07-21", "close": 1.0},
+            {"date": "2026-07-22", "close": 2.0},
+        ]
+        lunch_history, lunch_incomplete = market_app.completed_daily_history(
+            sample_daily,
+            market_app.datetime(
+                2026, 7, 22, 11, 45, tzinfo=market_app.MARKET_TIMEZONE
+            ),
+        )
+        assert lunch_incomplete is True
+        assert lunch_history == sample_daily[:-1]
+        closed_history, closed_incomplete = market_app.completed_daily_history(
+            sample_daily,
+            market_app.datetime(
+                2026, 7, 22, 15, 5, tzinfo=market_app.MARKET_TIMEZONE
+            ),
+        )
+        assert closed_incomplete is False
+        assert closed_history == sample_daily
 
         quote = fake_get_quote_data("600519")
         quote["quote"]["name"] = "*ST Test"
@@ -2798,6 +2912,7 @@ def main() -> None:
     test_kline_range_and_pagination()
     test_tencent_minute_kline_adjustment_fallback()
     test_synchronized_market_snapshot_contract()
+    test_snapshot_compensates_for_a_late_batch_component()
     test_search_source_parser()
     test_etf_market_routing_and_search()
     test_quote_unit_normalization()
@@ -2858,7 +2973,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "challenge_stability_cross_checks_v1"
+        assert health.json()["routing_revision"] == "session_snapshot_health_hardening_v1"
 
         for legacy_path in (
             "/search?keyword=600000",
