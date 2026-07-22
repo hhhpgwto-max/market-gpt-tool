@@ -27,7 +27,7 @@ from mcp.types import ToolAnnotations
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_v4"
+ROUTING_REVISION = "capital_timeline_sector_history_v5"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -95,7 +95,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.2",
+    version="0.14.3",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -6695,115 +6695,60 @@ def get_sector_rotation_data(
             continue
         seen_board_symbols.add(board_symbol)
         candidates.append(board)
-    if normalized_type == "industry":
-        try:
-            representative = next(
-                (board for board in candidates if matched_10jqka_industry_code(str(board.get("name") or ""))),
-                None,
-            )
-            if representative is not None:
-                candidates.remove(representative)
-                candidates.insert(0, representative)
-        except HTTPException:
-            pass
     history_results: dict[str, dict[str, Any]] = {}
     source_errors: list[str | dict[str, Any]] = normalize_source_errors(
         board_component.get("source_errors")
     )
     history_limit = max(normalized_lookbacks) + 6
-    history_route = "eastmoney_sector_daily_history"
-    route_degraded = preferred_route_is_temporarily_degraded(
-        history_route, min_consecutive_failures=2, cooldown_seconds=90
-    )
-    first_board_symbol = (
-        str(candidates[0].get("symbol")) if candidates else None
-    )
-    initial_loaders: dict[str, Any] = {
+    history_loaders: dict[str, Any] = {
         "market_turnover": lambda: get_cached_component_with_stale(
             cache_key("sector_rotation_market_turnover", {}),
             15,
             300,
             get_overview_breadth_component,
-        )
+        ),
+        "benchmark_history": lambda: get_cached_sector_daily_kline(
+            "1.000300", history_limit
+        ),
+        **{
+            f"sector_history:{board['symbol']}": lambda board=board: get_cached_sector_daily_kline(
+                f"90.{board['symbol']}",
+                history_limit,
+                board.get("name"),
+                normalized_type,
+            )
+            for board in candidates
+            if board.get("symbol")
+        },
     }
-    if not route_degraded and first_board_symbol:
-        initial_loaders.update(
-            {
-                "benchmark_history": lambda: get_cached_sector_daily_kline(
-                    "1.000300", history_limit
-                ),
-                f"sector_history:{first_board_symbol}": lambda: get_cached_sector_daily_kline(
-                    f"90.{first_board_symbol}", history_limit,
-                    candidates[0].get("name"), normalized_type,
-                ),
-            }
-        )
-    initial_results, _, initial_errors = collect_components(
-        initial_loaders, 6, COMPOSITE_TOOL_EXECUTOR
+    history_components, _, history_errors = collect_components(
+        history_loaders, 7, COMPOSITE_TOOL_EXECUTOR
     )
     source_errors.extend(
-        f"{error['source']}: {error['message']}" for error in initial_errors
+        f"{error['source']}: {error['message']}" for error in history_errors
     )
-    market_component = initial_results.get("market_turnover") or {}
+    market_component = history_components.get("market_turnover") or {}
     total_market_turnover = to_number(
         (market_component.get("turnover") or {}).get("current")
     )
-    benchmark_history = initial_results.get("benchmark_history") or {
+    benchmark_history = history_components.get("benchmark_history") or {
         "items": [],
         "source": None,
     }
-    if first_board_symbol and initial_results.get(f"sector_history:{first_board_symbol}"):
-        history_results[first_board_symbol] = initial_results[
-            f"sector_history:{first_board_symbol}"
-        ]
-
-    board_probe = history_results.get(first_board_symbol or "", {})
-    live_probe_succeeded = bool(
-        board_probe.get("items") and not board_probe.get("served_from_stale_cache")
-    )
-    if first_board_symbol and not route_degraded:
-        record_preferred_route_health(
-            history_route,
-            live_probe_succeeded,
-            None if live_probe_succeeded else "Representative board history route failed.",
-        )
-    if live_probe_succeeded:
-        remaining_loaders = {
-            f"sector_history:{board['symbol']}": lambda board=board: get_cached_sector_daily_kline(
-                f"90.{board['symbol']}", history_limit,
-                board.get("name"), normalized_type,
-            )
-            for board in candidates[1:]
-            if board.get("symbol")
-        }
-        remaining_results, _, remaining_errors = collect_components(
-            remaining_loaders, 6, COMPOSITE_TOOL_EXECUTOR
-        )
-        source_errors.extend(
-            f"{error['source']}: {error['message']}" for error in remaining_errors
-        )
-        for key, payload in remaining_results.items():
+    for key, payload in history_components.items():
+        if key.startswith("sector_history:"):
             history_results[key.split(":", 1)[1]] = payload
-    elif first_board_symbol:
-        route_degraded = True
-        source_errors.append(
-            "sector_history: public board-history route is temporarily bypassed after a failed representative probe"
-        )
-
-    if route_degraded:
-        benchmark_history = (
-            get_recent_sector_history_snapshot("1.000300", history_limit)
-            or benchmark_history
-        )
-        for board in candidates:
-            board_symbol = str(board.get("symbol") or "")
-            if not board_symbol or board_symbol in history_results:
-                continue
-            snapshot = get_recent_sector_history_snapshot(
-                f"90.{board_symbol}", history_limit
-            )
-            if snapshot:
-                history_results[board_symbol] = snapshot
+    if not benchmark_history.get("items"):
+        benchmark_history = get_recent_sector_history_snapshot(
+            "1.000300", history_limit
+        ) or benchmark_history
+    for board in candidates:
+        board_symbol = str(board.get("symbol") or "")
+        if not board_symbol or board_symbol in history_results:
+            continue
+        snapshot = get_recent_sector_history_snapshot(f"90.{board_symbol}", history_limit)
+        if snapshot:
+            history_results[board_symbol] = snapshot
 
     benchmark_returns = kline_lookback_returns(
         benchmark_history.get("items", []), normalized_lookbacks
