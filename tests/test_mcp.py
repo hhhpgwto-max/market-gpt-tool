@@ -1,4 +1,6 @@
+import hashlib
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -31,6 +33,24 @@ def rpc_request(request_id: int, method: str, params: dict | None = None) -> dic
         "method": method,
         "params": params or {},
     }
+
+
+def assert_tools_list_matches_frozen_public_contract(tools: list[dict]) -> None:
+    golden_path = Path(__file__).with_name("tools_list_golden.json")
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        tools,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    actual_sha256 = hashlib.sha256(canonical).hexdigest()
+    assert len(tools) == golden["tool_count"]
+    assert actual_sha256 == golden["sha256"], (
+        "Public MCP tools/list changed. Existing ChatGPT conversations may cache this "
+        "contract. Keep the current schema unchanged, or create an explicitly approved "
+        "parallel MCP version and then refresh tests/tools_list_golden.json."
+    )
 
 
 def fake_get_quote_data(symbol: str) -> dict:
@@ -3156,6 +3176,7 @@ def main() -> None:
         )
         assert tools.status_code == 200, tools.text
         registered_tools = tools.json()["result"]["tools"]
+        assert_tools_list_matches_frozen_public_contract(registered_tools)
         names = {tool["name"] for tool in registered_tools}
         assert names == {
             "search_a_share",
