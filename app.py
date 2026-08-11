@@ -28,7 +28,7 @@ from pydantic import Field
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_filter_schema_v8"
+ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v9"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -96,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.6",
+    version="0.14.7",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -2823,7 +2823,8 @@ def filter_a_share_securities_data(
     ):
         raise HTTPException(status_code=400, detail="change_pct_min cannot be greater than change_pct_max.")
 
-    rows = get_eastmoney_market_quotes()
+    market_snapshot = get_cached_all_market_quote_snapshot()
+    rows = market_snapshot["rows"]
     matched = []
     for row in rows:
         name = str(row.get("name") or "")
@@ -2880,15 +2881,26 @@ def filter_a_share_securities_data(
         "above_average_price": above_average_price,
         "market_cap_max": market_cap_max,
     }
+    source_errors = list(market_snapshot.get("source_errors") or [])
+    served_from_stale_cache = bool(market_snapshot.get("served_from_stale_cache"))
     return {
         "matched_count": len(matched),
         "returned_count": min(len(matched), limit),
         "conditions": conditions,
         "results": matched[:limit],
         "sort_order": "public_source_change_pct_desc",
-        "source": ["eastmoney_all_a_share_snapshot"],
+        "source": normalize_sources(market_snapshot.get("source")),
         "market_time": market_times[-1] if market_times else None,
+        "source_fetch_time": market_snapshot.get("queried_at"),
         "queried_at": now_iso(),
+        "data_status": (
+            "partial_data"
+            if served_from_stale_cache or source_errors
+            else market_snapshot.get("data_status", "full_data")
+        ),
+        "source_errors": source_errors,
+        "served_from_stale_cache": served_from_stale_cache,
+        "stale_cache_age_seconds": market_snapshot.get("stale_cache_age_seconds"),
         "scope": "Mechanical conditions only; ordinary A shares only, excluding ETFs, funds, B shares, and delisting-arrangement securities.",
         "note": "No hidden weights, scores, recommendations, or trading conclusions are applied.",
     }
@@ -5507,6 +5519,11 @@ def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
 
 def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
     page_size = 100
+    hosts = (
+        "push2.eastmoney.com",
+        "push2delay.eastmoney.com",
+        "82.push2.eastmoney.com",
+    )
 
     def fetch_page(host: str, page: int) -> tuple[int, dict[str, Any]]:
         query = urlencode(
@@ -5533,11 +5550,7 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
         )
 
     errors = []
-    for host in (
-        "push2.eastmoney.com",
-        "push2delay.eastmoney.com",
-        "82.push2.eastmoney.com",
-    ):
+    for host in hosts:
         try:
             _, first_payload = fetch_page(host, 1)
             first_data = first_payload.get("data") or {}
@@ -5548,19 +5561,34 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
             page_count = ceil(total / page_size)
             pages: dict[int, list[dict[str, Any]]] = {1: first_rows}
             if page_count > 1:
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                fallback_hosts = (host, *(candidate for candidate in hosts if candidate != host))
+
+                def fetch_page_with_fallback(page: int) -> tuple[int, list[dict[str, Any]]]:
+                    page_errors = []
+                    for candidate_host in fallback_hosts:
+                        try:
+                            _, payload = fetch_page(candidate_host, page)
+                            rows = ((payload.get("data") or {}).get("diff")) or []
+                            if not rows:
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail=f"{candidate_host} returned no stock rows for page {page}.",
+                                )
+                            return page, rows
+                        except HTTPException as exc:
+                            page_errors.append(f"{candidate_host}: {exc.detail}")
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"page {page} failed on every Eastmoney host: {'; '.join(page_errors)}",
+                    )
+
+                with ThreadPoolExecutor(max_workers=16) as executor:
                     futures = [
-                        executor.submit(fetch_page, host, page)
+                        executor.submit(fetch_page_with_fallback, page)
                         for page in range(2, page_count + 1)
                     ]
                     for future in as_completed(futures):
-                        page, payload = future.result()
-                        rows = ((payload.get("data") or {}).get("diff")) or []
-                        if not rows:
-                            raise HTTPException(
-                                status_code=502,
-                                detail=f"{host} returned no stock rows for page {page}.",
-                            )
+                        page, rows = future.result()
                         pages[page] = rows
 
             raw_rows = [row for page in range(1, page_count + 1) for row in pages[page]]
@@ -5594,6 +5622,56 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
         except HTTPException as exc:
             errors.append(f"{host}: {exc.detail}")
     raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
+def load_all_market_quote_snapshot() -> dict[str, Any]:
+    source_errors = []
+    try:
+        sina = get_sina_market_quotes()
+        rows = sina["rows"]
+        source = ["sina_all_a_share_snapshot"]
+        source_errors.extend(sina.get("source_errors") or [])
+        data_status = (
+            "full_data"
+            if sina.get("coverage_status") == "complete" and not source_errors
+            else "partial_data"
+        )
+    except HTTPException as exc:
+        source_errors.append(f"sina_all_a_share_snapshot: {exc.detail}")
+        try:
+            rows = get_eastmoney_market_quotes()
+        except HTTPException as fallback_exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"{source_errors[0]}; eastmoney_all_a_share_snapshot: "
+                    f"{fallback_exc.detail}"
+                ),
+            ) from fallback_exc
+        source = ["eastmoney_all_a_share_snapshot"]
+        data_status = "partial_data"
+    if not rows:
+        raise HTTPException(status_code=502, detail="All-market quote snapshot returned no rows.")
+    market_times = sorted(row["market_time"] for row in rows if row.get("market_time"))
+    return {
+        "rows": rows,
+        "row_count": len(rows),
+        "source": source,
+        "source_errors": source_errors,
+        "market_time": market_times[-1] if market_times else None,
+        "queried_at": now_iso(),
+        "data_status": data_status,
+    }
+
+
+def get_cached_all_market_quote_snapshot() -> dict[str, Any]:
+    return get_cached_component_with_stale(
+        cache_key("all_market_quote_snapshot", {}),
+        15,
+        300,
+        load_all_market_quote_snapshot,
+        inflight_wait_timeout_seconds=12,
+    )
 
 
 def get_sina_market_quotes() -> dict[str, Any]:
@@ -5681,7 +5759,11 @@ def get_sina_market_quotes() -> dict[str, Any]:
             "name": clean_value(row.get("name")),
             "price": to_number(row.get("trade")),
             "change_pct": to_number(row.get("changepercent")),
-            "volume": to_number(row.get("volume")),
+            "volume": (
+                to_number(row.get("volume")) / 100
+                if to_number(row.get("volume")) is not None
+                else None
+            ),
             "turnover": to_number(row.get("amount")),
             "turnover_rate": to_number(row.get("turnoverratio")),
             "high": to_number(row.get("high")),

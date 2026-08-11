@@ -1418,6 +1418,99 @@ def test_market_quote_pagination() -> None:
         market_app.read_public_json = original_json
 
 
+def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> None:
+    original_json = market_app.read_public_json
+    try:
+        requests: list[tuple[str, int]] = []
+
+        def paged_market_rows(url: str, *_: object) -> dict:
+            match = market_app.re.search(r"(?:\?|&)pn=(\d+)", url)
+            assert match is not None
+            page = int(match.group(1))
+            host = url.split("/", 3)[2]
+            requests.append((host, page))
+            if host == "push2.eastmoney.com" and page == 2:
+                raise market_app.HTTPException(status_code=502, detail="temporary page failure")
+            start = (page - 1) * 100
+            end = min(start + 100, 201)
+            return {
+                "data": {
+                    "total": 201,
+                    "diff": [
+                        {
+                            "f12": str(600000 + number),
+                            "f14": f"Test {number}",
+                            "f2": 10.0,
+                            "f3": 1.0,
+                            "f5": 100,
+                            "f6": 100000,
+                        }
+                        for number in range(start, end)
+                    ],
+                }
+            }
+
+        market_app.read_public_json = paged_market_rows
+        rows = market_app.get_eastmoney_market_quotes()
+        assert len(rows) == 201
+        assert ("push2delay.eastmoney.com", 2) in requests
+        assert ("push2delay.eastmoney.com", 3) not in requests
+        assert requests.count(("push2.eastmoney.com", 1)) == 1
+    finally:
+        market_app.read_public_json = original_json
+
+
+def test_all_market_snapshot_is_shared_and_has_honest_stale_fallback() -> None:
+    original_eastmoney_rows = market_app.get_eastmoney_market_quotes
+    original_sina_rows = market_app.get_sina_market_quotes
+    key = market_app.cache_key("all_market_quote_snapshot", {})
+    with market_app.TOOL_CACHE_LOCK:
+        market_app.TOOL_CACHE.pop(key, None)
+        market_app.TOOL_CACHE_INFLIGHT.pop(key, None)
+    calls = []
+    try:
+        market_app.get_sina_market_quotes = lambda: {
+            "rows": calls.append("live") or [
+                {
+                    "symbol": "600001",
+                    "name": "Eligible Stock",
+                    "price": 11.0,
+                    "change_pct": 2.0,
+                    "volume": 100,
+                    "turnover": 200000,
+                    "turnover_rate": 3.0,
+                    "total_market_value": 10000000000.0,
+                    "market_time": "2026-07-10T10:00:00+08:00",
+                }
+            ],
+            "coverage_status": "complete",
+            "source_errors": [],
+        }
+        first = market_app.get_cached_all_market_quote_snapshot()
+        second = market_app.get_cached_all_market_quote_snapshot()
+        assert first["row_count"] == second["row_count"] == 1
+        assert calls == ["live"]
+
+        with market_app.TOOL_CACHE_LOCK:
+            market_app.TOOL_CACHE[key]["created_at"] -= market_app.timedelta(seconds=16)
+        market_app.get_sina_market_quotes = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="live source failed")
+        )
+        market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
+            market_app.HTTPException(status_code=502, detail="backup source failed")
+        )
+        stale = market_app.get_cached_all_market_quote_snapshot()
+        assert stale["served_from_stale_cache"] is True
+        assert stale["stale_cache_age_seconds"] >= 16
+        assert any("using recent component cache" in error for error in stale["source_errors"])
+    finally:
+        market_app.get_eastmoney_market_quotes = original_eastmoney_rows
+        market_app.get_sina_market_quotes = original_sina_rows
+        with market_app.TOOL_CACHE_LOCK:
+            market_app.TOOL_CACHE.pop(key, None)
+            market_app.TOOL_CACHE_INFLIGHT.pop(key, None)
+
+
 def test_sina_market_pagination_and_breadth_fallback() -> None:
     original_json = market_app.read_public_json
     original_text = market_app.read_market_text
@@ -1970,7 +2063,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_filter_schema_v8"
+    assert health["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v9"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -3141,7 +3234,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_schema_v8"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v9"
 
         for legacy_path in (
             "/search?keyword=600000",
