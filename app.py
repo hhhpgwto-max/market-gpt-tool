@@ -28,7 +28,7 @@ from pydantic import Field
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v9"
+ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v10"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -96,7 +96,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.7",
+    version="0.14.8",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
