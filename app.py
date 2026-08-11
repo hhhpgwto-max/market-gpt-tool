@@ -1,6 +1,7 @@
 import os
 import base64
 import json
+import logging
 import re
 import ssl
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -19,6 +20,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree  # nosec B405
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
@@ -27,8 +29,11 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v10"
+ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v11"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -96,7 +101,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.8",
+    version="0.14.9",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -361,6 +366,14 @@ SOURCE_HEALTH_LOCK = Lock()
 PREFERRED_ROUTE_HEALTH: dict[str, dict[str, Any]] = {}
 PREFERRED_ROUTE_HEALTH_LOCK = Lock()
 PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+PUBLIC_MARKET_HTTP_CLIENT = httpx.Client(
+    headers={
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+    },
+    timeout=3,
+    limits=httpx.Limits(max_connections=24, max_keepalive_connections=24),
+)
 SINA_AUX_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 TENCENT_KLINE_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 # Composite tools can fan out into several slow public routes. Keep those pools
@@ -1178,6 +1191,24 @@ def read_public_json(
             errors.append(str(exc))
             record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
     raise HTTPException(status_code=502, detail=f"Failed to fetch public market data: {'; '.join(errors)}")
+
+
+def read_public_json_pooled(url: str, referer: str) -> Any:
+    """Read high-fan-out market pages through a shared keep-alive connection pool."""
+    started_at = perf_counter()
+    source = source_name_from_url(url)
+    try:
+        response = PUBLIC_MARKET_HTTP_CLIENT.get(url, headers={"Referer": referer})
+        response.raise_for_status()
+        payload = response.json()
+        record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+        return payload
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch public market data: {exc}",
+        ) from exc
 
 
 def read_public_json_post(
@@ -5541,11 +5572,9 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
         )
         return (
             page,
-            read_public_json(
+            read_public_json_pooled(
                 f"https://{host}/api/qt/clist/get?{query}",
                 "https://quote.eastmoney.com/",
-                3,
-                1,
             ),
         )
 
@@ -5710,12 +5739,10 @@ def get_sina_market_quotes() -> dict[str, Any]:
                 "_s_r_a": "page",
             }
         )
-        payload = read_public_json(
+        payload = read_public_json_pooled(
             "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
             f"Market_Center.getHQNodeData?{query}",
             "https://vip.stock.finance.sina.com.cn/",
-            timeout=3,
-            attempts=1,
         )
         if not isinstance(payload, list):
             raise HTTPException(

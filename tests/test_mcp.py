@@ -1185,7 +1185,7 @@ def test_limit_activity_and_index_identity() -> None:
 def test_batch_quotes_intraday_indicators_and_filtering() -> None:
     original_json = market_app.read_public_json
     original_batch_rows = market_app.get_eastmoney_batch_quote_rows
-    original_market_rows = market_app.get_eastmoney_market_quotes
+    original_market_snapshot = market_app.get_cached_all_market_quote_snapshot
     original_quote_data = market_app.get_quote_data
     try:
         market_app.read_public_json = lambda *_: {
@@ -1269,30 +1269,36 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         assert indicators["return_30m"] == 300.0
         assert indicators["at_intraday_high"] is True
 
-        market_app.get_eastmoney_market_quotes = lambda: [
-            {
-                "symbol": "600001",
-                "name": "Eligible Stock",
-                "price": 11.0,
-                "change_pct": 3.0,
-                "volume": 1000.0,
-                "turnover": 1000000.0,
-                "turnover_rate": 3.0,
-                "total_market_value": 10000000000.0,
-                "market_time": "2026-07-10T10:00:00+08:00",
-            },
-            {
-                "symbol": "600002",
-                "name": "*ST Excluded",
-                "price": 12.0,
-                "change_pct": 3.0,
-                "volume": 1000.0,
-                "turnover": 1000000.0,
-                "turnover_rate": 3.0,
-                "total_market_value": 10000000000.0,
-                "market_time": "2026-07-10T10:00:00+08:00",
-            },
-        ]
+        market_app.get_cached_all_market_quote_snapshot = lambda: {
+            "rows": [
+                {
+                    "symbol": "600001",
+                    "name": "Eligible Stock",
+                    "price": 11.0,
+                    "change_pct": 3.0,
+                    "volume": 1000.0,
+                    "turnover": 1000000.0,
+                    "turnover_rate": 3.0,
+                    "total_market_value": 10000000000.0,
+                    "market_time": "2026-07-10T10:00:00+08:00",
+                },
+                {
+                    "symbol": "600002",
+                    "name": "*ST Excluded",
+                    "price": 12.0,
+                    "change_pct": 3.0,
+                    "volume": 1000.0,
+                    "turnover": 1000000.0,
+                    "turnover_rate": 3.0,
+                    "total_market_value": 10000000000.0,
+                    "market_time": "2026-07-10T10:00:00+08:00",
+                },
+            ],
+            "source": ["test_all_market_snapshot"],
+            "source_errors": [],
+            "queried_at": "2026-07-10T10:00:00+08:00",
+            "data_status": "full_data",
+        }
         filtered = market_app.filter_a_share_securities_data(
             security_type="stock",
             exclude_st=True,
@@ -1315,7 +1321,7 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
     finally:
         market_app.read_public_json = original_json
         market_app.get_eastmoney_batch_quote_rows = original_batch_rows
-        market_app.get_eastmoney_market_quotes = original_market_rows
+        market_app.get_cached_all_market_quote_snapshot = original_market_snapshot
         market_app.get_quote_data = original_quote_data
 
 
@@ -1382,7 +1388,7 @@ def test_intraday_session_filter_and_market_time_cap() -> None:
 
 
 def test_market_quote_pagination() -> None:
-    original_json = market_app.read_public_json
+    original_json = market_app.read_public_json_pooled
     try:
         requested_pages: list[int] = []
 
@@ -1410,16 +1416,16 @@ def test_market_quote_pagination() -> None:
                 }
             }
 
-        market_app.read_public_json = paged_market_rows
+        market_app.read_public_json_pooled = paged_market_rows
         rows = market_app.get_eastmoney_market_quotes()
         assert len(rows) == 201
         assert set(requested_pages) == {1, 2, 3}
     finally:
-        market_app.read_public_json = original_json
+        market_app.read_public_json_pooled = original_json
 
 
 def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> None:
-    original_json = market_app.read_public_json
+    original_json = market_app.read_public_json_pooled
     try:
         requests: list[tuple[str, int]] = []
 
@@ -1450,14 +1456,14 @@ def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> No
                 }
             }
 
-        market_app.read_public_json = paged_market_rows
+        market_app.read_public_json_pooled = paged_market_rows
         rows = market_app.get_eastmoney_market_quotes()
         assert len(rows) == 201
         assert ("push2delay.eastmoney.com", 2) in requests
         assert ("push2delay.eastmoney.com", 3) not in requests
         assert requests.count(("push2.eastmoney.com", 1)) == 1
     finally:
-        market_app.read_public_json = original_json
+        market_app.read_public_json_pooled = original_json
 
 
 def test_all_market_snapshot_is_shared_and_has_honest_stale_fallback() -> None:
@@ -1512,7 +1518,7 @@ def test_all_market_snapshot_is_shared_and_has_honest_stale_fallback() -> None:
 
 
 def test_sina_market_pagination_and_breadth_fallback() -> None:
-    original_json = market_app.read_public_json
+    original_json = market_app.read_public_json_pooled
     original_text = market_app.read_market_text
     original_eastmoney_rows = market_app.get_eastmoney_market_quotes
     original_sina_rows = market_app.get_sina_market_quotes
@@ -1543,7 +1549,7 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
                 for number in range(start, end)
             ]
 
-        market_app.read_public_json = sina_page
+        market_app.read_public_json_pooled = sina_page
         sina = market_app.get_sina_market_quotes()
         assert sina["returned_count"] == 201
         assert sina["coverage_status"] == "complete"
@@ -1552,7 +1558,7 @@ def test_sina_market_pagination_and_breadth_fallback() -> None:
             market_app.HTTPException(status_code=502, detail="blocked")
         )
     finally:
-        market_app.read_public_json = original_json
+        market_app.read_public_json_pooled = original_json
         market_app.read_market_text = original_text
         market_app.get_eastmoney_market_quotes = original_eastmoney_rows
         market_app.get_sina_market_quotes = original_sina_rows
@@ -2063,7 +2069,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v10"
+    assert health["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v11"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -3234,7 +3240,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v10"
+        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v11"
 
         for legacy_path in (
             "/search?keyword=600000",
