@@ -1059,6 +1059,17 @@ def test_industry_board_deduplication() -> None:
         "城商行Ⅲ",
         "农商行Ⅲ",
     ]
+    selected, coverage = market_app.select_industry_level_boards(
+        [
+            {"name": "中药Ⅱ", "level": 2, "change_pct": 1.0},
+            {"name": "通信设备", "level": None, "change_pct": 2.0},
+            {"name": "煤炭Ⅰ", "level": 1, "change_pct": 3.0},
+        ],
+        "2",
+    )
+    assert [item["name"] for item in selected] == ["通信设备", "中药Ⅱ"]
+    assert selected[0]["level_match_status"] == "provider_level_unlabeled_included_for_coverage"
+    assert coverage == "partial_level_metadata_unlabeled_boards_included"
 
 
 def test_market_structure_calculations() -> None:
@@ -1085,6 +1096,23 @@ def test_market_structure_calculations() -> None:
     assert turnover["estimated_full_day"] == 1600.0
     assert turnover["previous_trade_day_same_time"] is None
     assert turnover["top_turnover_securities"][0]["symbol"] == "430001"
+
+    current_structure = market_app.build_current_market_structure(
+        [{"change_pct": 1.0}, {"change_pct": -0.5}, {"change_pct": 0.2}],
+        [{"change_pct": 2.0}, {"change_pct": -2.0}],
+        [{"change_pct": 4.0}, {"change_pct": 1.0}, {"change_pct": -3.0}],
+        breadth,
+        {"observed_count": 92, "positive_count": 41, "negative_count": 50},
+    )
+    assert current_structure["current_snapshot_only"] is True
+    assert current_structure["breadth_participation"]["rise_count"] == 4
+    assert current_structure["primary_index_participation"]["positive_count"] == 2
+    assert (
+        current_structure["stabilization_confirmation_status"]
+        == "current_snapshot_cannot_confirm_multi_session_stabilization"
+    )
+    assert current_structure["required_companion_evidence"]["lookbacks"] == [1, 3, 5, 10, 20]
+    assert current_structure["industry_board_universe_participation"]["observed_count"] == 92
 
     try:
         market_app.get_sector_rankings_data("industry", "2", "momentum_15m", 20)
@@ -1422,7 +1450,6 @@ def test_market_quote_pagination() -> None:
         assert set(requested_pages) == {1, 2, 3}
     finally:
         market_app.read_public_json_pooled = original_json
-
 
 def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> None:
     original_json = market_app.read_public_json_pooled
@@ -2069,7 +2096,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v11"
+    assert health["routing_revision"] == "market_path_structure_v12"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2238,6 +2265,17 @@ def test_historical_context_and_security_status_facts() -> None:
         historical = market_app.get_historical_context_data("600519")
         assert historical["adjustment"] == "forward_adjusted"
         assert list(historical["windows"]) == ["20", "60", "120", "250"]
+        assert list(historical["path_facts"]["windows"]) == [
+            "1",
+            "3",
+            "5",
+            "10",
+            "20",
+        ]
+        assert historical["path_facts"]["path_shape"] == (
+            "positive_across_available_windows"
+        )
+        assert "no continuation" in historical["path_facts"]["boundary"]
         assert all(
             window["window_complete"] for window in historical["windows"].values()
         )
@@ -2391,6 +2429,34 @@ def test_candidate_research_screen_evidence_gates() -> None:
         assert history_calls == []
         assert filter_calls == []
         assert blocked["preselected_count"] == 0
+
+        # A failed caller-configurable breadth gate is not proof that no relative-
+        # strength research route exists. The same public tool can explicitly run
+        # an exploratory weak-market pass by setting only that threshold to zero;
+        # results remain research candidates, never orders.
+        market_app.get_cached_historical_context_data = lambda symbol: {
+            "latest_trade_date": "2026-07-10",
+            "source_sessions": 260,
+            "windows": {
+                str(window): {
+                    "window_complete": True,
+                    "return_pct": 3.0,
+                    "annualized_volatility_pct": 20.0,
+                    "maximum_drawdown_pct": -5.0,
+                    "volume": {"latest_vs_prior_average_ratio": 1.1},
+                }
+                for window in (20, 60, 120, 250)
+            },
+            "source": "test_history",
+        }
+        weak_market_research = market_app.screen_a_share_research_candidates_data(
+            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
+            5, 8, 0.0, [20, 60], 0.0, "raw",
+        )
+        assert weak_market_research["market_gate"]["passed"] is True
+        assert weak_market_research["no_candidate"] is False
+        assert weak_market_research["research_candidates"][0]["symbol"] == "600002"
+        filter_calls.clear()
 
         market_app.get_market_overview_data = lambda _limit: {
             "market_activity_facts": {
@@ -2585,6 +2651,49 @@ def test_rotation_overnight_and_event_helpers() -> None:
         [1, 3, 5],
     )
     assert returns == {"1": 10.0, "3": 21.0, "5": None}
+
+    confirmed_path = market_app.sector_path_facts(
+        1.5,
+        {"1": 1.0, "3": 2.0, "5": 4.0, "10": 6.0, "20": 8.0},
+        {"1": 0.5, "3": 1.0, "5": 2.0, "10": 3.0, "20": 4.0},
+        [1, 3, 5, 10, 20],
+    )
+    assert confirmed_path["multi_session_confirmation"] is True
+    assert (
+        confirmed_path["current_vs_completed_history"]
+        == "current_strength_with_multi_session_confirmation"
+    )
+    repair_path = market_app.sector_path_facts(
+        3.0,
+        {"1": 2.0, "3": 1.0, "5": -2.0, "10": -5.0, "20": -12.0},
+        {"1": 1.0, "3": 0.5, "5": -1.0, "10": -3.0, "20": -8.0},
+        [1, 3, 5, 10, 20],
+    )
+    assert (
+        repair_path["current_vs_completed_history"]
+        == "current_repair_after_negative_20_session_path"
+    )
+    structure = market_app.summarize_sector_paths(
+        [
+            {
+                "name": "Confirmed",
+                "returns_pct": {"1": 1.0, "3": 2.0, "5": 4.0},
+                "relative_to_csi300_pct": {"1": 0.5, "3": 1.0, "5": 2.0},
+                "path_facts": confirmed_path,
+            },
+            {
+                "name": "Repair",
+                "returns_pct": {"1": 2.0, "3": 1.0, "5": -2.0},
+                "relative_to_csi300_pct": {"1": 1.0, "3": 0.5, "5": -1.0},
+                "path_facts": repair_path,
+            },
+        ],
+        [1, 3, 5],
+        "test_universe",
+    )
+    assert structure["observed_count"] == 2
+    assert structure["window_distribution"]["5"]["positive_share_pct"] == 50.0
+    assert structure["window_distribution"]["5"]["dispersion_range_pct"] == 6.0
 
     parsed = market_app.parse_sina_overnight_record(
         "hf_NQ",
@@ -3240,7 +3349,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "capital_timeline_sector_history_filter_snapshot_v11"
+        assert health.json()["routing_revision"] == "market_path_structure_v12"
 
         for legacy_path in (
             "/search?keyword=600000",

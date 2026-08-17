@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "capital_timeline_sector_history_filter_snapshot_v11"
+ROUTING_REVISION = "market_path_structure_v12"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -101,7 +101,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.14.9",
+    version="0.15.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -4272,6 +4272,7 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
 
 
 HISTORICAL_CONTEXT_WINDOWS = (20, 60, 120, 250)
+HISTORICAL_PATH_WINDOWS = (1, 3, 5, 10, 20)
 CORPORATE_ACTION_EVENT_TAGS = {
     "dividend",
     "buyback",
@@ -4385,6 +4386,52 @@ def historical_window_metrics(
     return metrics
 
 
+def historical_path_facts(
+    items: list[dict[str, Any]],
+    windows: tuple[int, ...] = HISTORICAL_PATH_WINDOWS,
+) -> dict[str, Any]:
+    """Describe completed-session price paths without predicting continuation."""
+    metrics = {
+        str(window): historical_window_metrics(items, window)
+        for window in windows
+    }
+    available_returns = {
+        window: to_number(metrics[str(window)].get("return_pct"))
+        for window in windows
+        if metrics[str(window)].get("window_complete")
+    }
+    positive_windows = [
+        window
+        for window, value in available_returns.items()
+        if value is not None and value > 0
+    ]
+    negative_windows = [
+        window
+        for window, value in available_returns.items()
+        if value is not None and value < 0
+    ]
+    if not available_returns:
+        shape = "insufficient_completed_sessions"
+    elif positive_windows and not negative_windows:
+        shape = "positive_across_available_windows"
+    elif negative_windows and not positive_windows:
+        shape = "negative_across_available_windows"
+    elif 1 in positive_windows and 20 in negative_windows:
+        shape = "short_repair_with_negative_20_session_path"
+    elif 1 in negative_windows and 20 in positive_windows:
+        shape = "current_pullback_with_positive_20_session_path"
+    else:
+        shape = "mixed_path"
+    return {
+        "windows": metrics,
+        "available_windows": list(available_returns),
+        "positive_windows": positive_windows,
+        "negative_windows": negative_windows,
+        "path_shape": shape,
+        "boundary": "Completed-session path facts only; no continuation, reversal, holding-period, or trade prediction is implied.",
+    }
+
+
 def completed_daily_history(
     items: list[dict[str, Any]],
     now: datetime | None = None,
@@ -4449,6 +4496,7 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
         str(window): historical_window_metrics(completed_items, window)
         for window in HISTORICAL_CONTEXT_WINDOWS
     }
+    path_facts = historical_path_facts(completed_items)
     return {
         "symbol": symbol,
         "security_type": payload.get("security_type"),
@@ -4467,6 +4515,7 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
         "source_sessions": len(items),
         "complete_sessions_used": len(completed_items),
         "windows": windows,
+        "path_facts": path_facts,
         "source": payload.get("source"),
         "source_errors": payload.get("source_errors", []),
         "queried_at": now_iso(),
@@ -4945,6 +4994,9 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
     market_cross_checks = (
         (decision_inputs.get("market_overview") or {}).get("market_cross_checks")
     )
+    current_market_structure = (
+        (decision_inputs.get("market_overview") or {}).get("current_market_structure")
+    )
     return {
         "snapshot_id": snapshot_id,
         "symbol": symbol,
@@ -4964,6 +5016,7 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
             else None
         ),
         "market_cross_checks": market_cross_checks,
+        "current_market_structure": current_market_structure,
         "decision_inputs": decision_inputs,
         "excluded_components": {},
         "source": sorted(
@@ -5512,6 +5565,34 @@ def deduplicate_industry_boards(
         key=lambda item: item.get("change_pct") if item.get("change_pct") is not None else float("-inf"),
         reverse=True,
     )[:limit]
+
+
+def select_industry_level_boards(
+    boards: list[dict[str, Any]], requested_level: str
+) -> tuple[list[dict[str, Any]], str]:
+    if requested_level == "all":
+        return boards, "all_provider_industry_levels"
+    expected = int(requested_level)
+    exact = [board for board in boards if board.get("level") == expected]
+    unlabeled = [board for board in boards if board.get("level") is None]
+    if unlabeled:
+        selected = []
+        for board in [*exact, *unlabeled]:
+            item = deepcopy(board)
+            item["level_match_status"] = (
+                "requested_level_exact"
+                if board.get("level") == expected
+                else "provider_level_unlabeled_included_for_coverage"
+            )
+            selected.append(item)
+        selected.sort(
+            key=lambda item: item.get("change_pct")
+            if item.get("change_pct") is not None
+            else float("-inf"),
+            reverse=True,
+        )
+        return selected, "partial_level_metadata_unlabeled_boards_included"
+    return exact, "requested_level_exact"
 
 
 def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
@@ -6414,10 +6495,12 @@ def get_sector_rankings_data(
 
     board_component = get_cached_sector_board_component(normalized_type)
     boards = board_component.get("items") or []
+    level_coverage_status = None
     if normalized_type == "industry":
         boards = deduplicate_industry_boards(boards, len(boards))
-        if normalized_level != "all":
-            boards = [board for board in boards if board.get("level") == int(normalized_level)]
+        boards, level_coverage_status = select_industry_level_boards(
+            boards, normalized_level
+        )
     boards.sort(
         key=lambda item: item.get(sort_by) if item.get(sort_by) is not None else float("-inf"),
         reverse=True,
@@ -6426,13 +6509,14 @@ def get_sector_rankings_data(
     return {
         "sector_type": normalized_type,
         "level": normalized_level if normalized_type == "industry" else None,
+        "level_coverage_status": level_coverage_status,
         "sort_by": sort_by,
         "count": len(items),
         "items": items,
         "source": ["eastmoney_sector_snapshot"],
         "source_errors": normalize_source_errors(board_component.get("source_errors")),
         "queried_at": now_iso(),
-        "note": "Mechanical ranking of public sector quotes only; no theme, trading, or investment judgement is generated.",
+        "note": "Mechanical ranking of public sector quotes only. When the provider omits industry level metadata, unlabeled boards remain visible with level_match_status instead of being silently dropped; no theme, trading, or investment judgement is generated.",
     }
 
 
@@ -6800,6 +6884,133 @@ def kline_lookback_returns(items: list[dict[str, Any]], lookbacks: list[int]) ->
     }
 
 
+def median_number(values: list[float]) -> float | None:
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(ordered[middle], 4)
+    return round((ordered[middle - 1] + ordered[middle]) / 2, 4)
+
+
+def summarize_change_participation(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    changes = [
+        value
+        for row in rows
+        if (value := to_number(row.get("change_pct"))) is not None
+    ]
+    return {
+        "observed_count": len(changes),
+        "positive_count": sum(value > 0 for value in changes),
+        "negative_count": sum(value < 0 for value in changes),
+        "flat_count": sum(value == 0 for value in changes),
+        "positive_share_pct": round(sum(value > 0 for value in changes) / len(changes) * 100, 4)
+        if changes
+        else None,
+        "median_change_pct": median_number(changes),
+        "dispersion_range_pct": round(max(changes) - min(changes), 4) if changes else None,
+    }
+
+
+def sector_path_facts(
+    current_change_pct: float | None,
+    returns: dict[str, float | None],
+    relative_returns: dict[str, float | None],
+    lookbacks: list[int],
+) -> dict[str, Any]:
+    available_windows = [
+        str(window) for window in lookbacks if returns.get(str(window)) is not None
+    ]
+    positive_windows = [window for window in available_windows if returns[window] > 0]
+    positive_relative_windows = [
+        window
+        for window in available_windows
+        if relative_returns.get(window) is not None and relative_returns[window] > 0
+    ]
+    multi_session_windows = [window for window in available_windows if int(window) >= 3]
+    positive_multi_session_windows = [
+        window for window in multi_session_windows if returns[window] > 0
+    ]
+    confirmed = (
+        len(multi_session_windows) >= 2
+        and len(positive_multi_session_windows) >= 2
+        and len(positive_relative_windows) >= 2
+    )
+    medium_return = returns.get("20")
+    if current_change_pct is None:
+        current_vs_history = "current_snapshot_unavailable"
+    elif current_change_pct > 0 and confirmed:
+        current_vs_history = "current_strength_with_multi_session_confirmation"
+    elif current_change_pct > 0 and medium_return is not None and medium_return < 0:
+        current_vs_history = "current_repair_after_negative_20_session_path"
+    elif current_change_pct > 0:
+        current_vs_history = "current_strength_without_multi_session_confirmation"
+    elif current_change_pct < 0 and confirmed:
+        current_vs_history = "current_weakness_despite_positive_multi_session_path"
+    else:
+        current_vs_history = "current_and_history_mixed_or_flat"
+    return {
+        "available_windows": available_windows,
+        "positive_windows": positive_windows,
+        "positive_relative_windows": positive_relative_windows,
+        "multi_session_confirmation": confirmed,
+        "current_vs_completed_history": current_vs_history,
+        "interpretation_boundary": (
+            "Mechanical current-versus-completed-session comparison only; it does not predict continuation."
+        ),
+    }
+
+
+def summarize_sector_paths(
+    items: list[dict[str, Any]], lookbacks: list[int], coverage_scope: str
+) -> dict[str, Any]:
+    window_distribution: dict[str, Any] = {}
+    for window in lookbacks:
+        key = str(window)
+        values = [
+            value
+            for item in items
+            if (value := to_number((item.get("returns_pct") or {}).get(key))) is not None
+        ]
+        relative_values = [
+            value
+            for item in items
+            if (value := to_number((item.get("relative_to_csi300_pct") or {}).get(key)))
+            is not None
+        ]
+        window_distribution[key] = {
+            "available_count": len(values),
+            "positive_count": sum(value > 0 for value in values),
+            "negative_count": sum(value < 0 for value in values),
+            "positive_share_pct": round(sum(value > 0 for value in values) / len(values) * 100, 4)
+            if values
+            else None,
+            "median_return_pct": median_number(values),
+            "median_relative_to_csi300_pct": median_number(relative_values),
+            "dispersion_range_pct": round(max(values) - min(values), 4) if values else None,
+        }
+    path_counts: dict[str, int] = {}
+    for item in items:
+        path = str((item.get("path_facts") or {}).get("current_vs_completed_history") or "unavailable")
+        path_counts[path] = path_counts.get(path, 0) + 1
+    confirmed = [
+        item for item in items if (item.get("path_facts") or {}).get("multi_session_confirmation")
+    ]
+    return {
+        "coverage_scope": coverage_scope,
+        "observed_count": len(items),
+        "window_distribution": window_distribution,
+        "path_counts": path_counts,
+        "multi_session_confirmed_count": len(confirmed),
+        "multi_session_confirmed_names": [item.get("name") for item in confirmed[:10]],
+        "boundary": (
+            "These are cross-sectional completed-session and current-snapshot facts. "
+            "They do not assign a market regime or imply that a path will continue."
+        ),
+    }
+
+
 def get_sector_rotation_data(
     sector_type: str,
     level: str,
@@ -6818,10 +7029,12 @@ def get_sector_rotation_data(
 
     board_component = get_cached_sector_board_component(normalized_type)
     boards = board_component.get("items") or []
+    level_coverage_status = None
     if normalized_type == "industry":
         boards = deduplicate_industry_boards(boards, len(boards))
-        if normalized_level != "all":
-            boards = [board for board in boards if board.get("level") == int(normalized_level)]
+        boards, level_coverage_status = select_industry_level_boards(
+            boards, normalized_level
+        )
     candidate_count = min(max(limit + 3, 8), 12)
     by_change = sorted(
         boards,
@@ -6921,6 +7134,70 @@ def get_sector_rotation_data(
     benchmark_returns = kline_lookback_returns(
         benchmark_history.get("items", []), normalized_lookbacks
     )
+    official_universe_histories: dict[str, dict[str, Any]] = {}
+    if normalized_type == "industry" and normalized_level == "2":
+        try:
+            official_universe_component = get_swsresearch_recent_level2_history(history_limit)
+            official_universe_histories = official_universe_component.get("histories") or {}
+        except HTTPException as exc:
+            source_errors.append(f"swsresearch_official_universe: {exc.detail}")
+
+    # The old route only studied boards already leading today's change/turnover lists.
+    # Add a bounded set of multi-session leaders from the official completed-session
+    # universe so a single hot day cannot define the entire research sample.
+    historical_additions = []
+    if official_universe_histories:
+        for board in boards:
+            normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board.get("name") or "")).strip()
+            history = official_universe_histories.get(normalized_name)
+            if not history:
+                continue
+            rows = history.get("items") or []
+            returns = kline_lookback_returns(rows, normalized_lookbacks)
+            relative_returns = {
+                str(window): (
+                    round(returns[str(window)] - benchmark_returns[str(window)], 4)
+                    if returns.get(str(window)) is not None
+                    and benchmark_returns.get(str(window)) is not None
+                    else None
+                )
+                for window in normalized_lookbacks
+            }
+            relative_values = [
+                value for value in relative_returns.values() if value is not None
+            ]
+            historical_additions.append(
+                (
+                    sum(value > 0 for value in relative_values),
+                    median_number(relative_values) or float("-inf"),
+                    to_number(board.get("turnover")) or 0,
+                    board,
+                    history,
+                )
+            )
+        historical_additions.sort(key=lambda entry: entry[:3], reverse=True)
+        addition_limit = max(4, candidate_count // 2)
+        for _, _, _, board, history in historical_additions:
+            board_symbol = str(board.get("symbol") or "")
+            if not board_symbol or board_symbol in seen_board_symbols:
+                continue
+            seen_board_symbols.add(board_symbol)
+            candidates.append(board)
+            history_results[board_symbol] = {
+                "name": re.sub(r"[ⅠⅡⅢ]$", "", str(board.get("name") or "")).strip(),
+                "matched_provider_name": history.get("provider_name"),
+                "provider_identifier": history.get("provider_identifier"),
+                "items": (history.get("items") or [])[-history_limit:],
+                "source": "swsresearch_official_index_history",
+                "source_errors": [],
+                "transport_security_note": (
+                    "Fixed official public host; certificate-chain verification unavailable at source; "
+                    "response schema, code, and exact industry name are validated."
+                ),
+            }
+            if len(candidates) >= candidate_count + addition_limit:
+                break
+
     items = []
     for board in candidates:
         history = history_results.get(str(board.get("symbol")), {"items": []})
@@ -6938,6 +7215,12 @@ def get_sector_rotation_data(
         recent_changes = [value for value in recent_changes if value is not None]
         recent_closes = [to_number(row.get("close")) for row in rows[-20:]]
         recent_closes = [value for value in recent_closes if value is not None]
+        path_facts = sector_path_facts(
+            to_number(board.get("change_pct")),
+            returns,
+            relative_returns,
+            normalized_lookbacks,
+        )
         item = deepcopy(board)
         item.update(
             {
@@ -6972,6 +7255,7 @@ def get_sector_rotation_data(
                 ),
                 "leader_continuity": None,
                 "leader_continuity_status": "unavailable_without_reliable_daily_constituent-leader_history",
+                "path_facts": path_facts,
             }
         )
         items.append(item)
@@ -6989,9 +7273,54 @@ def get_sector_rotation_data(
     )
     items = items[:limit]
     histories_available = sum(item["history_status"] == "available" for item in items)
+    returned_sample_structure = summarize_sector_paths(
+        items, normalized_lookbacks, "returned_rotation_sample"
+    )
+    industry_universe_items = []
+    if official_universe_histories:
+        current_board_by_name = {
+            re.sub(r"[ⅠⅡⅢ]$", "", str(board.get("name") or "")).strip(): board
+            for board in boards
+        }
+        for normalized_name, history in official_universe_histories.items():
+            rows = history.get("items") or []
+            returns = kline_lookback_returns(rows, normalized_lookbacks)
+            relative_returns = {
+                str(window): (
+                    round(returns[str(window)] - benchmark_returns[str(window)], 4)
+                    if returns.get(str(window)) is not None
+                    and benchmark_returns.get(str(window)) is not None
+                    else None
+                )
+                for window in normalized_lookbacks
+            }
+            current_board = current_board_by_name.get(normalized_name) or {}
+            industry_universe_items.append(
+                {
+                    "name": normalized_name,
+                    "returns_pct": returns,
+                    "relative_to_csi300_pct": relative_returns,
+                    "path_facts": sector_path_facts(
+                        to_number(current_board.get("change_pct")),
+                        returns,
+                        relative_returns,
+                        normalized_lookbacks,
+                    ),
+                }
+            )
+    industry_universe_structure = (
+        summarize_sector_paths(
+            industry_universe_items,
+            normalized_lookbacks,
+            "official_sw_level2_completed_session_universe_with_current_snapshot_when_matched",
+        )
+        if industry_universe_items
+        else None
+    )
     return {
         "sector_type": normalized_type,
         "level": normalized_level if normalized_type == "industry" else None,
+        "level_coverage_status": level_coverage_status,
         "lookbacks": normalized_lookbacks,
         "benchmark": {"identifier": "index:000300", "name": "CSI 300", "returns_pct": benchmark_returns},
         "a_share_market_turnover": total_market_turnover,
@@ -7005,6 +7334,16 @@ def get_sector_rotation_data(
         "official_sw_history_count": sum(
             item.get("history_source") == "swsresearch_official_index_history" for item in items
         ),
+        "rotation_structure": {
+            "returned_sample": returned_sample_structure,
+            "official_industry_universe": industry_universe_structure,
+            "selection_sources": [
+                "current_change_leaders",
+                "current_turnover_leaders",
+                *(["official_multi_session_relative_leaders"] if official_universe_histories else []),
+            ],
+            "current_session_and_completed_history_are_separate": True,
+        },
         "items": items,
         "source": sorted(
             {
@@ -7022,7 +7361,7 @@ def get_sector_rotation_data(
             else "partial_data"
         ),
         "queried_at": now_iso(),
-        "note": "Rotation fields are mechanical multi-session returns, breadth, turnover, and persistence facts. Missing board history or leader continuity remains explicit and is not inferred.",
+        "note": "Rotation fields separate the current snapshot from completed-session history and include a bounded historical-leader route so today's hot boards do not define the whole sample. They remain mechanical facts; missing leader continuity is explicit and no continuation or trading label is inferred.",
     }
 
 
@@ -8714,17 +9053,34 @@ def get_fastest_index_component() -> dict[str, Any]:
 def get_overview_board_component(limit: int) -> dict[str, Any]:
     errors = []
     for source, getter in (
-        ("eastmoney_industry", get_eastmoney_industry_boards),
-        ("efinance_calculated", get_calculated_industry_boards),
+        (
+            "eastmoney_industry",
+            lambda _limit: get_eastmoney_industry_boards(500),
+        ),
+        (
+            "efinance_calculated",
+            lambda _limit: get_calculated_industry_boards(500),
+        ),
     ):
         try:
-            boards = getter(limit)
-            if not boards:
+            board_universe = getter(limit)
+            if not board_universe:
                 raise HTTPException(
                     status_code=502,
                     detail=f"{source} returned no industry-board rows.",
                 )
-            return {"boards": boards, "source": source, "source_errors": errors}
+            return {
+                "boards": board_universe[:limit],
+                "board_universe_current_summary": summarize_change_participation(
+                    board_universe
+                ),
+                "board_universe_count": len(board_universe),
+                "board_universe_scope": (
+                    "provider_industry_board_universe_with_disclosed_or_unlabeled_levels"
+                ),
+                "source": source,
+                "source_errors": errors,
+            }
         except (HTTPException, OSError, ValueError, TypeError) as exc:
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             errors.append(f"{source}: {detail}")
@@ -8975,6 +9331,63 @@ def build_market_cross_checks(
     }
 
 
+def build_current_market_structure(
+    indices: list[dict[str, Any]],
+    style_indices: list[dict[str, Any]],
+    industry_boards: list[dict[str, Any]],
+    breadth: dict[str, Any] | None,
+    industry_board_universe_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    all_market = (breadth or {}).get("all_market") or {}
+    rise_count = _to_int(all_market.get("rise_count"))
+    fall_count = _to_int(all_market.get("fall_count"))
+    flat_count = _to_int(all_market.get("flat_count"))
+    observed_total = (
+        rise_count + fall_count + (flat_count or 0)
+        if rise_count is not None and fall_count is not None
+        else None
+    )
+
+    breadth_participation = {
+        "observed_count": observed_total,
+        "rise_count": rise_count,
+        "fall_count": fall_count,
+        "flat_count": flat_count,
+        "rise_share_pct": round(rise_count / observed_total * 100, 4)
+        if rise_count is not None and observed_total
+        else None,
+        "fall_share_pct": round(fall_count / observed_total * 100, 4)
+        if fall_count is not None and observed_total
+        else None,
+    }
+    return {
+        "current_snapshot_only": True,
+        "breadth_participation": breadth_participation,
+        "primary_index_participation": summarize_change_participation(indices),
+        "style_index_participation": summarize_change_participation(style_indices),
+        "returned_leading_board_sample": {
+            **summarize_change_participation(industry_boards),
+            "selection_bias": "top_current_change_sample_not_sector_universe",
+        },
+        "industry_board_universe_participation": industry_board_universe_summary,
+        "stabilization_confirmation_status": (
+            "current_snapshot_cannot_confirm_multi_session_stabilization"
+        ),
+        "required_companion_evidence": {
+            "tool": "get_a_share_sector_rotation",
+            "lookbacks": [1, 3, 5, 10, 20],
+            "reason": (
+                "Use completed-session cross-sectional persistence and current-versus-history path facts "
+                "before describing stabilization, continuation, repair, decay, or rotation."
+            ),
+        },
+        "boundary": (
+            "Current breadth and index participation describe this snapshot only. "
+            "They cannot by themselves prove that a repair or trend will persist."
+        ),
+    }
+
+
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     started_at = perf_counter()
     response_budget_seconds = 9.0
@@ -9198,6 +9611,13 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         boards,
         breadth,
     )
+    current_market_structure = build_current_market_structure(
+        primary_indices,
+        style_indices,
+        boards,
+        breadth,
+        board_component.get("board_universe_current_summary"),
+    )
 
     return {
         "market_status": market_status_at(),
@@ -9217,6 +9637,8 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "index_source": index_source,
         "industry_boards": boards,
         "industry_board_source": board_source,
+        "industry_board_universe_count": board_component.get("board_universe_count"),
+        "industry_board_universe_scope": board_component.get("board_universe_scope"),
         "industry_board_errors": board_component.get("source_errors", []) if not boards else [],
         "market_breadth": breadth,
         "market_breadth_source": breadth_component.get("source", "unavailable"),
@@ -9235,6 +9657,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         ),
         "market_activity_facts": market_activity_facts,
         "market_cross_checks": market_cross_checks,
+        "current_market_structure": current_market_structure,
         "component_status": component_status,
         "response_budget_ms": int(response_budget_seconds * 1000),
         "source": sources,
@@ -9298,6 +9721,8 @@ def compact_market_overview_for_snapshot(payload: dict[str, Any]) -> dict[str, A
             "turnover",
             "limit_stats",
             "market_activity_facts",
+            "market_cross_checks",
+            "current_market_structure",
             "component_status",
             "data_status",
         )
