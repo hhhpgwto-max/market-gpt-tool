@@ -2760,7 +2760,7 @@ def test_candidate_research_screen_evidence_gates() -> None:
         )
         assert blocked["market_gate"]["passed"] is False
         assert sorted(history_calls) == ["600001", "600002"]
-        assert len(filter_calls) == 3
+        assert len(filter_calls) == 4
         assert blocked["preselected_count"] == 2
         assert blocked["research_candidates"] == []
         assert blocked["data_quality"]["historical_universe_reconstruction"] == (
@@ -2999,6 +2999,23 @@ def test_dynamic_candidate_lanes_and_history_alignment_are_no_lookahead() -> Non
     assert repair_lanes["early_repair"]["observed"] is True
     assert repair_lanes["continuation"]["observed"] is False
 
+    repair_prefilter_hold = market_app.candidate_research_lane_evidence(
+        {
+            "symbol": "600004",
+            "change_pct": 0.1,
+            "price_above_average_pct": -0.2,
+            "preselection_lanes": ["controlled_pullback"],
+        },
+        repair_context,
+        legacy_positive_gate_rejections,
+        True,
+    )
+    assert repair_prefilter_hold["early_repair"]["observed"] is False
+    assert (
+        "not_in_caller_early_repair_filter"
+        in repair_prefilter_hold["early_repair"]["failed_conditions"]
+    )
+
     breadth_quality_hold = market_app.market_breadth_promotion_quality(
         {
             "market_activity_facts": {"rise_count": 100, "fall_count": 500},
@@ -3046,7 +3063,10 @@ def test_dynamic_candidate_lanes_and_history_alignment_are_no_lookahead() -> Non
         "symbol": "600002",
         "change_pct": 1.2,
         "price_above_average_pct": 0.4,
-        "preselection_lanes": ["continuation"],
+        "preselection_lanes": [
+            "continuation",
+            "relative_resilience_in_weak_breadth",
+        ],
     }
     breadth_dependent_lanes = market_app.candidate_research_lane_evidence(
         weak_breadth_candidate,

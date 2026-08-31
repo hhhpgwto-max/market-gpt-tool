@@ -3426,6 +3426,8 @@ def candidate_research_lane_evidence(
         continuation_reasons.append("market_breadth_gate_failed")
 
     pullback_reasons = list(shared_evidence_reasons)
+    if "controlled_pullback" not in candidate.get("preselection_lanes", []):
+        pullback_reasons.append("not_in_caller_controlled_pullback_filter")
     if return_20 is None or return_20 <= 0:
         pullback_reasons.append("positive_20_session_path_not_observed")
     if current_change is None or not (-3.0 <= current_change <= 1.0):
@@ -3436,20 +3438,32 @@ def candidate_research_lane_evidence(
         )
 
     repair_reasons = list(shared_evidence_reasons)
+    if "early_repair" not in candidate.get("preselection_lanes", []):
+        repair_reasons.append("not_in_caller_early_repair_filter")
     if return_20 is None or return_20 >= 0:
         repair_reasons.append("negative_20_session_path_not_observed")
     if not short_returns or max(short_returns) <= 0:
         repair_reasons.append("positive_short_completed_path_not_observed")
     if current_change is None or current_change <= 0:
         repair_reasons.append("positive_current_snapshot_not_observed")
+    elif not (0.2 <= current_change <= 4.0):
+        repair_reasons.append("current_change_outside_early_repair_filter")
+    if not above_average:
+        repair_reasons.append("price_not_above_current_session_average")
 
     resilience_reasons = list(shared_evidence_reasons)
+    if "relative_resilience_in_weak_breadth" not in candidate.get(
+        "preselection_lanes", []
+    ):
+        resilience_reasons.append("not_in_weak_breadth_resilience_filter")
     if not market_breadth_quality_passed:
         resilience_reasons.append("market_breadth_time_quality_hold")
     elif market_gate_passed:
         resilience_reasons.append("broad_market_gate_did_not_fail")
     if current_change is None or current_change <= 0:
         resilience_reasons.append("positive_relative_snapshot_not_observed")
+    elif not (0.2 <= current_change <= 6.0):
+        resilience_reasons.append("current_change_outside_resilience_filter")
     if return_20 is None or return_20 <= 0:
         resilience_reasons.append("positive_20_session_path_not_observed")
     if not above_average:
@@ -3655,6 +3669,11 @@ def screen_a_share_research_candidates_data(
                 "change_pct_band": [0.2, 4.0],
                 "above_average_price": True,
             },
+            "relative_resilience_in_weak_breadth": {
+                "change_pct_band": [0.2, 6.0],
+                "above_average_price": True,
+                "market_breadth_requirement": "observed_rise_to_fall_ratio_below_caller_threshold_with_current_aligned_breadth",
+            },
         },
     }
     empty_lanes = {
@@ -3704,6 +3723,12 @@ def screen_a_share_research_candidates_data(
             "above_average_price": True,
         },
     }
+    if not market_gate["passed"] and breadth_promotion_quality["passed"]:
+        filter_specs["relative_resilience_filter"] = {
+            "change_pct_min": 0.2,
+            "change_pct_max": 6.0,
+            "above_average_price": True,
+        }
     snapshot_results, snapshot_status, snapshot_errors = collect_components(
         {"all_market_snapshot": get_cached_all_market_quote_snapshot},
         12,
@@ -3782,6 +3807,10 @@ def screen_a_share_research_candidates_data(
         ).get("results")
         or [],
         "early_repair": (filter_results.get("early_repair_filter") or {}).get("results")
+        or [],
+        "relative_resilience_in_weak_breadth": (
+            filter_results.get("relative_resilience_filter") or {}
+        ).get("results")
         or [],
     }
     snapshot_alignment = current_snapshot_time_alignment(
