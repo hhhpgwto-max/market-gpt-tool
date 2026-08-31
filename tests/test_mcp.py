@@ -243,8 +243,16 @@ def fake_get_fund_exposure_data(
                 "provider_industry_name": "Manufacturing",
             }
         ][:holdings_limit],
-        "industry_distribution": [{"industry_name": "Manufacturing", "weight_pct": 80.0}],
-        "asset_allocation": {"stock_pct": 90.0, "bond_pct": 0.0, "cash_pct": 10.0, "other_pct": 0.0, "fund_pct": 0.0},
+        "industry_distribution": [
+            {"industry_name": "Manufacturing", "weight_pct": 80.0}
+        ],
+        "asset_allocation": {
+            "stock_pct": 90.0,
+            "bond_pct": 0.0,
+            "cash_pct": 10.0,
+            "other_pct": 0.0,
+            "fund_pct": 0.0,
+        },
         "holdings_disclosure_date": "2026-03-31",
         "detail_level": detail_level,
         "source": ["test"],
@@ -256,7 +264,10 @@ def fake_get_fund_exposure_data(
 
 
 def fake_get_portfolio_exposure_data(
-    positions: list[dict], normalize_weights: bool, holdings_limit: int, detail_level: str
+    positions: list[dict],
+    normalize_weights: bool,
+    holdings_limit: int,
+    detail_level: str,
 ) -> dict:
     return {
         "input_position_count": len(positions),
@@ -300,13 +311,30 @@ def fake_get_ipo_subscription_status_data(
 
 
 def fake_get_a_share_trading_calendar_data(start_date, end_date, detail_level) -> dict:
-    return {"start_date": start_date, "end_date": end_date, "items": [], "detail_level": detail_level,
-            "source": ["test"], "source_errors": [], "missing_fields": [], "data_status": "full_data"}
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "items": [],
+        "detail_level": detail_level,
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+    }
 
 
-def fake_get_a_share_capital_activity_data(symbol, lookback_days, limit, detail_level) -> dict:
-    return {"symbol": symbol, "components": {}, "source": ["test"], "source_errors": [],
-            "missing_fields": [], "data_status": "full_data", "detail_level": detail_level}
+def fake_get_a_share_capital_activity_data(
+    symbol, lookback_days, limit, detail_level
+) -> dict:
+    return {
+        "symbol": symbol,
+        "components": {},
+        "source": ["test"],
+        "source_errors": [],
+        "missing_fields": [],
+        "data_status": "full_data",
+        "detail_level": detail_level,
+    }
 
 
 def fake_get_news_data(
@@ -351,7 +379,9 @@ def fake_get_event_timeline_data(symbol: str, days: int, limit: int) -> dict:
         "symbol": symbol,
         "period_days": days,
         "count": 1,
-        "events": [{"event_title": "Test event", "price_feedback": {"status": "available"}}][:limit],
+        "events": [
+            {"event_title": "Test event", "price_feedback": {"status": "available"}}
+        ][:limit],
         "source": ["test"],
         "source_errors": [],
         "data_status": "full_data",
@@ -414,9 +444,7 @@ def fake_get_security_status_data(symbol: str) -> dict:
     }
 
 
-def fake_get_decision_context_data(
-    symbol: str, benchmark_symbol: str | None
-) -> dict:
+def fake_get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict:
     return {
         "snapshot_id": f"{symbol}-test",
         "symbol": symbol,
@@ -484,7 +512,9 @@ def fake_get_market_snapshot_data(
         "snapshot_id": "market-snapshot-test",
         "requested_as_of": as_of,
         "symbol": symbol,
-        "requested_identifiers": [symbol, *(peer_symbols or [])] if symbol else peer_symbols or [],
+        "requested_identifiers": [symbol, *(peer_symbols or [])]
+        if symbol
+        else peer_symbols or [],
         "market_time": "2026-07-10T15:00:00+08:00",
         "market_time_range": {
             "earliest": "2026-07-10T15:00:00+08:00",
@@ -496,7 +526,9 @@ def fake_get_market_snapshot_data(
         "target_quote": {"symbol": symbol, "price": 123.45} if symbol else None,
         "peer_quotes": [],
         "market_overview": fake_get_market_overview_data(sector_limit),
-        "component_status": {"market_overview": {"status": "available", "latency_ms": 1}},
+        "component_status": {
+            "market_overview": {"status": "available", "latency_ms": 1}
+        },
         "source": ["test"],
         "source_errors": [],
         "conflicts": [],
@@ -524,7 +556,9 @@ def fake_get_limit_activity_data(limit: int) -> dict:
     }
 
 
-def fake_get_sector_rankings_data(sector_type: str, level: str, sort_by: str, limit: int) -> dict:
+def fake_get_sector_rankings_data(
+    sector_type: str, level: str, sort_by: str, limit: int
+) -> dict:
     return {
         "sector_type": sector_type,
         "level": level,
@@ -561,7 +595,9 @@ def test_kline_source_parsers() -> None:
         market_app.read_public_json = lambda *_, **__: {
             "data": {
                 "sh600519": {
-                    "qfqday": [["2026-07-10", "120.0", "123.45", "124.0", "119.5", "1000"]]
+                    "qfqday": [
+                        ["2026-07-10", "120.0", "123.45", "124.0", "119.5", "1000"]
+                    ]
                 }
             }
         }
@@ -627,6 +663,7 @@ def test_kline_range_and_pagination() -> None:
     original_reader = market_app.read_public_json
     requested_urls: list[str] = []
     try:
+
         def fake_reader(url: str, *_: object, **__: object) -> dict:
             requested_urls.append(url)
             return {
@@ -678,6 +715,7 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
     market_app.TOOL_CACHE.clear()
     requested_urls: list[str] = []
     try:
+
         def fake_reader(url: str, *_: object, **__: object) -> dict:
             requested_urls.append(url)
             sleep(0.12)
@@ -686,8 +724,26 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
                     "data": {
                         "sh600519": {
                             "m5": [
-                                ["202607100935", "100", "101", "102", "99", "10", "", ""],
-                                ["202607100940", "101", "102", "103", "100", "20", "", ""],
+                                [
+                                    "202607100935",
+                                    "100",
+                                    "101",
+                                    "102",
+                                    "99",
+                                    "10",
+                                    "",
+                                    "",
+                                ],
+                                [
+                                    "202607100940",
+                                    "101",
+                                    "102",
+                                    "103",
+                                    "100",
+                                    "20",
+                                    "",
+                                    "",
+                                ],
                             ]
                         }
                     }
@@ -716,7 +772,10 @@ def test_tencent_minute_kline_adjustment_fallback() -> None:
         assert market_app.perf_counter() - started < 0.2
         assert result["source"] == "tencent"
         assert result["adjustment"] == "forward_adjusted"
-        assert result["adjustment_source_parameter"] == "tencent_mkline_plus_qfq_daily_factor"
+        assert (
+            result["adjustment_source_parameter"]
+            == "tencent_mkline_plus_qfq_daily_factor"
+        )
         assert result["items"][0]["open"] == 50.5
         assert result["items"][0]["close"] == 51.0
         assert result["items"][0]["volume"] == 2000.0
@@ -748,6 +807,7 @@ def test_synchronized_market_snapshot_contract() -> None:
     calls = {"overview": 0, "batch": 0, "quote": 0}
     market_app.TOOL_CACHE.clear()
     try:
+
         def cached_overview(limit: int = 5) -> dict:
             calls["overview"] += 1
             return fake_get_market_overview_data(limit)
@@ -763,18 +823,14 @@ def test_synchronized_market_snapshot_contract() -> None:
         market_app.get_market_overview_data = cached_overview
         market_app.get_batch_quote_data = cached_batch
         market_app.get_quote_data = cached_quote
-        snapshot = market_app.get_market_snapshot_data(
-            "600519", [], None, 5, "summary"
-        )
+        snapshot = market_app.get_market_snapshot_data("600519", [], None, 5, "summary")
         assert snapshot["snapshot_id"].startswith("market-snapshot-")
         assert snapshot["market_time_range"]["latest"] == "2026-07-10T15:00:00+08:00"
         assert snapshot["source_difference_pct"] > 0
         assert snapshot["conflicts"][0]["type"] == "target_price_difference"
         assert snapshot["recommended_source"] == ["test"]
         assert snapshot["data_status"] == "partial_data"
-        repeated = market_app.get_market_snapshot_data(
-            "600519", [], None, 5, "summary"
-        )
+        repeated = market_app.get_market_snapshot_data("600519", [], None, 5, "summary")
         assert repeated["snapshot_id"] != snapshot["snapshot_id"]
         assert calls == {"overview": 1, "batch": 1, "quote": 1}
 
@@ -795,6 +851,7 @@ def test_snapshot_compensates_for_a_late_batch_component() -> None:
     original_collect = market_app.collect_components
     calls = 0
     try:
+
         def staged_collect(loaders: dict, _budget: float, _executor: object = None):
             nonlocal calls
             calls += 1
@@ -827,14 +884,14 @@ def test_snapshot_compensates_for_a_late_batch_component() -> None:
             )
 
         market_app.collect_components = staged_collect
-        snapshot = market_app.get_market_snapshot_data(
-            "600519", [], None, 5, "summary"
-        )
+        snapshot = market_app.get_market_snapshot_data("600519", [], None, 5, "summary")
         assert calls == 2
         assert snapshot["component_status"]["batch_quotes"]["status"] == (
             "recovered_within_compensation_budget"
         )
-        assert snapshot["component_status"]["batch_quotes"]["recovery_attempted"] is True
+        assert (
+            snapshot["component_status"]["batch_quotes"]["recovery_attempted"] is True
+        )
         assert not any(
             error.get("source") == "batch_quotes" for error in snapshot["source_errors"]
         )
@@ -921,7 +978,9 @@ def test_etf_market_routing_and_search() -> None:
             or {
                 "data": {
                     "sh512760": {
-                        "qfqday": [["2026-07-10", "10.0", "10.2", "10.3", "9.9", "1000"]]
+                        "qfqday": [
+                            ["2026-07-10", "10.0", "10.2", "10.3", "9.9", "1000"]
+                        ]
                     }
                 }
             }
@@ -963,15 +1022,25 @@ def test_quote_timestamp_semantics() -> None:
     lunch_time = market_app.datetime(
         2026, 7, 17, 12, 0, tzinfo=market_app.MARKET_TIMEZONE
     )
+    assert market_app.is_market_time_stale("2026-07-16T15:00:00+08:00", lunch_time)
+    assert not market_app.is_market_time_stale("2026-07-17T11:30:00+08:00", lunch_time)
+    assert market_app.is_market_time_stale("2026-07-17T11:00:00+08:00", lunch_time)
+
+    monday_after_close = market_app.datetime(
+        2026, 8, 31, 20, 0, tzinfo=market_app.MARKET_TIMEZONE
+    )
     assert market_app.is_market_time_stale(
-        "2026-07-16T15:00:00+08:00", lunch_time
+        "2026-08-28T15:00:00+08:00", monday_after_close
+    )
+    assert market_app.is_market_time_stale(
+        "2026-08-31T14:55:00+08:00", monday_after_close
     )
     assert not market_app.is_market_time_stale(
-        "2026-07-17T11:30:00+08:00", lunch_time
+        "2026-08-31T15:00:00+08:00", monday_after_close
     )
-    assert market_app.is_market_time_stale(
-        "2026-07-17T11:00:00+08:00", lunch_time
-    )
+
+    weekend = market_app.datetime(2026, 8, 30, 20, 0, tzinfo=market_app.MARKET_TIMEZONE)
+    assert not market_app.is_market_time_stale("2026-08-28T15:00:00+08:00", weekend)
     assert (
         market_app.staleness_basis_for(
             "2026-07-16T15:00:00+08:00",
@@ -1028,7 +1097,13 @@ def test_industry_board_parser() -> None:
         market_app.read_public_json = lambda *_: {
             "data": {
                 "diff": [
-                    {"f12": "BK0001", "f14": "Test Industry", "f2": 100.5, "f3": 2.3, "f4": 2.25}
+                    {
+                        "f12": "BK0001",
+                        "f14": "Test Industry",
+                        "f2": 100.5,
+                        "f3": 2.3,
+                        "f4": 2.25,
+                    }
                 ]
             }
         }
@@ -1042,13 +1117,48 @@ def test_industry_board_parser() -> None:
 def test_industry_board_deduplication() -> None:
     boards = market_app.deduplicate_industry_boards(
         [
-            {"name": "中药Ⅲ", "industry_name": "中药", "industry_level": "Ⅲ", "change_pct": 3.26},
-            {"name": "中药Ⅱ", "industry_name": "中药", "industry_level": "Ⅱ", "change_pct": 3.26},
-            {"name": "油气开采Ⅲ", "industry_name": "油气开采", "industry_level": "Ⅲ", "change_pct": 2.17},
-            {"name": "油气开采Ⅱ", "industry_name": "油气开采", "industry_level": "Ⅱ", "change_pct": 2.17},
-            {"name": "国有大型银行Ⅲ", "industry_name": "国有大型银行", "industry_level": "Ⅲ", "change_pct": 2.07},
-            {"name": "城商行Ⅲ", "industry_name": "城商行", "industry_level": "Ⅲ", "change_pct": 1.69},
-            {"name": "农商行Ⅲ", "industry_name": "农商行", "industry_level": "Ⅲ", "change_pct": 1.69},
+            {
+                "name": "中药Ⅲ",
+                "industry_name": "中药",
+                "industry_level": "Ⅲ",
+                "change_pct": 3.26,
+            },
+            {
+                "name": "中药Ⅱ",
+                "industry_name": "中药",
+                "industry_level": "Ⅱ",
+                "change_pct": 3.26,
+            },
+            {
+                "name": "油气开采Ⅲ",
+                "industry_name": "油气开采",
+                "industry_level": "Ⅲ",
+                "change_pct": 2.17,
+            },
+            {
+                "name": "油气开采Ⅱ",
+                "industry_name": "油气开采",
+                "industry_level": "Ⅱ",
+                "change_pct": 2.17,
+            },
+            {
+                "name": "国有大型银行Ⅲ",
+                "industry_name": "国有大型银行",
+                "industry_level": "Ⅲ",
+                "change_pct": 2.07,
+            },
+            {
+                "name": "城商行Ⅲ",
+                "industry_name": "城商行",
+                "industry_level": "Ⅲ",
+                "change_pct": 1.69,
+            },
+            {
+                "name": "农商行Ⅲ",
+                "industry_name": "农商行",
+                "industry_level": "Ⅲ",
+                "change_pct": 1.69,
+            },
         ],
         5,
     )
@@ -1068,17 +1178,60 @@ def test_industry_board_deduplication() -> None:
         "2",
     )
     assert [item["name"] for item in selected] == ["通信设备", "中药Ⅱ"]
-    assert selected[0]["level_match_status"] == "provider_level_unlabeled_included_for_coverage"
+    assert (
+        selected[0]["level_match_status"]
+        == "provider_level_unlabeled_included_for_coverage"
+    )
     assert coverage == "partial_level_metadata_unlabeled_boards_included"
 
 
 def test_market_structure_calculations() -> None:
     rows = [
-        {"symbol": "600001", "name": "Test Main", "price": 11.0, "change_pct": 10.0, "turnover": 100.0, "high": 11.0, "previous_close": 10.0},
-        {"symbol": "300001", "name": "Test Growth", "price": 12.0, "change_pct": 20.0, "turnover": 200.0, "high": 12.0, "previous_close": 10.0},
-        {"symbol": "430001", "name": "Test BSE", "price": 7.0, "change_pct": -30.0, "turnover": 300.0, "high": 8.0, "previous_close": 10.0},
-        {"symbol": "600002", "name": "*ST Test", "price": 10.5, "change_pct": 5.0, "turnover": 150.0, "high": 10.5, "previous_close": 10.0},
-        {"symbol": "600003", "name": "Test Open Board", "price": 10.5, "change_pct": 5.0, "turnover": 50.0, "high": 11.0, "previous_close": 10.0},
+        {
+            "symbol": "600001",
+            "name": "Test Main",
+            "price": 11.0,
+            "change_pct": 10.0,
+            "turnover": 100.0,
+            "high": 11.0,
+            "previous_close": 10.0,
+        },
+        {
+            "symbol": "300001",
+            "name": "Test Growth",
+            "price": 12.0,
+            "change_pct": 20.0,
+            "turnover": 200.0,
+            "high": 12.0,
+            "previous_close": 10.0,
+        },
+        {
+            "symbol": "430001",
+            "name": "Test BSE",
+            "price": 7.0,
+            "change_pct": -30.0,
+            "turnover": 300.0,
+            "high": 8.0,
+            "previous_close": 10.0,
+        },
+        {
+            "symbol": "600002",
+            "name": "*ST Test",
+            "price": 10.5,
+            "change_pct": 5.0,
+            "turnover": 150.0,
+            "high": 10.5,
+            "previous_close": 10.0,
+        },
+        {
+            "symbol": "600003",
+            "name": "Test Open Board",
+            "price": 10.5,
+            "change_pct": 5.0,
+            "turnover": 50.0,
+            "high": 11.0,
+            "previous_close": 10.0,
+        },
     ]
     breadth = market_app.calculate_market_breadth(rows)
     totals = breadth["all_market"]
@@ -1111,12 +1264,37 @@ def test_market_structure_calculations() -> None:
         current_structure["stabilization_confirmation_status"]
         == "current_snapshot_cannot_confirm_multi_session_stabilization"
     )
-    assert current_structure["required_companion_evidence"]["lookbacks"] == [1, 3, 5, 10, 20]
-    assert current_structure["industry_board_universe_participation"]["observed_count"] == 92
+    assert current_structure["required_companion_evidence"]["lookbacks"] == [
+        1,
+        3,
+        5,
+        10,
+        20,
+    ]
+    assert (
+        current_structure["industry_board_universe_participation"]["observed_count"]
+        == 92
+    )
+    assert (
+        current_structure["snapshot_pattern"]["time_scope"] == "single_current_snapshot"
+    )
+    assert current_structure["snapshot_pattern"]["prediction_status"] == (
+        "not_a_forecast_or_regime_assignment"
+    )
+
+    narrow = market_app.classify_current_market_snapshot_pattern(
+        {"rise_share_pct": 35.0},
+        {"positive_share_pct": 66.67},
+        {"positive_share_pct": 50.0},
+        {"positive_share_pct": 40.0},
+    )
+    assert narrow["pattern"] == "index_resilience_with_narrow_stock_participation"
 
     try:
         market_app.get_sector_rankings_data("industry", "2", "momentum_15m", 20)
-        raise AssertionError("Expected unstable minute momentum ranking to be rejected.")
+        raise AssertionError(
+            "Expected unstable minute momentum ranking to be rejected."
+        )
     except market_app.HTTPException as exc:
         assert exc.status_code == 400
 
@@ -1250,13 +1428,22 @@ def test_batch_quotes_intraday_indicators_and_filtering() -> None:
         assert batch["source_updated_at"] == batch["results"][0]["source_updated_at"]
         assert batch["source_fetch_time"] == batch["tool_queried_at"]
         assert batch["errors"][0]["code"] == "invalid_symbol"
-        assert market_app.batch_security_metadata("index:000300")["security_type"] == "index"
+        assert (
+            market_app.batch_security_metadata("index:000300")["security_type"]
+            == "index"
+        )
 
         lunch_update = market_app.datetime(
             2026, 7, 22, 11, 37, tzinfo=market_app.MARKET_TIMEZONE
         )
         lunch_quote = market_app.batch_quote_from_eastmoney_row(
-            {"f12": "512760", "f13": 1, "f14": "Test ETF", "f2": 1.23, "f124": lunch_update.timestamp()},
+            {
+                "f12": "512760",
+                "f13": 1,
+                "f14": "Test ETF",
+                "f2": 1.23,
+                "f124": lunch_update.timestamp(),
+            },
             market_app.batch_security_metadata("512760"),
         )
         assert lunch_quote["source_updated_at"] == "2026-07-22T11:37:00+08:00"
@@ -1399,18 +1586,29 @@ def test_intraday_session_filter_and_market_time_cap() -> None:
         )
         assert indicators["return_from_open_pct"] == 2.0
         assert indicators["return_from_first_returned_minute_pct"] == 0.0
-        assert indicators["opening_price_scope"] == "official_open_from_09_30_exchange_minute"
+        assert (
+            indicators["opening_price_scope"]
+            == "official_open_from_09_30_exchange_minute"
+        )
 
         indicators = market_app.intraday_mechanical_indicators(
             intraday["items"]
-            + [{"time": "2026-07-10 15:11", "price": 999.0, "high": 999.0, "low": 999.0}]
+            + [
+                {
+                    "time": "2026-07-10 15:11",
+                    "price": 999.0,
+                    "high": 999.0,
+                    "low": 999.0,
+                }
+            ]
         )
         assert indicators["at_intraday_high"] is True
         assert indicators["distance_from_high_pct"] == 0.0
 
-        assert market_app.market_time_from_source_update(
-            "2026-07-10T16:14:42+08:00"
-        ) == "2026-07-10T15:00:00+08:00"
+        assert (
+            market_app.market_time_from_source_update("2026-07-10T16:14:42+08:00")
+            == "2026-07-10T15:00:00+08:00"
+        )
     finally:
         market_app.read_public_json = original_json
 
@@ -1451,6 +1649,7 @@ def test_market_quote_pagination() -> None:
     finally:
         market_app.read_public_json_pooled = original_json
 
+
 def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> None:
     original_json = market_app.read_public_json_pooled
     try:
@@ -1463,7 +1662,9 @@ def test_market_quote_pagination_retries_only_failed_page_on_backup_host() -> No
             host = url.split("/", 3)[2]
             requests.append((host, page))
             if host == "push2.eastmoney.com" and page == 2:
-                raise market_app.HTTPException(status_code=502, detail="temporary page failure")
+                raise market_app.HTTPException(
+                    status_code=502, detail="temporary page failure"
+                )
             start = (page - 1) * 100
             end = min(start + 100, 201)
             return {
@@ -1502,8 +1703,9 @@ def test_all_market_snapshot_is_shared_and_has_honest_stale_fallback() -> None:
         market_app.TOOL_CACHE_INFLIGHT.pop(key, None)
     calls = []
     try:
-        market_app.get_sina_market_quotes = lambda: {
-            "rows": calls.append("live") or [
+        market_app.get_eastmoney_market_quotes = lambda: (
+            calls.append("live")
+            or [
                 {
                     "symbol": "600001",
                     "name": "Eligible Stock",
@@ -1515,27 +1717,56 @@ def test_all_market_snapshot_is_shared_and_has_honest_stale_fallback() -> None:
                     "total_market_value": 10000000000.0,
                     "market_time": "2026-07-10T10:00:00+08:00",
                 }
-            ],
-            "coverage_status": "complete",
-            "source_errors": [],
-        }
+            ]
+        )
         first = market_app.get_cached_all_market_quote_snapshot()
         second = market_app.get_cached_all_market_quote_snapshot()
         assert first["row_count"] == second["row_count"] == 1
+        assert first["source"] == ["eastmoney_all_a_share_snapshot"]
+        assert first["promotion_time_status"] == "source_timestamp_available"
         assert calls == ["live"]
 
         with market_app.TOOL_CACHE_LOCK:
             market_app.TOOL_CACHE[key]["created_at"] -= market_app.timedelta(seconds=16)
-        market_app.get_sina_market_quotes = lambda: (_ for _ in ()).throw(
+        market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="live source failed")
         )
-        market_app.get_eastmoney_market_quotes = lambda: (_ for _ in ()).throw(
+        market_app.get_sina_market_quotes = lambda: (_ for _ in ()).throw(
             market_app.HTTPException(status_code=502, detail="backup source failed")
         )
         stale = market_app.get_cached_all_market_quote_snapshot()
         assert stale["served_from_stale_cache"] is True
         assert stale["stale_cache_age_seconds"] >= 16
-        assert any("using recent component cache" in error for error in stale["source_errors"])
+        assert any(
+            "using recent component cache" in error for error in stale["source_errors"]
+        )
+
+        with market_app.TOOL_CACHE_LOCK:
+            market_app.TOOL_CACHE.pop(key, None)
+        market_app.get_sina_market_quotes = lambda: {
+            "rows": [
+                {
+                    "symbol": "600001",
+                    "name": "Descriptive Only",
+                    "price": 11.0,
+                    "change_pct": 2.0,
+                    "volume": 100,
+                    "turnover": 200000,
+                    "turnover_rate": 3.0,
+                    "total_market_value": 10000000000.0,
+                    "market_time": None,
+                }
+            ],
+            "coverage_status": "complete",
+            "source_errors": [],
+        }
+        fallback = market_app.get_cached_all_market_quote_snapshot()
+        assert fallback["source"] == ["sina_all_a_share_snapshot"]
+        assert fallback["market_time"] is None
+        assert fallback["promotion_time_status"] == (
+            "descriptive_only_source_timestamp_unavailable"
+        )
+        assert fallback["data_status"] == "partial_data"
     finally:
         market_app.get_eastmoney_market_quotes = original_eastmoney_rows
         market_app.get_sina_market_quotes = original_sina_rows
@@ -1597,9 +1828,30 @@ def test_fast_market_aggregate() -> None:
         market_app.read_public_json = lambda *_args, **_kwargs: {
             "data": {
                 "diff": [
-                    {"f12": "000002", "f104": 10, "f105": 20, "f106": 2, "f6": 1000, "f124": 1783930322},
-                    {"f12": "399107", "f104": 30, "f105": 40, "f106": 3, "f6": 2000, "f124": 1783930305},
-                    {"f12": "899050", "f104": 5, "f105": 6, "f106": 1, "f6": 300, "f124": 1783928233},
+                    {
+                        "f12": "000002",
+                        "f104": 10,
+                        "f105": 20,
+                        "f106": 2,
+                        "f6": 1000,
+                        "f124": 1783930322,
+                    },
+                    {
+                        "f12": "399107",
+                        "f104": 30,
+                        "f105": 40,
+                        "f106": 3,
+                        "f6": 2000,
+                        "f124": 1783930305,
+                    },
+                    {
+                        "f12": "899050",
+                        "f104": 5,
+                        "f105": 6,
+                        "f106": 1,
+                        "f6": 300,
+                        "f124": 1783928233,
+                    },
                 ]
             }
         }
@@ -1677,7 +1929,9 @@ def test_intraday_and_index_fallback_parsers() -> None:
         assert intraday["mechanical_indicators"]["return_from_open_pct"] == 1.5075
 
         market_app.read_public_json = lambda *_: {
-            "data": {"sh600519": {"data": {"date": "20261399", "data": ["0930 10 2 2"]}}}
+            "data": {
+                "sh600519": {"data": {"date": "20261399", "data": ["0930 10 2 2"]}}
+            }
         }
         try:
             market_app.get_tencent_intraday("600519", 1)
@@ -1693,14 +1947,22 @@ def test_intraday_and_index_fallback_parsers() -> None:
         )
         try:
             market_app.get_intraday_data("600519", 1)
-            raise AssertionError("Expected all-not-found intraday sources to return 404.")
+            raise AssertionError(
+                "Expected all-not-found intraday sources to return 404."
+            )
         except market_app.HTTPException as exc:
             assert exc.status_code == 404
         market_app.get_tencent_intraday = original_tencent_intraday
 
         market_app.get_eastmoney_indices = lambda: []
         market_app.get_eastmoney_industry_boards = lambda _: [
-            {"symbol": "BK0001", "name": "Test Industry", "price": 100, "change_pct": 1.5, "change": 1.48}
+            {
+                "symbol": "BK0001",
+                "name": "Test Industry",
+                "price": 100,
+                "change_pct": 1.5,
+                "change": 1.48,
+            }
         ]
         market_app.get_all_realtime_quotes = lambda: types.SimpleNamespace(empty=True)
         fields = [""] * 35
@@ -1723,7 +1985,9 @@ def test_intraday_and_index_fallback_parsers() -> None:
             "fresh_cache",
         }
 
-        market_app.read_market_text = lambda *_: 'v_sh000001="' + "~".join([""] * 32) + '";'
+        market_app.read_market_text = lambda *_: (
+            'v_sh000001="' + "~".join([""] * 32) + '";'
+        )
         try:
             market_app.get_tencent_indices()
             raise AssertionError("Expected short Tencent index row to fail.")
@@ -1826,7 +2090,9 @@ def test_intraday_and_index_fallback_parsers() -> None:
         )
         try:
             market_app.get_fund_flow_data("600519", 1)
-            raise AssertionError("Expected all-not-found fund-flow sources to return 404.")
+            raise AssertionError(
+                "Expected all-not-found fund-flow sources to return 404."
+            )
         except market_app.HTTPException as exc:
             assert exc.status_code == 404
     finally:
@@ -1871,9 +2137,7 @@ def test_announcements_relative_strength_and_anomaly_scan() -> None:
                 ]
             ]
         }
-        sse = market_app.get_sse_announcements(
-            "600000", "2026-07-01", "2026-07-14", 10
-        )
+        sse = market_app.get_sse_announcements("600000", "2026-07-01", "2026-07-14", 10)
         assert len(sse) == 1
         assert sse[0]["event_tags"] == ["dividend"]
         assert sse[0]["url"] == "https://static.sse.com.cn/disclosure/test.pdf"
@@ -2020,13 +2284,16 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert refreshed_cache["cache_hit"] is False
 
     original_market_status_at = market_app.market_status_at
+    original_market_time_stale = market_app.is_market_time_stale
     market_app.market_status_at = lambda *_: "closed"
+    market_app.is_market_time_stale = lambda *_args, **_kwargs: False
     try:
         result = market_app.standardize_tool_success(
             first, market_app.perf_counter(), second_cache
         )
     finally:
         market_app.market_status_at = original_market_status_at
+        market_app.is_market_time_stale = original_market_time_stale
     assert result["ok"] is True
     assert result["source"] == ["eastmoney"]
     assert result["cache_hit"] is True
@@ -2047,7 +2314,9 @@ def test_reliability_envelope_cache_and_health() -> None:
     ) - market_app.timedelta(seconds=20)
 
     def failing_loader() -> dict:
-        raise market_app.HTTPException(status_code=502, detail="temporary upstream failure")
+        raise market_app.HTTPException(
+            status_code=502, detail="temporary upstream failure"
+        )
 
     stale = market_app.run_cached_tool(
         "test",
@@ -2074,14 +2343,16 @@ def test_reliability_envelope_cache_and_health() -> None:
     market_app.TOOL_CACHE[component_key]["created_at"] = market_app.datetime.now(
         market_app.timezone.utc
     ) - market_app.timedelta(seconds=20)
-    component_results, component_status, component_errors = market_app.collect_components(
-        {
-            "shared_component": lambda: market_app.get_cached_component_with_stale(
-                component_key, 10, 120, failing_loader
-            )
-        },
-        1,
-        market_app.COMPOSITE_TOOL_EXECUTOR,
+    component_results, component_status, component_errors = (
+        market_app.collect_components(
+            {
+                "shared_component": lambda: market_app.get_cached_component_with_stale(
+                    component_key, 10, 120, failing_loader
+                )
+            },
+            1,
+            market_app.COMPOSITE_TOOL_EXECUTOR,
+        )
     )
     assert component_errors == []
     assert component_status["shared_component"]["status"] == "stale_cache"
@@ -2090,13 +2361,17 @@ def test_reliability_envelope_cache_and_health() -> None:
 
     market_app.record_source_health("eastmoney", True, 42)
     health = market_app.get_market_data_health_data()
-    eastmoney = next(item for item in health["sources"] if item["source"] == "eastmoney")
+    eastmoney = next(
+        item for item in health["sources"] if item["source"] == "eastmoney"
+    )
     assert eastmoney["status"] == "healthy"
     assert health["quote_route"]["status"] == "configured"
-    assert health["quote_route"]["observed_status"] == "operational_on_observed_requests"
+    assert (
+        health["quote_route"]["observed_status"] == "operational_on_observed_requests"
+    )
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "market_path_structure_v12"
+    assert health["routing_revision"] == "dynamic_market_evidence_v13"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -2120,9 +2395,10 @@ def test_reliability_envelope_cache_and_health() -> None:
     assert adaptive_source == "tencent"
     assert any("adaptive fast fallback" in error for error in adaptive_errors)
     adaptive_health = market_app.get_market_data_health_data()
-    assert adaptive_health["kline_route"]["eastmoney_circuit"][
-        "adaptive_fast_fallback"
-    ] is True
+    assert (
+        adaptive_health["kline_route"]["eastmoney_circuit"]["adaptive_fast_fallback"]
+        is True
+    )
 
     original_cache_limit = market_app.TOOL_CACHE_MAX_ENTRIES
     market_app.TOOL_CACHE.clear()
@@ -2179,10 +2455,14 @@ def test_reliability_envelope_cache_and_health() -> None:
         return {"source": "test", "market_time": "2026-07-10T15:00:00+08:00"}
 
     with market_app.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(
-            lambda _: market_app.get_cached_tool_data("single-flight", 10, slow_loader),
-            range(5),
-        ))
+        results = list(
+            executor.map(
+                lambda _: market_app.get_cached_tool_data(
+                    "single-flight", 10, slow_loader
+                ),
+                range(5),
+            )
+        )
     assert concurrent_calls == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is False) == 1
     assert sum(1 for _, cache in results if cache["cache_hit"] is True) == 4
@@ -2194,11 +2474,15 @@ def test_reliability_envelope_cache_and_health() -> None:
         nonlocal failure_calls
         failure_calls += 1
         sleep(0.05)
-        raise market_app.HTTPException(status_code=502, detail="shared upstream failure")
+        raise market_app.HTTPException(
+            status_code=502, detail="shared upstream failure"
+        )
 
     def consume_shared_failure(_: int) -> int:
         try:
-            market_app.get_cached_tool_data("single-flight-failure", 10, shared_failing_loader)
+            market_app.get_cached_tool_data(
+                "single-flight-failure", 10, shared_failing_loader
+            )
         except market_app.HTTPException as exc:
             return exc.status_code
         raise AssertionError("Expected the shared loader failure to propagate.")
@@ -2248,6 +2532,7 @@ def test_historical_context_and_security_status_facts() -> None:
             }
             for index in range(260)
         ]
+        items.append({**items[-1], "date": "2099-01-01", "close": 9999.0})
         historical_payload = {
             "symbol": "600519",
             "security_type": "a_share",
@@ -2259,7 +2544,9 @@ def test_historical_context_and_security_status_facts() -> None:
             "source_errors": [],
         }
         market_app.get_tencent_kline = lambda *_args, **_kwargs: historical_payload
-        market_app.get_eastmoney_kline = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        market_app.get_eastmoney_kline = lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(
             market_app.HTTPException(status_code=502, detail="test primary blocked")
         )
         historical = market_app.get_historical_context_data("600519")
@@ -2280,10 +2567,12 @@ def test_historical_context_and_security_status_facts() -> None:
             window["window_complete"] for window in historical["windows"].values()
         )
         assert historical["windows"]["250"]["available_sessions"] == 250
+        assert historical["data_quality"]["future_bar_count"] == 1
+        assert historical["data_quality"]["future_bar_used"] is False
+        assert historical["latest_observation_trade_date"] != "2099-01-01"
+        assert historical["data_status"] == "partial_data"
         assert (
-            historical["windows"]["20"]["turnover"][
-                "percentile_rank_in_window"
-            ]
+            historical["windows"]["20"]["turnover"]["percentile_rank_in_window"]
             == 100.0
         )
 
@@ -2293,20 +2582,22 @@ def test_historical_context_and_security_status_facts() -> None:
         ]
         lunch_history, lunch_incomplete = market_app.completed_daily_history(
             sample_daily,
-            market_app.datetime(
-                2026, 7, 22, 11, 45, tzinfo=market_app.MARKET_TIMEZONE
-            ),
+            market_app.datetime(2026, 7, 22, 11, 45, tzinfo=market_app.MARKET_TIMEZONE),
         )
         assert lunch_incomplete is True
         assert lunch_history == sample_daily[:-1]
         closed_history, closed_incomplete = market_app.completed_daily_history(
             sample_daily,
-            market_app.datetime(
-                2026, 7, 22, 15, 5, tzinfo=market_app.MARKET_TIMEZONE
-            ),
+            market_app.datetime(2026, 7, 22, 15, 5, tzinfo=market_app.MARKET_TIMEZONE),
         )
         assert closed_incomplete is False
         assert closed_history == sample_daily
+        future_filtered, future_incomplete = market_app.completed_daily_history(
+            [*sample_daily, {"date": "2099-01-01", "close": 999.0}],
+            market_app.datetime(2026, 7, 22, 15, 5, tzinfo=market_app.MARKET_TIMEZONE),
+        )
+        assert future_incomplete is False
+        assert future_filtered == sample_daily
 
         quote = fake_get_quote_data("600519")
         quote["quote"]["name"] = "*ST Test"
@@ -2339,7 +2630,9 @@ def test_historical_context_and_security_status_facts() -> None:
 
         def reference_hosts(url: str, *_: object) -> dict:
             if url.startswith("https://push2.eastmoney.com/"):
-                raise market_app.HTTPException(status_code=502, detail="primary blocked")
+                raise market_app.HTTPException(
+                    status_code=502, detail="primary blocked"
+                )
             return {
                 "data": {
                     "f57": "600519",
@@ -2384,30 +2677,45 @@ def test_candidate_research_screen_evidence_gates() -> None:
     original_overview = market_app.get_market_overview_data
     original_filter = market_app.filter_a_share_securities_data
     original_history = market_app.get_cached_historical_context_data
+    original_snapshot = market_app.get_cached_all_market_quote_snapshot
+    original_stale_check = market_app.is_market_time_stale
     history_calls = []
     filter_calls = []
     try:
+        market_app.is_market_time_stale = lambda *_args, **_kwargs: False
+
         def filtered_universe(**_: object) -> dict:
             filter_calls.append(True)
-            return {"results": [
-                {
-                    "symbol": "600001",
-                    "name": "Lower Turnover",
-                    "turnover": 600_000_000,
-                    "change_pct": 5.0,
-                },
-                {
-                    "symbol": "600002",
-                    "name": "Higher Turnover",
-                    "turnover": 1_200_000_000,
-                    "change_pct": 2.0,
-                },
+            return {
+                "results": [
+                    {
+                        "symbol": "600001",
+                        "name": "Lower Turnover",
+                        "turnover": 600_000_000,
+                        "change_pct": 5.0,
+                        "price_above_average_pct": 1.0,
+                        "market_time": "2026-07-10T15:00:00+08:00",
+                    },
+                    {
+                        "symbol": "600002",
+                        "name": "Higher Turnover",
+                        "turnover": 1_200_000_000,
+                        "change_pct": 2.0,
+                        "price_above_average_pct": 1.0,
+                        "market_time": "2026-07-10T15:00:00+08:00",
+                    },
                 ],
                 "source": ["test_filter"],
                 "market_time": "2026-07-10T15:00:00+08:00",
             }
 
         market_app.filter_a_share_securities_data = filtered_universe
+        market_app.get_cached_all_market_quote_snapshot = lambda: {
+            "rows": [],
+            "market_time": "2026-07-10T15:00:00+08:00",
+            "source": ["test_snapshot"],
+            "source_errors": [],
+        }
         market_app.get_market_overview_data = lambda _limit: {
             "market_activity_facts": {
                 "rise_count": 100,
@@ -2417,18 +2725,47 @@ def test_candidate_research_screen_evidence_gates() -> None:
                 "limit_down_count": 30,
             },
             "market_time": "2026-07-10T15:00:00+08:00",
+            "current_market_structure": {
+                "temporal_alignment": {
+                    "status": "aligned",
+                    "component_market_times": {
+                        "market_overview": "2026-07-10T15:00:00+08:00",
+                        "market_breadth": "2026-07-10T15:00:00+08:00",
+                    },
+                }
+            },
+            "component_status": {"market_breadth": {"status": "live"}},
             "source": ["test_overview"],
         }
-        market_app.get_cached_historical_context_data = lambda symbol: history_calls.append(symbol)
+        market_app.get_cached_historical_context_data = lambda symbol: (
+            history_calls.append(symbol)
+        )
         blocked = market_app.screen_a_share_research_candidates_data(
-            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
-            5, 8, 0.5, [20, 60], 0.0, "raw",
+            0.5,
+            6.0,
+            500_000_000,
+            2.0,
+            100_000_000_000,
+            5,
+            8,
+            0.5,
+            [20, 60],
+            0.0,
+            "raw",
         )
         assert blocked["no_candidate"] is True
-        assert blocked["selection_status"] == "no_candidate_due_to_market_breadth_gate"
-        assert history_calls == []
-        assert filter_calls == []
-        assert blocked["preselected_count"] == 0
+        assert (
+            blocked["selection_status"]
+            == "no_candidate_due_to_incomplete_history_evidence"
+        )
+        assert blocked["market_gate"]["passed"] is False
+        assert sorted(history_calls) == ["600001", "600002"]
+        assert len(filter_calls) == 3
+        assert blocked["preselected_count"] == 2
+        assert blocked["research_candidates"] == []
+        assert blocked["data_quality"]["historical_universe_reconstruction"] == (
+            "unavailable_current_live_universe_only"
+        )
 
         # A failed caller-configurable breadth gate is not proof that no relative-
         # strength research route exists. The same public tool can explicitly run
@@ -2449,9 +2786,50 @@ def test_candidate_research_screen_evidence_gates() -> None:
             },
             "source": "test_history",
         }
+        weak_dynamic_research = market_app.screen_a_share_research_candidates_data(
+            0.5,
+            6.0,
+            500_000_000,
+            2.0,
+            100_000_000_000,
+            5,
+            8,
+            0.5,
+            [20, 60],
+            0.0,
+            "raw",
+        )
+        assert weak_dynamic_research["no_candidate"] is False
+        assert weak_dynamic_research["research_candidates"][0]["primary_lane"] == (
+            "relative_resilience_in_weak_breadth"
+        )
+        assert weak_dynamic_research["legacy_continuation_candidates"] == []
+        assert (
+            weak_dynamic_research["research_candidates"][0]["evidence_gate_passed"]
+            is True
+        )
+        assert (
+            weak_dynamic_research["research_candidates"][0]["rejection_reasons"] == []
+        )
+        assert (
+            weak_dynamic_research["research_candidates"][0]["legacy_continuation_gate"][
+                "passed"
+            ]
+            is False
+        )
+
         weak_market_research = market_app.screen_a_share_research_candidates_data(
-            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
-            5, 8, 0.0, [20, 60], 0.0, "raw",
+            0.5,
+            6.0,
+            500_000_000,
+            2.0,
+            100_000_000_000,
+            5,
+            8,
+            0.0,
+            [20, 60],
+            0.0,
+            "raw",
         )
         assert weak_market_research["market_gate"]["passed"] is True
         assert weak_market_research["no_candidate"] is False
@@ -2465,6 +2843,16 @@ def test_candidate_research_screen_evidence_gates() -> None:
                 "rise_to_fall_ratio": 1.2,
             },
             "market_time": "2026-07-10T15:00:00+08:00",
+            "current_market_structure": {
+                "temporal_alignment": {
+                    "status": "aligned",
+                    "component_market_times": {
+                        "market_overview": "2026-07-10T15:00:00+08:00",
+                        "market_breadth": "2026-07-10T15:00:00+08:00",
+                    },
+                }
+            },
+            "component_status": {"market_breadth": {"status": "live"}},
             "source": ["test_overview"],
         }
 
@@ -2488,19 +2876,439 @@ def test_candidate_research_screen_evidence_gates() -> None:
 
         market_app.get_cached_historical_context_data = history
         accepted = market_app.screen_a_share_research_candidates_data(
-            0.5, 6.0, 500_000_000, 2.0, 100_000_000_000,
-            5, 8, 0.5, [20, 60], 0.0, "raw",
+            0.5,
+            6.0,
+            500_000_000,
+            2.0,
+            100_000_000_000,
+            5,
+            8,
+            0.5,
+            [20, 60],
+            0.0,
+            "raw",
         )
         assert accepted["no_candidate"] is False
-        assert filter_calls == [True]
+        assert filter_calls == [True, True, True]
         assert accepted["research_candidates"][0]["symbol"] == "600002"
         assert accepted["research_candidates"][0]["evidence_gate_passed"] is True
         assert accepted["rejected_candidates"][0]["symbol"] == "600001"
-        assert "history_return_below_minimum:20" in accepted["rejected_candidates"][0]["rejection_reasons"]
+        assert (
+            "history_return_below_minimum:20"
+            in accepted["rejected_candidates"][0]["rejection_reasons"]
+        )
     finally:
         market_app.get_market_overview_data = original_overview
         market_app.filter_a_share_securities_data = original_filter
         market_app.get_cached_historical_context_data = original_history
+        market_app.get_cached_all_market_quote_snapshot = original_snapshot
+        market_app.is_market_time_stale = original_stale_check
+
+
+def test_dynamic_candidate_lanes_and_history_alignment_are_no_lookahead() -> None:
+    context = {
+        "latest_trade_date": "2026-07-09",
+        "windows": {
+            "20": {
+                "window_complete": True,
+                "return_pct": 8.0,
+                "distance_from_high_pct": -6.0,
+            },
+            "60": {"window_complete": True, "return_pct": 12.0},
+        },
+        "path_facts": {
+            "windows": {
+                "1": {"return_pct": -1.0},
+                "3": {"return_pct": 1.5},
+                "5": {"return_pct": 2.0},
+            }
+        },
+    }
+    persistence, rejections = market_app.candidate_history_gate(
+        context,
+        [20, 60],
+        0.0,
+        "2026-07-10T10:00:00+08:00",
+    )
+    assert rejections == []
+    assert persistence["as_of_alignment"]["status"] == (
+        "expected_intraday_one_session_lag"
+    )
+    candidate = {
+        "symbol": "600001",
+        "change_pct": -1.2,
+        "price_above_average_pct": -0.4,
+        "preselection_lanes": ["controlled_pullback"],
+    }
+    lanes = market_app.candidate_research_lane_evidence(
+        candidate, context, rejections, True
+    )
+    assert lanes["controlled_pullback"]["observed"] is True
+    assert lanes["continuation"]["observed"] is False
+
+    caller_gate_blocked_lanes = market_app.candidate_research_lane_evidence(
+        candidate,
+        context,
+        ["history_return_below_minimum:60"],
+        True,
+    )
+    assert caller_gate_blocked_lanes["controlled_pullback"]["observed"] is False
+    assert (
+        "history_return_below_minimum:60"
+        in caller_gate_blocked_lanes["controlled_pullback"]["failed_conditions"]
+    )
+
+    breadth_quality_hold = market_app.market_breadth_promotion_quality(
+        {
+            "market_activity_facts": {"rise_count": 100, "fall_count": 500},
+            "current_market_structure": {
+                "temporal_alignment": {
+                    "status": "quality_hold",
+                    "component_market_times": {
+                        "market_breadth": "2026-07-10T10:00:00+08:00"
+                    },
+                }
+            },
+            "component_status": {"market_breadth": {"status": "stale_cache"}},
+        },
+        "2026-07-10T10:01:00+08:00",
+    )
+    assert breadth_quality_hold["passed"] is False
+    breadth_quality_ignores_unrelated_board_hold = (
+        market_app.market_breadth_promotion_quality(
+            {
+                "market_time": "2026-07-10T10:00:00+08:00",
+                "market_activity_facts": {"rise_count": 600, "fall_count": 500},
+                "current_market_structure": {
+                    "temporal_alignment": {
+                        "status": "quality_hold",
+                        "component_market_times": {
+                            "market_overview": "2026-07-10T10:00:00+08:00",
+                            "market_breadth": "2026-07-10T10:00:00+08:00",
+                            "industry_boards": None,
+                        },
+                    }
+                },
+                "component_status": {"market_breadth": {"status": "live"}},
+            },
+            "2026-07-10T10:01:00+08:00",
+        )
+    )
+    assert breadth_quality_ignores_unrelated_board_hold["passed"] is True
+    assert (
+        breadth_quality_ignores_unrelated_board_hold[
+            "overview_structure_alignment_status"
+        ]
+        == "quality_hold"
+    )
+    weak_breadth_candidate = {
+        "symbol": "600002",
+        "change_pct": 1.2,
+        "price_above_average_pct": 0.4,
+        "preselection_lanes": ["continuation"],
+    }
+    breadth_dependent_lanes = market_app.candidate_research_lane_evidence(
+        weak_breadth_candidate,
+        context,
+        [],
+        False,
+        False,
+    )
+    assert (
+        breadth_dependent_lanes["relative_resilience_in_weak_breadth"]["observed"]
+        is False
+    )
+    assert (
+        "market_breadth_time_quality_hold"
+        in breadth_dependent_lanes["relative_resilience_in_weak_breadth"][
+            "failed_conditions"
+        ]
+    )
+    assert breadth_dependent_lanes["continuation"]["observed"] is False
+    assert lanes["controlled_pullback"]["observed"] is True
+
+    _, future_rejections = market_app.candidate_history_gate(
+        {**context, "latest_trade_date": "2026-07-13"},
+        [20, 60],
+        0.0,
+        "2026-07-10T15:00:00+08:00",
+    )
+    assert "history_after_market_snapshot" in future_rejections
+
+    _, missing_time_rejections = market_app.candidate_history_gate(
+        context, [20, 60], 0.0, None
+    )
+    assert "alignment_unavailable" in missing_time_rejections
+
+    _, after_close_rejections = market_app.candidate_history_gate(
+        context,
+        [20, 60],
+        0.0,
+        "2026-07-10T15:06:00+08:00",
+    )
+    assert "history_stale_after_session_close" in after_close_rejections
+
+    _, effective_close_time_rejections = market_app.candidate_history_gate(
+        {**context, "latest_trade_date": "2026-07-09"},
+        [20, 60],
+        0.0,
+        "2026-07-10T15:00:00+08:00",
+        "2026-07-10T15:06:00+08:00",
+    )
+    assert "history_stale_after_session_close" in effective_close_time_rejections
+
+    before_scope = market_app.historical_context_cache_scope(
+        market_app.datetime(2026, 7, 10, 15, 4, tzinfo=market_app.MARKET_TIMEZONE)
+    )
+    after_scope = market_app.historical_context_cache_scope(
+        market_app.datetime(2026, 7, 10, 15, 5, tzinfo=market_app.MARKET_TIMEZONE)
+    )
+    next_day_scope = market_app.historical_context_cache_scope(
+        market_app.datetime(2026, 7, 11, 10, 0, tzinfo=market_app.MARKET_TIMEZONE)
+    )
+    assert before_scope != after_scope
+    assert before_scope["completion_phase"] == "before_1505"
+    assert after_scope["completion_phase"] == "after_1505"
+    assert next_day_scope["trade_date"] == "2026-07-11"
+
+    snapshot_alignment = market_app.current_snapshot_time_alignment(
+        "2026-07-10T10:00:00+08:00",
+        {
+            "continuation_filter": {"market_time": "2026-07-10T10:01:00+08:00"},
+            "controlled_pullback_filter": {"market_time": "2026-07-09T15:00:00+08:00"},
+        },
+    )
+    assert snapshot_alignment["status"] == "quality_hold"
+
+    selected = market_app.round_robin_candidate_preselection(
+        {
+            "continuation": [
+                {"symbol": "1", "turnover": 300},
+                {"symbol": "2", "turnover": 200},
+            ],
+            "controlled_pullback": [
+                {"symbol": "3", "turnover": 100},
+            ],
+            "early_repair": [
+                {"symbol": "4", "turnover": 50},
+            ],
+        },
+        3,
+    )
+    assert [item["symbol"] for item in selected] == ["1", "3", "4"]
+
+
+def test_history_sensitive_outer_caches_include_completion_scope() -> None:
+    original_run_cached_tool = market_app.run_cached_tool
+    captured: dict[str, dict] = {}
+    try:
+
+        def capture(
+            tool_name: str, parameters: dict, *_args: object, **_kwargs: object
+        ):
+            captured[tool_name] = parameters
+            return {"ok": True}
+
+        market_app.run_cached_tool = capture
+        market_app.get_a_share_historical_context("600519")
+        market_app.screen_a_share_research_candidates()
+        for tool_name in (
+            "get_a_share_historical_context",
+            "screen_a_share_research_candidates",
+        ):
+            scope = captured[tool_name]["_history_cache_scope"]
+            assert scope["trade_date"]
+            assert scope["completion_phase"] in {"before_1505", "after_1505"}
+    finally:
+        market_app.run_cached_tool = original_run_cached_tool
+
+
+def test_candidate_screen_does_not_promote_an_untimestamped_descriptive_snapshot() -> (
+    None
+):
+    original_overview = market_app.get_market_overview_data
+    original_snapshot = market_app.get_cached_all_market_quote_snapshot
+    original_history = market_app.get_cached_historical_context_data
+    original_stale_check = market_app.is_market_time_stale
+    history_calls: list[str] = []
+    try:
+        market_app.is_market_time_stale = lambda *_args, **_kwargs: False
+        market_app.get_market_overview_data = lambda _limit: {
+            "market_activity_facts": {
+                "rise_count": 600,
+                "fall_count": 500,
+                "rise_to_fall_ratio": 1.2,
+            },
+            "market_time": "2026-07-10T10:00:00+08:00",
+            "current_market_structure": {
+                "temporal_alignment": {
+                    "status": "aligned",
+                    "component_market_times": {
+                        "market_overview": "2026-07-10T10:00:00+08:00",
+                        "market_breadth": "2026-07-10T10:00:00+08:00",
+                    },
+                }
+            },
+            "component_status": {"market_breadth": {"status": "live"}},
+            "source": ["test_overview"],
+        }
+        market_app.get_cached_all_market_quote_snapshot = lambda: {
+            "rows": [
+                {
+                    "symbol": "600001",
+                    "name": "Untimestamped Row",
+                    "price": 10.5,
+                    "change_pct": 1.0,
+                    "volume": 1_000_000,
+                    "turnover": 1_000_000_000,
+                    "turnover_rate": 3.0,
+                    "total_market_value": 10_000_000_000,
+                    "market_time": None,
+                }
+            ],
+            "market_time": None,
+            "source": ["sina_all_a_share_snapshot"],
+            "source_errors": ["source timestamp unavailable"],
+            "data_status": "partial_data",
+        }
+        market_app.get_cached_historical_context_data = lambda symbol: (
+            history_calls.append(symbol)
+        )
+        result = market_app.screen_a_share_research_candidates_data(
+            0.5,
+            6.0,
+            500_000_000,
+            2.0,
+            100_000_000_000,
+            5,
+            8,
+            0.5,
+            [20, 60],
+            0.0,
+            "raw",
+        )
+        assert result["no_candidate"] is True
+        assert result["selection_status"] == (
+            "no_candidate_due_to_current_snapshot_time_quality"
+        )
+        assert result["data_quality"]["current_snapshot_time_alignment"]["status"] == (
+            "quality_hold"
+        )
+        assert history_calls == []
+    finally:
+        market_app.get_market_overview_data = original_overview
+        market_app.get_cached_all_market_quote_snapshot = original_snapshot
+        market_app.get_cached_historical_context_data = original_history
+        market_app.is_market_time_stale = original_stale_check
+
+
+def test_medium_term_index_background_uses_completed_aligned_multi_index_paths() -> (
+    None
+):
+    trading_dates = []
+    cursor = market_app.date(2026, 1, 1)
+    while cursor <= market_app.date(2026, 7, 10):
+        if cursor.weekday() < 5:
+            trading_dates.append(cursor)
+        cursor += market_app.timedelta(days=1)
+    trading_dates = trading_dates[-122:]
+
+    def history(symbol: str, slope: float = 1.0) -> dict:
+        items = [
+            {
+                "date": day.isoformat(),
+                "open": 100 + index * slope,
+                "close": 100 + index * slope,
+                "high": 101 + index * slope,
+                "low": 99 + index * slope,
+            }
+            for index, day in enumerate(trading_dates)
+        ]
+        items.append(
+            {
+                "date": "2026-07-13",
+                "open": 999,
+                "close": 999,
+                "high": 999,
+                "low": 999,
+            }
+        )
+        return {
+            "name": market_app.INDEX_IDENTITY[symbol]["expected_name"],
+            "items": items,
+            "source": "test_index_history",
+            "source_errors": [],
+        }
+
+    histories = {
+        symbol: history(symbol) for symbol in market_app.MEDIUM_TERM_INDEX_PANEL
+    }
+    statuses = {symbol: {"status": "available"} for symbol in histories}
+    intraday = market_app.build_medium_term_index_background(
+        histories,
+        statuses,
+        [],
+        "2026-07-10T14:30:00+08:00",
+    )
+    assert intraday["common_complete_trade_date"] == "2026-07-09"
+    assert intraday["coverage_status"] == "sufficient_balanced_panel"
+    assert intraday["mechanical_path_pattern"] == "positive_across_20_60_120"
+    assert intraday["data_quality"]["future_bar_count"] == 5
+    assert all(item["excluded_current_incomplete_bar"] for item in intraday["panel"])
+    assert all(item["windows"]["120"]["window_complete"] for item in intraday["panel"])
+
+    after_close = market_app.build_medium_term_index_background(
+        histories,
+        statuses,
+        [],
+        "2026-07-10T15:05:00+08:00",
+    )
+    assert after_close["common_complete_trade_date"] == "2026-07-10"
+    assert not any(
+        item["excluded_current_incomplete_bar"] for item in after_close["panel"]
+    )
+
+    lagged_histories = dict(histories)
+    lagged = history("000922")
+    lagged["items"] = [
+        item
+        for item in lagged["items"]
+        if item["date"] not in {"2026-07-10", "2026-07-13"}
+    ]
+    lagged_histories["000922"] = lagged
+    lagged_panel = market_app.build_medium_term_index_background(
+        lagged_histories,
+        statuses,
+        [],
+        "2026-07-10T15:06:00+08:00",
+    )
+    assert "index:000922" in lagged_panel["data_quality"]["excluded_unaligned_indices"]
+    assert lagged_panel["coverage_status"] == "sufficient_balanced_panel"
+
+    insufficient = market_app.build_medium_term_index_background(
+        dict(list(histories.items())[:3]),
+        dict(list(statuses.items())[:3]),
+        [],
+        "2026-07-10T15:05:00+08:00",
+    )
+    assert insufficient["mechanical_path_pattern"] == "insufficient_panel_coverage"
+
+    short_histories = {}
+    for symbol, payload in histories.items():
+        short_histories[symbol] = {
+            **payload,
+            "items": [
+                item for item in payload["items"] if item["date"] <= "2026-07-10"
+            ][-120:],
+        }
+    short_window_panel = market_app.build_medium_term_index_background(
+        short_histories,
+        statuses,
+        [],
+        "2026-07-10T15:05:00+08:00",
+    )
+    assert short_window_panel["window_summary"]["120"]["eligible_index_count"] == 0
+    assert short_window_panel["coverage_status"] == "insufficient_panel_coverage"
 
 
 def test_news_relevance_deduplication_and_source_metadata() -> None:
@@ -2699,15 +3507,33 @@ def test_rotation_overnight_and_event_helpers() -> None:
         "hf_NQ",
         "global_futures",
         [
-            "110", "", "109", "110", "112", "108", "10:00:00", "100", "101",
-            "0", "1", "1", "2026-07-10", "Nasdaq futures",
+            "110",
+            "",
+            "109",
+            "110",
+            "112",
+            "108",
+            "10:00:00",
+            "100",
+            "101",
+            "0",
+            "1",
+            "1",
+            "2026-07-10",
+            "Nasdaq futures",
         ],
     )
     assert parsed is not None
     assert parsed["change_pct"] == 10.0
     assert parsed["market_time"] == "2026-07-10T10:00:00+08:00"
-    assert market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["price_unit"] == "US_cent_per_pound"
-    assert market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["contract_size"] == 25_000
+    assert (
+        market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["price_unit"]
+        == "US_cent_per_pound"
+    )
+    assert (
+        market_app.OVERNIGHT_INSTRUMENT_METADATA["comex_copper"]["contract_size"]
+        == 25_000
+    )
 
     bars = [
         {"date": "2026-07-10", "close": 100},
@@ -2721,7 +3547,10 @@ def test_rotation_overnight_and_event_helpers() -> None:
     assert feedback["return_after_1_session_pct"] == 1.0
     assert feedback["return_after_3_sessions_pct"] == 6.0
     assert feedback["return_after_5_sessions_pct"] == 10.0
-    assert market_app.event_titles_match("公司回购股份方案", "关于公司回购股份方案的公告") is True
+    assert (
+        market_app.event_titles_match("公司回购股份方案", "关于公司回购股份方案的公告")
+        is True
+    )
 
     capital_records = market_app.capital_activity_timeline_records(
         {
@@ -2742,13 +3571,23 @@ def test_rotation_overnight_and_event_helpers() -> None:
     nearby = market_app.nearby_capital_activity("2026-07-10", capital_records)
     assert len(nearby) == 2
     assert {item["calendar_days_from_event"] for item in nearby} == {-1, 3}
-    assert all(item["relationship_status"] == "temporal_proximity_only_not_causation" for item in nearby)
+    assert all(
+        item["relationship_status"] == "temporal_proximity_only_not_causation"
+        for item in nearby
+    )
 
     original_json = market_app.read_public_json
+
     def sector_json(url: str, *args, **kwargs) -> dict:
         if "7.push2his" not in url:
             raise market_app.HTTPException(status_code=502, detail="test node failure")
-        return {"data": {"name": "Test board", "klines": ["2026-07-20,100,101,102,99,10,1000,3,1,1,2"]}}
+        return {
+            "data": {
+                "name": "Test board",
+                "klines": ["2026-07-20,100,101,102,99,10,1000,3,1,1,2"],
+            }
+        }
+
     market_app.read_public_json = sector_json
     try:
         sector_history = market_app.get_eastmoney_generic_daily_kline("90.BK0001", 30)
@@ -2782,7 +3621,9 @@ def test_rotation_overnight_and_event_helpers() -> None:
         market_app.cache_key("swsresearch_recent_level2_history", {"limit": 30}), None
     )
     try:
-        sws_history = market_app.get_swsresearch_industry_daily_kline("Planting\u2161", 30)
+        sws_history = market_app.get_swsresearch_industry_daily_kline(
+            "Planting\u2161", 30
+        )
     finally:
         market_app.read_swsresearch_json = original_sws_json
     assert sws_history["provider_identifier"] == "801016"
@@ -2836,9 +3677,23 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         {
             "Datas": {
                 "fundStocks": (
-                    [{"GPDM": "600050", "GPJC": "China Unicom", "JZBL": "8", "TEXCH": "1"}]
+                    [
+                        {
+                            "GPDM": "600050",
+                            "GPJC": "China Unicom",
+                            "JZBL": "8",
+                            "TEXCH": "1",
+                        }
+                    ]
                     if code == "515050"
-                    else [{"GPDM": "600519", "GPJC": "Direct holding", "JZBL": "0.2", "TEXCH": "1"}]
+                    else [
+                        {
+                            "GPDM": "600519",
+                            "GPJC": "Direct holding",
+                            "JZBL": "0.2",
+                            "TEXCH": "1",
+                        }
+                    ]
                 ),
                 **(
                     {"ETFCODE": "515050", "ETFSHORTNAME": "Communication ETF"}
@@ -2869,7 +3724,10 @@ def test_fund_and_portfolio_exposure_calculations() -> None:
         assert feeder["underlying_fund_weight_pct"] == 92.7
         assert feeder["top_holdings_reported_weight_pct"] == 0.2
         assert feeder["look_through_holdings"][0]["symbol"] == "600050"
-        assert feeder["look_through_holdings"][0]["underlying_fund_holding_weight_pct"] == 8
+        assert (
+            feeder["look_through_holdings"][0]["underlying_fund_holding_weight_pct"]
+            == 8
+        )
         assert feeder["look_through_holdings"][0]["weight_pct"] == 7.416
     finally:
         market_app.get_eastmoney_fund_component = original_component
@@ -2988,7 +3846,10 @@ def test_market_cross_checks_preserve_coexisting_signals() -> None:
 
     assert checks["breadth_counts"]["fall_to_rise_ratio"] == 9.0
     assert checks["primary_index_equal_weight_change_pct"] == -1.2
-    assert checks["relationship_status"] == "broad_weakness_and_relative_resilience_coexist"
+    assert (
+        checks["relationship_status"]
+        == "broad_weakness_and_relative_resilience_coexist"
+    )
     assert checks["coexisting_signals"] == [
         "falling_stocks_outnumber_rising_stocks",
         "returned_industry_boards_outperform_primary_index_equal_weight_change",
@@ -3000,7 +3861,10 @@ def test_market_cross_checks_preserve_coexisting_signals() -> None:
     assert checks["missing_inputs"] == []
 
     incomplete = market_app.build_market_cross_checks([], [], None)
-    assert incomplete["relationship_status"] == "coexistence_not_observed_in_returned_snapshot"
+    assert (
+        incomplete["relationship_status"]
+        == "coexistence_not_observed_in_returned_snapshot"
+    )
     assert incomplete["missing_inputs"] == [
         "market_breadth",
         "primary_index_changes",
@@ -3054,13 +3918,14 @@ def test_ipo_subscription_status_contract() -> None:
 
     market_app.read_public_json = fake_ipo_json
     try:
-        result = market_app.get_ipo_subscription_status_data(
-            "301707", 30, 7, 10, "raw"
-        )
+        result = market_app.get_ipo_subscription_status_data("301707", 30, 7, 10, "raw")
         item = result["items"][0]
         assert item["subscription_code"] == "301707"
         assert item["eligibility_rules"]["exchange"] == "SZSE"
-        assert item["eligibility_rules"]["required_permission"] == "chinext_trading_permission"
+        assert (
+            item["eligibility_rules"]["required_permission"]
+            == "chinext_trading_permission"
+        )
         assert "szse.cn" in item["eligibility_rules"]["official_rule_url"]
         assert item["maximum_subscription_market_value_requirement_cny"] == 55000
         assert item["pending_fields"] == ["issue_price", "listing_date"]
@@ -3192,7 +4057,9 @@ def test_ipo_subscription_status_contract() -> None:
         )
         assert bse["market"] == "北京证券交易所"
         assert bse["subscription_unit_shares"] == 100
-        assert bse["eligibility_rules"]["subscription_method"] == "full_cash_subscription"
+        assert (
+            bse["eligibility_rules"]["subscription_method"] == "full_cash_subscription"
+        )
         assert bse["maximum_subscription_market_value_requirement_cny"] is None
         assert bse["maximum_subscription_cash_cny"] == 19136250.0
 
@@ -3212,17 +4079,22 @@ def test_ipo_subscription_status_contract() -> None:
         sse_rules = market_app.ipo_market_rules(
             {"SECURITY_CODE": "603407", "MARKET": "涓婁氦鎵€涓绘澘"}
         )
-        assert "sse.com.cn/lawandrules/sselawsrules2025" in sse_rules["official_rule_url"]
+        assert (
+            "sse.com.cn/lawandrules/sselawsrules2025" in sse_rules["official_rule_url"]
+        )
 
         today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
-        assert market_app.ipo_subscription_stage(
-            {
-                "APPLY_DATE": (today - market_app.timedelta(days=2)).isoformat(),
-                "BALLOT_PAY_DATE": today.isoformat(),
-                "LISTING_DATE": (today + market_app.timedelta(days=5)).isoformat(),
-            },
-            today.isoformat(),
-        ) == "ballot_result_and_payment_today"
+        assert (
+            market_app.ipo_subscription_stage(
+                {
+                    "APPLY_DATE": (today - market_app.timedelta(days=2)).isoformat(),
+                    "BALLOT_PAY_DATE": today.isoformat(),
+                    "LISTING_DATE": (today + market_app.timedelta(days=5)).isoformat(),
+                },
+                today.isoformat(),
+            )
+            == "ballot_result_and_payment_today"
+        )
 
         try:
             market_app.normalize_ipo_query('301707")')
@@ -3236,43 +4108,99 @@ def test_ipo_subscription_status_contract() -> None:
 
 
 def test_trading_calendar_and_capital_activity_contracts() -> None:
-    calendar = market_app.get_a_share_trading_calendar_data("2026-02-13", "2026-02-25", "raw")
+    calendar = market_app.get_a_share_trading_calendar_data(
+        "2026-02-13", "2026-02-25", "raw"
+    )
     by_date = {item["date"]: item for item in calendar["items"]}
     assert by_date["2026-02-16"]["session_type"] == "closed_official_holiday"
     assert by_date["2026-02-24"]["is_trading_day"] is True
-    assert market_app.market_status_at(market_app.datetime(2026, 2, 16, 10, 0,
-        tzinfo=market_app.MARKET_TIMEZONE)) == "closed"
-    assert market_app.get_a_share_trading_calendar_data("2027-01-04", "2027-01-04", "summary")["data_status"] == "partial_data"
+    assert (
+        market_app.market_status_at(
+            market_app.datetime(2026, 2, 16, 10, 0, tzinfo=market_app.MARKET_TIMEZONE)
+        )
+        == "closed"
+    )
+    assert (
+        market_app.get_a_share_trading_calendar_data(
+            "2027-01-04", "2027-01-04", "summary"
+        )["data_status"]
+        == "partial_data"
+    )
     original = market_app.get_eastmoney_datacenter_rows
+    today = market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
+    recent_date = (today - market_app.timedelta(days=2)).isoformat()
+    holder_date = (today - market_app.timedelta(days=20)).isoformat()
+
     def rows(report, row_filter, sort, page_size=20):
         if report == "RPT_DAILYBILLBOARD_DETAILSNEW":
-            return [{"TRADE_DATE": "2026-07-20", "BILLBOARD_NET_AMT": 20}]
-        if report in {"RPT_BILLBOARD_DAILYDETAILSBUY", "RPT_BILLBOARD_DAILYDETAILSSELL"}:
-            return [{"OPERATEDEPT_CODE": "0", "OPERATEDEPT_NAME": "机构专用", "BUY": 60, "SELL": 40, "NET": 20}]
+            return [{"TRADE_DATE": recent_date, "BILLBOARD_NET_AMT": 20}]
+        if report in {
+            "RPT_BILLBOARD_DAILYDETAILSBUY",
+            "RPT_BILLBOARD_DAILYDETAILSSELL",
+        }:
+            return [
+                {
+                    "OPERATEDEPT_CODE": "0",
+                    "OPERATEDEPT_NAME": "机构专用",
+                    "BUY": 60,
+                    "SELL": 40,
+                    "NET": 20,
+                }
+            ]
         if report == "RPT_DATA_BLOCKTRADE":
-            return [{"TRADE_DATE": "2026-07-19", "DEAL_PRICE": 101, "CLOSE_PRICE": 100, "DEAL_AMT": 500,
-                     "BUYER_CODE": "0", "BUYER_NAME": "机构专用", "SELLER_CODE": "1"}]
+            return [
+                {
+                    "TRADE_DATE": recent_date,
+                    "DEAL_PRICE": 101,
+                    "CLOSE_PRICE": 100,
+                    "DEAL_AMT": 500,
+                    "BUYER_CODE": "0",
+                    "BUYER_NAME": "机构专用",
+                    "SELLER_CODE": "1",
+                }
+            ]
         if report == "RPT_ORG_SURVEYNEW":
-            return [{"NOTICE_DATE": "2026-07-18", "SUM": 12}]
+            return [{"NOTICE_DATE": recent_date, "SUM": 12}]
         if report == "RPTA_WEB_RZRQ_GGMX":
-            return [{"DATE": "2026-07-21", "RZYE": 1000}]
+            return [{"DATE": recent_date, "RZYE": 1000}]
         if report == "RPT_HOLDERNUMLATEST":
-            return [{"END_DATE": "2026-06-30", "HOLDER_NUM": 100}]
+            return [{"END_DATE": holder_date, "HOLDER_NUM": 100}]
         raise AssertionError(report)
+
     market_app.get_eastmoney_datacenter_rows = rows
     try:
         result = market_app.get_a_share_capital_activity_data("600519", 90, 10, "raw")
     finally:
         market_app.get_eastmoney_datacenter_rows = original
     assert result["data_status"] == "full_data"
-    assert result["components"]["dragon_tiger"]["latest_institution_net_amount_cny"] == 20
+    assert (
+        result["components"]["dragon_tiger"]["latest_institution_net_amount_cny"] == 20
+    )
     assert result["components"]["block_trades"]["institution_buy_amount_cny"] == 500
-    assert result["components"]["block_trades"]["items"][0]["premium_discount_pct"] == 1.0
-    assert result["historical_comparisons"]["block_trades"]["institution_buy_amount_cny"]["recent_total"] == 500
+    assert (
+        result["components"]["block_trades"]["items"][0]["premium_discount_pct"] == 1.0
+    )
+    assert (
+        result["historical_comparisons"]["block_trades"]["institution_buy_amount_cny"][
+            "recent_total"
+        ]
+        == 500
+    )
     comparison = market_app.dated_window_totals(
         [
-            {"date": market_app.datetime.now(market_app.MARKET_TIMEZONE).date().isoformat(), "amount": 20},
-            {"date": (market_app.datetime.now(market_app.MARKET_TIMEZONE).date() - market_app.timedelta(days=31)).isoformat(), "amount": 10},
+            {
+                "date": market_app.datetime.now(market_app.MARKET_TIMEZONE)
+                .date()
+                .isoformat(),
+                "amount": 20,
+            },
+            {
+                "date": (
+                    market_app.datetime.now(market_app.MARKET_TIMEZONE).date()
+                    - market_app.timedelta(days=31)
+                ).isoformat(),
+                "amount": 10,
+            },
         ],
         "date",
         ("amount",),
@@ -3319,7 +4247,9 @@ def main() -> None:
     market_app.get_intraday_data = fake_get_intraday_data
     market_app.get_auction_data = fake_get_auction_data
     market_app.filter_a_share_securities_data = fake_filter_a_share_securities_data
-    market_app.screen_a_share_research_candidates_data = fake_screen_a_share_research_candidates_data
+    market_app.screen_a_share_research_candidates_data = (
+        fake_screen_a_share_research_candidates_data
+    )
     market_app.get_fund_flow_data = fake_get_fund_flow_data
     market_app.get_financial_data = fake_get_financial_data
     market_app.get_fund_exposure_data = fake_get_fund_exposure_data
@@ -3339,8 +4269,12 @@ def main() -> None:
     market_app.get_sector_rotation_data = fake_get_sector_rotation_data
     market_app.get_overnight_risk_packet_data = fake_get_overnight_risk_packet_data
     market_app.get_ipo_subscription_status_data = fake_get_ipo_subscription_status_data
-    market_app.get_a_share_trading_calendar_data = fake_get_a_share_trading_calendar_data
-    market_app.get_a_share_capital_activity_data = fake_get_a_share_capital_activity_data
+    market_app.get_a_share_trading_calendar_data = (
+        fake_get_a_share_trading_calendar_data
+    )
+    market_app.get_a_share_capital_activity_data = (
+        fake_get_a_share_capital_activity_data
+    )
     headers = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
@@ -3349,7 +4283,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "market_path_structure_v12"
+        assert health.json()["routing_revision"] == "dynamic_market_evidence_v13"
 
         for legacy_path in (
             "/search?keyword=600000",
@@ -3419,14 +4353,21 @@ def main() -> None:
             "get_market_data_health",
         }
         registered_by_name = {tool["name"]: tool for tool in registered_tools}
-        filter_properties = registered_by_name["filter_a_share_securities"]["inputSchema"]["properties"]
+        filter_properties = registered_by_name["filter_a_share_securities"][
+            "inputSchema"
+        ]["properties"]
         assert filter_properties["security_type"]["enum"] == ["stock", "a_share"]
         assert "percentage points" in filter_properties["change_pct_min"]["description"]
         assert "CNY yuan" in filter_properties["turnover_min"]["description"]
-        assert "volume-weighted average" in filter_properties["above_average_price"]["description"]
+        assert (
+            "volume-weighted average"
+            in filter_properties["above_average_price"]["description"]
+        )
         assert filter_properties["limit"]["minimum"] == 1
         assert filter_properties["limit"]["maximum"] == 200
-        assert all(tool["annotations"]["readOnlyHint"] is True for tool in registered_tools)
+        assert all(
+            tool["annotations"]["readOnlyHint"] is True for tool in registered_tools
+        )
 
         search = client.post(
             "/mcp",
@@ -3520,7 +4461,11 @@ def main() -> None:
             ),
             (29, "get_ipo_subscription_status", {"symbol_or_name": "301707"}),
             (30, "screen_a_share_research_candidates", {}),
-            (31, "get_a_share_trading_calendar", {"start_date": "2026-07-20", "end_date": "2026-07-24"}),
+            (
+                31,
+                "get_a_share_trading_calendar",
+                {"start_date": "2026-07-20", "end_date": "2026-07-24"},
+            ),
             (32, "get_a_share_capital_activity", {"symbol": "600519"}),
         ):
             response = client.post(
@@ -3539,7 +4484,9 @@ def main() -> None:
             assert "cache_hit" in content
             assert "data" in content
 
-    assert market_app.format_market_time("20260710150146") == "2026-07-10T15:01:46+08:00"
+    assert (
+        market_app.format_market_time("20260710150146") == "2026-07-10T15:01:46+08:00"
+    )
 
     print("MCP handshake, tool discovery, and read-only market-tool tests passed.")
 

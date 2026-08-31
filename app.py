@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "market_path_structure_v12"
+ROUTING_REVISION = "dynamic_market_evidence_v13"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -101,7 +101,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.15.0",
+    version="0.16.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -301,8 +301,16 @@ INDEX_SECID_BY_SYMBOL = {
     "899050": "0.899050",
 }
 INDEX_IDENTITY = {
-    "000001": {"expected_name": "SSE Composite", "exchange": "SSE", "index_role": "primary"},
-    "399001": {"expected_name": "Shenzhen Component", "exchange": "SZSE", "index_role": "primary"},
+    "000001": {
+        "expected_name": "SSE Composite",
+        "exchange": "SSE",
+        "index_role": "primary",
+    },
+    "399001": {
+        "expected_name": "Shenzhen Component",
+        "exchange": "SZSE",
+        "index_role": "primary",
+    },
     "399006": {"expected_name": "ChiNext", "exchange": "SZSE", "index_role": "primary"},
     "000688": {"expected_name": "STAR 50", "exchange": "SSE", "index_role": "style"},
     "000300": {"expected_name": "CSI 300", "exchange": "SSE", "index_role": "style"},
@@ -310,7 +318,11 @@ INDEX_IDENTITY = {
     "399852": {"expected_name": "CSI 1000", "exchange": "SZSE", "index_role": "style"},
     "932000": {"expected_name": "CSI 2000", "exchange": "SSE", "index_role": "style"},
     "000016": {"expected_name": "SSE 50", "exchange": "SSE", "index_role": "style"},
-    "000922": {"expected_name": "CSI Dividend", "exchange": "SSE", "index_role": "style"},
+    "000922": {
+        "expected_name": "CSI Dividend",
+        "exchange": "SSE",
+        "index_role": "style",
+    },
 }
 SECTOR_TYPE_CONFIG = {
     "industry": "m:90+t:2",
@@ -323,17 +335,21 @@ A_SHARE_CALENDAR_SOURCES = {
 }
 A_SHARE_CALENDAR_REVISION = "sse_2026_schedule_published_2025-12-22"
 A_SHARE_2026_HOLIDAYS = {
-    date(2026, 1, 1): "New Year's Day", date(2026, 1, 2): "New Year's Day",
+    date(2026, 1, 1): "New Year's Day",
+    date(2026, 1, 2): "New Year's Day",
     **{date(2026, 2, day): "Spring Festival" for day in range(16, 24)},
     date(2026, 4, 6): "Qingming Festival",
     **{date(2026, 5, day): "Labour Day" for day in range(1, 6)},
-    date(2026, 6, 19): "Dragon Boat Festival", date(2026, 9, 25): "Mid-Autumn Festival",
+    date(2026, 6, 19): "Dragon Boat Festival",
+    date(2026, 9, 25): "Mid-Autumn Festival",
     **{date(2026, 10, day): "National Day" for day in range(1, 8)},
 }
 A_SHARE_SUPPORTED_CALENDAR_YEARS = {2026}
 
 SYMBOL_PATTERN = re.compile(r"^\d{6}$")
-INDUSTRY_LEVEL_PATTERN = re.compile(r"^(?P<industry_name>.+?)(?P<industry_level>[ⅠⅡⅢ])$")
+INDUSTRY_LEVEL_PATTERN = re.compile(
+    r"^(?P<industry_name>.+?)(?P<industry_level>[ⅠⅡⅢ])$"
+)
 INDUSTRY_LEVEL_RANK = {"Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3}
 
 # These codes are listed on the Shanghai and Shenzhen exchanges rather than being
@@ -355,7 +371,20 @@ ETF_PREFIXES = (
     "588",
     "159",
 )
-LOF_PREFIXES = ("501", "502", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169")
+LOF_PREFIXES = (
+    "501",
+    "502",
+    "160",
+    "161",
+    "162",
+    "163",
+    "164",
+    "165",
+    "166",
+    "167",
+    "168",
+    "169",
+)
 
 TOOL_CACHE: dict[str, dict[str, Any]] = {}
 TOOL_CACHE_LOCK = Lock()
@@ -453,7 +482,9 @@ def batch_security_metadata(identifier: Any) -> dict[str, str]:
                     "get_a_share_market_overview."
                 ),
             )
-        exchange = "BSE" if symbol == "899050" else "SZSE" if secid.startswith("0.") else "SSE"
+        exchange = (
+            "BSE" if symbol == "899050" else "SZSE" if secid.startswith("0.") else "SSE"
+        )
         return {
             "identifier": raw_identifier,
             "symbol": symbol,
@@ -464,7 +495,11 @@ def batch_security_metadata(identifier: Any) -> dict[str, str]:
         }
 
     security = security_metadata(raw_identifier)
-    return {"identifier": raw_identifier, **security, "eastmoney_secid": eastmoney_secid(raw_identifier)}
+    return {
+        "identifier": raw_identifier,
+        **security,
+        "eastmoney_secid": eastmoney_secid(raw_identifier),
+    }
 
 
 def enrich_index_identity(index: dict[str, Any]) -> dict[str, Any]:
@@ -650,7 +685,9 @@ def source_name_from_url(url: str) -> str:
     return "public_market_source"
 
 
-def record_source_health(source: str, success: bool, latency_ms: int, error: str | None = None) -> None:
+def record_source_health(
+    source: str, success: bool, latency_ms: int, error: str | None = None
+) -> None:
     now = now_iso()
     with SOURCE_HEALTH_LOCK:
         state = SOURCE_HEALTH.setdefault(
@@ -751,7 +788,12 @@ def classify_error_type(message: Any, status_code: int | None = None) -> str:
     text = str(message).lower()
     if status_code == 404 or "not found" in text or "not_found" in text:
         return "not_found"
-    if status_code == 400 or "must be" in text or "invalid" in text or "required" in text:
+    if (
+        status_code == 400
+        or "must be" in text
+        or "invalid" in text
+        or "required" in text
+    ):
         return "invalid_symbol"
     if "timeout" in text or "timed out" in text or "exceeded" in text:
         return "timeout"
@@ -769,7 +811,8 @@ def race_public_sources(
 ) -> tuple[Any, str, list[str]]:
     """Return the first successful independent source without serial failure delay."""
     futures = {
-        PUBLIC_SOURCE_EXECUTOR.submit(getter): source for source, getter in source_getters
+        PUBLIC_SOURCE_EXECUTOR.submit(getter): source
+        for source, getter in source_getters
     }
     pending = set(futures)
     errors: list[str] = []
@@ -780,7 +823,9 @@ def race_public_sources(
         remaining = deadline - perf_counter()
         if remaining <= 0:
             break
-        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        completed, pending = wait(
+            pending, timeout=remaining, return_when=FIRST_COMPLETED
+        )
         if not completed:
             break
         for future in sorted(completed, key=lambda item: source_order[futures[item]]):
@@ -795,9 +840,13 @@ def race_public_sources(
                 status_codes.append(502)
     for future in pending:
         future.cancel()
-        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        errors.append(
+            f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget"
+        )
         status_codes.append(502)
-    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    status_code = (
+        404 if status_codes and all(code == 404 for code in status_codes) else 502
+    )
     raise HTTPException(
         status_code=status_code,
         detail="; ".join(errors) or "All public market sources are unavailable.",
@@ -826,10 +875,14 @@ def prefer_primary_public_source(
         remaining = deadline - perf_counter()
         if remaining <= 0:
             break
-        completed, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+        completed, pending = wait(
+            pending, timeout=remaining, return_when=FIRST_COMPLETED
+        )
         if not completed:
             break
-        for future in sorted(completed, key=lambda item: futures[item] != primary_source):
+        for future in sorted(
+            completed, key=lambda item: futures[item] != primary_source
+        ):
             source = futures[future]
             try:
                 payload = future.result()
@@ -848,11 +901,7 @@ def prefer_primary_public_source(
             if degradation_route
             else source_is_temporarily_degraded(primary_source)
         )
-        if (
-            fallback_payload is not None
-            and primary_pending
-            and route_degraded
-        ):
+        if fallback_payload is not None and primary_pending and route_degraded:
             for future in pending:
                 if futures[future] == primary_source:
                     future.cancel()
@@ -864,14 +913,19 @@ def prefer_primary_public_source(
             return fallback_payload, fallback_source, errors
     for future in pending:
         future.cancel()
-        errors.append(f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget")
+        errors.append(
+            f"{futures[future]}: request exceeded the {timeout_seconds:g} second budget"
+        )
         status_codes.append(502)
     if fallback_payload is not None:
         return fallback_payload, fallback_source, errors
-    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    status_code = (
+        404 if status_codes and all(code == 404 for code in status_codes) else 502
+    )
     raise HTTPException(
         status_code=status_code,
-        detail="; ".join(errors) or "Both preferred and fallback sources are unavailable.",
+        detail="; ".join(errors)
+        or "Both preferred and fallback sources are unavailable.",
     )
 
 
@@ -896,7 +950,9 @@ def normalize_source_errors(value: Any) -> list[dict[str, str]]:
             normalized.append(
                 {
                     "source": str(item.get("source") or "public_market_source"),
-                    "error_type": str(item.get("error_type") or classify_error_type(message)),
+                    "error_type": str(
+                        item.get("error_type") or classify_error_type(message)
+                    ),
                     "message": message,
                 }
             )
@@ -932,7 +988,11 @@ def staleness_basis_for(
     if is_stale:
         return "current_session_freshness_window"
     if parsed is not None:
-        if market_status not in {"open", "lunch_break"} and parsed.hour == 15 and parsed.minute == 0:
+        if (
+            market_status not in {"open", "lunch_break"}
+            and parsed.hour == 15
+            and parsed.minute == 0
+        ):
             return "completed_session_final"
         if market_status in {"open", "lunch_break"} and parsed.date() == now.date():
             return "current_session_observation"
@@ -1041,12 +1101,24 @@ def format_market_time(value: Any) -> str | None:
         return None
     text = str(value).strip()
     if re.fullmatch(r"\d{14}", text):
-        return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=MARKET_TIMEZONE).isoformat()
+        return (
+            datetime.strptime(text, "%Y%m%d%H%M%S")
+            .replace(tzinfo=MARKET_TIMEZONE)
+            .isoformat()
+        )
     if re.fullmatch(r"\d{8}", text):
-        return datetime.strptime(text, "%Y%m%d").replace(tzinfo=MARKET_TIMEZONE).isoformat()
+        return (
+            datetime.strptime(text, "%Y%m%d")
+            .replace(tzinfo=MARKET_TIMEZONE)
+            .isoformat()
+        )
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(text, pattern).replace(tzinfo=MARKET_TIMEZONE).isoformat()
+            return (
+                datetime.strptime(text, pattern)
+                .replace(tzinfo=MARKET_TIMEZONE)
+                .isoformat()
+            )
         except ValueError:
             pass
     return text
@@ -1054,7 +1126,11 @@ def format_market_time(value: Any) -> str | None:
 
 def format_unix_market_time(value: Any) -> str | None:
     try:
-        return datetime.fromtimestamp(float(value), timezone.utc).astimezone(MARKET_TIMEZONE).isoformat()
+        return (
+            datetime.fromtimestamp(float(value), timezone.utc)
+            .astimezone(MARKET_TIMEZONE)
+            .isoformat()
+        )
     except (TypeError, ValueError, OSError):
         return None
 
@@ -1160,7 +1236,9 @@ def read_market_text(url: str, referer: str, timeout: int = 3) -> str:
         record_source_health(source, True, int((perf_counter() - started_at) * 1000))
         return text
     except OSError as exc:
-        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
+        record_source_health(
+            source, False, int((perf_counter() - started_at) * 1000), str(exc)
+        )
         raise
 
 
@@ -1185,12 +1263,19 @@ def read_public_json(
         try:
             with urlopen(request, timeout=timeout) as response:  # nosec B310
                 payload = json.loads(response.read().decode("utf-8"))
-            record_source_health(source, True, int((perf_counter() - started_at) * 1000))
+            record_source_health(
+                source, True, int((perf_counter() - started_at) * 1000)
+            )
             return payload
         except (OSError, URLError, json.JSONDecodeError) as exc:
             errors.append(str(exc))
-            record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
-    raise HTTPException(status_code=502, detail=f"Failed to fetch public market data: {'; '.join(errors)}")
+            record_source_health(
+                source, False, int((perf_counter() - started_at) * 1000), str(exc)
+            )
+    raise HTTPException(
+        status_code=502,
+        detail=f"Failed to fetch public market data: {'; '.join(errors)}",
+    )
 
 
 def read_public_json_pooled(url: str, referer: str) -> Any:
@@ -1204,7 +1289,9 @@ def read_public_json_pooled(url: str, referer: str) -> Any:
         record_source_health(source, True, int((perf_counter() - started_at) * 1000))
         return payload
     except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
-        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
+        record_source_health(
+            source, False, int((perf_counter() - started_at) * 1000), str(exc)
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch public market data: {exc}",
@@ -1273,8 +1360,12 @@ def read_public_jsonp(url: str, referer: str) -> dict[str, Any]:
         record_source_health(source, True, int((perf_counter() - started_at) * 1000))
         return payload
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        record_source_health(source, False, int((perf_counter() - started_at) * 1000), str(exc))
-        raise HTTPException(status_code=502, detail=f"Failed to fetch public market news: {exc}") from exc
+        record_source_health(
+            source, False, int((perf_counter() - started_at) * 1000), str(exc)
+        )
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch public market news: {exc}"
+        ) from exc
 
 
 def read_sina_object(url: str, referer: str) -> dict[str, Any]:
@@ -1282,13 +1373,15 @@ def read_sina_object(url: str, referer: str) -> dict[str, Any]:
         text = read_market_text(url, referer).strip().rstrip(";").strip()
         if text.startswith("(") and text.endswith(")"):
             text = text[1:-1].strip()
-        text = re.sub(r'([,{]\s*)([A-Za-z_]\w*)\s*:', r'\1"\2":', text)
+        text = re.sub(r"([,{]\s*)([A-Za-z_]\w*)\s*:", r'\1"\2":', text)
         payload = json.loads(text)
         if not isinstance(payload, dict):
             raise ValueError("Unexpected Sina object response.")
         return payload
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina market data: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch Sina market data: {exc}"
+        ) from exc
 
 
 def get_tencent_quote(symbol: str) -> dict[str, Any]:
@@ -1296,13 +1389,17 @@ def get_tencent_quote(symbol: str) -> dict[str, Any]:
     try:
         text = read_market_text(url, "https://stockapp.finance.qq.com/")
     except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Tencent quote: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch Tencent quote: {exc}"
+        ) from exc
 
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Tencent quote format.")
     parts = text.split('"', 2)[1].split("~")
     if len(parts) < 47 or not parts[1]:
-        raise HTTPException(status_code=404, detail=f"Stock not found from Tencent: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Stock not found from Tencent: {symbol}"
+        )
 
     return {
         "symbol": clean_value(parts[2]),
@@ -1331,13 +1428,17 @@ def get_sina_quote(symbol: str) -> dict[str, Any]:
     try:
         text = read_market_text(url, "https://finance.sina.com.cn/")
     except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina quote: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch Sina quote: {exc}"
+        ) from exc
 
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Sina quote format.")
     parts = text.split('"', 2)[1].split(",")
     if len(parts) < 32 or not parts[0]:
-        raise HTTPException(status_code=404, detail=f"Stock not found from Sina: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Stock not found from Sina: {symbol}"
+        )
 
     price = to_number(parts[3])
     previous_close = to_number(parts[2])
@@ -1373,7 +1474,9 @@ def get_eastmoney_quote(symbol: str) -> dict[str, Any]:
 
     data = payload.get("data")
     if not data:
-        raise HTTPException(status_code=404, detail=f"Stock not found from Eastmoney: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Stock not found from Eastmoney: {symbol}"
+        )
 
     return {
         "symbol": clean_value(data.get("f57")),
@@ -1464,7 +1567,9 @@ def search_tencent_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
     try:
         text = read_market_text(url, "https://stockapp.finance.qq.com/")
     except OSError as exc:
-        raise HTTPException(status_code=502, detail="Tencent stock search is unavailable.") from exc
+        raise HTTPException(
+            status_code=502, detail="Tencent stock search is unavailable."
+        ) from exc
 
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Tencent search format.")
@@ -1504,7 +1609,9 @@ def search_sina_stock(keyword: str, limit: int) -> list[dict[str, Any]]:
     try:
         text = read_market_text(url, "https://finance.sina.com.cn/")
     except OSError as exc:
-        raise HTTPException(status_code=502, detail="Sina stock search is unavailable.") from exc
+        raise HTTPException(
+            status_code=502, detail="Sina stock search is unavailable."
+        ) from exc
 
     if '"' not in text:
         raise HTTPException(status_code=502, detail="Unexpected Sina search format.")
@@ -1592,13 +1699,21 @@ def get_quote_data(symbol: str) -> dict[str, Any]:
     }
 
 
-def normalize_batch_symbols(symbols: Any) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+def normalize_batch_symbols(
+    symbols: Any,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     if not isinstance(symbols, list):
-        raise HTTPException(status_code=400, detail="symbols must be a JSON array of up to 20 codes.")
+        raise HTTPException(
+            status_code=400, detail="symbols must be a JSON array of up to 20 codes."
+        )
     if not symbols:
-        raise HTTPException(status_code=400, detail="symbols must contain at least one code.")
+        raise HTTPException(
+            status_code=400, detail="symbols must contain at least one code."
+        )
     if len(symbols) > 20:
-        raise HTTPException(status_code=400, detail="symbols supports at most 20 codes per request.")
+        raise HTTPException(
+            status_code=400, detail="symbols supports at most 20 codes per request."
+        )
 
     securities: list[dict[str, str]] = []
     errors: list[dict[str, Any]] = []
@@ -1630,7 +1745,9 @@ def normalize_batch_symbols(symbols: Any) -> tuple[list[dict[str, str]], list[di
     return securities, errors
 
 
-def get_eastmoney_batch_quote_rows(securities: list[dict[str, str]]) -> tuple[list[dict[str, Any]], str]:
+def get_eastmoney_batch_quote_rows(
+    securities: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], str]:
     query = urlencode(
         {
             "fltt": 2,
@@ -1672,7 +1789,9 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
     )
     errors: list[str] = []
     executor = ThreadPoolExecutor(max_workers=len(source_getters))
-    futures = {executor.submit(getter, symbol): source for source, getter in source_getters}
+    futures = {
+        executor.submit(getter, symbol): source for source, getter in source_getters
+    }
     pending = set(futures)
     try:
         deadline = perf_counter() + 6
@@ -1706,7 +1825,9 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
     )
 
 
-def batch_quote_from_eastmoney_row(row: dict[str, Any], security: dict[str, str]) -> dict[str, Any]:
+def batch_quote_from_eastmoney_row(
+    row: dict[str, Any], security: dict[str, str]
+) -> dict[str, Any]:
     volume = to_number(row.get("f5"))
     source_updated_at = format_unix_market_time(row.get("f124"))
     timestamps = derive_quote_timestamps(source_updated_at)
@@ -1781,7 +1902,9 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
                     }
                 )
 
-    market_times = sorted(item["market_time"] for item in results if item.get("market_time"))
+    market_times = sorted(
+        item["market_time"] for item in results if item.get("market_time")
+    )
     source_update_times = sorted(
         item["source_updated_at"] for item in results if item.get("source_updated_at")
     )
@@ -1795,7 +1918,9 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         "source_errors": source_errors,
         "market_time": market_times[-1] if market_times else None,
         "market_time_range": (
-            {"earliest": market_times[0], "latest": market_times[-1]} if market_times else None
+            {"earliest": market_times[0], "latest": market_times[-1]}
+            if market_times
+            else None
         ),
         "effective_market_time": market_times[-1] if market_times else None,
         "source_updated_at": source_update_times[-1] if source_update_times else None,
@@ -1807,7 +1932,11 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         "source_fetch_time": completed_at,
         "tool_queried_at": completed_at,
         "queried_at": completed_at,
-        "data_status": "full_data" if results and not errors else "partial_data" if results else "no_data",
+        "data_status": "full_data"
+        if results and not errors
+        else "partial_data"
+        if results
+        else "no_data",
         "note": "All successful quotes are requested from one public batch snapshot; no investment judgement is generated.",
     }
 
@@ -1838,7 +1967,9 @@ def decode_kline_page_token(page_token: str | None) -> str | None:
         datetime.fromisoformat(before)
         return before
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid K-line page_token.") from exc
+        raise HTTPException(
+            status_code=400, detail="Invalid K-line page_token."
+        ) from exc
 
 
 def filter_and_page_kline_items(
@@ -1900,7 +2031,9 @@ def get_kline_data(
     start_date = parse_iso_date_parameter(start_date, "start_date")
     end_date = parse_iso_date_parameter(end_date, "end_date")
     if start_date and end_date and start_date > end_date:
-        raise HTTPException(status_code=400, detail="start_date must not be after end_date.")
+        raise HTTPException(
+            status_code=400, detail="start_date must not be after end_date."
+        )
     if adjust not in KLINE_ADJUSTMENTS:
         raise HTTPException(
             status_code=400, detail="adjust must be none, forward, or backward."
@@ -1956,6 +2089,7 @@ def get_eastmoney_kline(
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
     )
+
     def load_source_payload() -> dict[str, Any]:
         return read_public_json(
             f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}",
@@ -1984,7 +2118,9 @@ def get_eastmoney_kline(
     data = payload.get("data") or {}
     klines = data.get("klines") or []
     if not klines:
-        raise HTTPException(status_code=404, detail=f"Kline data not found from Eastmoney: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Kline data not found from Eastmoney: {symbol}"
+        )
 
     items = []
     for kline in klines:
@@ -2010,13 +2146,17 @@ def get_eastmoney_kline(
             }
         )
     if not items:
-        raise HTTPException(status_code=502, detail=f"Unexpected Eastmoney Kline format: {symbol}")
+        raise HTTPException(
+            status_code=502, detail=f"Unexpected Eastmoney Kline format: {symbol}"
+        )
 
     items, next_page_token, has_more = filter_and_page_kline_items(
         items, limit, start_date, end_date, page_token
     )
     if not items:
-        raise HTTPException(status_code=404, detail=f"Kline data not found in requested range: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Kline data not found in requested range: {symbol}"
+        )
     coverage_status, missing_fields = kline_coverage_status(period, start_date, items)
 
     return {
@@ -2041,21 +2181,18 @@ def get_eastmoney_kline(
     }
 
 
-def get_tencent_minute_adjustment_factors(
-    symbol: str, adjust: str
-) -> dict[str, float]:
+def get_tencent_minute_adjustment_factors(symbol: str, adjust: str) -> dict[str, float]:
     if adjust == "none":
         return {}
     adjustment_code = "qfq" if adjust == "forward" else "hfq"
     market_code = market_symbol(symbol)
-    adjusted_url = (
-        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-        + urlencode({"param": f"{market_code},day,,,640,{adjustment_code}"})
+    adjusted_url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode(
+        {"param": f"{market_code},day,,,640,{adjustment_code}"}
     )
-    raw_url = (
-        "https://ifzq.gtimg.cn/appstock/app/kline/kline?"
-        + urlencode({"param": f"{market_code},day,,,640"})
+    raw_url = "https://ifzq.gtimg.cn/appstock/app/kline/kline?" + urlencode(
+        {"param": f"{market_code},day,,,640"}
     )
+
     def load_factors() -> dict[str, Any]:
         with ThreadPoolExecutor(max_workers=2) as executor:
             adjusted_future = executor.submit(
@@ -2069,7 +2206,9 @@ def get_tencent_minute_adjustment_factors(
         adjusted_rows = (
             (adjusted_payload.get("data") or {}).get(market_code) or {}
         ).get(f"{adjustment_code}day") or []
-        raw_rows = ((raw_payload.get("data") or {}).get(market_code) or {}).get("day") or []
+        raw_rows = ((raw_payload.get("data") or {}).get(market_code) or {}).get(
+            "day"
+        ) or []
         raw_close_by_date = {
             str(row[0]): to_number(row[2])
             for row in raw_rows
@@ -2136,10 +2275,13 @@ def get_tencent_minute_kline(
     )
     payload, _ = source_future.result()
     factors = factors_future.result()
-    rows = ((payload.get("data") or {}).get(market_code) or {}).get(tencent_period) or []
+    rows = ((payload.get("data") or {}).get(market_code) or {}).get(
+        tencent_period
+    ) or []
     if not rows:
         raise HTTPException(
-            status_code=404, detail=f"Minute Kline data not found from Tencent: {symbol}"
+            status_code=404,
+            detail=f"Minute Kline data not found from Tencent: {symbol}",
         )
     items = []
     previous_close = None
@@ -2166,7 +2308,9 @@ def get_tencent_minute_kline(
         adjusted_close = close * factor if close is not None else None
         change_pct = None
         if adjusted_close is not None and previous_close not in (None, 0):
-            change_pct = round((adjusted_close - previous_close) / previous_close * 100, 4)
+            change_pct = round(
+                (adjusted_close - previous_close) / previous_close * 100, 4
+            )
         items.append(
             {
                 "date": item_time,
@@ -2255,7 +2399,10 @@ def get_tencent_kline(
     }
     tencent_period = tencent_periods.get(period)
     if tencent_period is None:
-        raise HTTPException(status_code=502, detail=f"Tencent Kline fallback is unavailable for {period}.")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Tencent Kline fallback is unavailable for {period}.",
+        )
     if adjust != "forward":
         raise HTTPException(
             status_code=502,
@@ -2275,7 +2422,9 @@ def get_tencent_kline(
     data = (payload.get("data") or {}).get(market_symbol(symbol)) or {}
     rows = data.get(f"qfq{tencent_period}") or data.get(tencent_period) or []
     if not rows:
-        raise HTTPException(status_code=404, detail=f"Kline data not found from Tencent: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Kline data not found from Tencent: {symbol}"
+        )
 
     items = []
     previous_close = None
@@ -2303,13 +2452,17 @@ def get_tencent_kline(
         )
         previous_close = close
     if not items:
-        raise HTTPException(status_code=502, detail=f"Unexpected Tencent Kline format: {symbol}")
+        raise HTTPException(
+            status_code=502, detail=f"Unexpected Tencent Kline format: {symbol}"
+        )
 
     items, next_page_token, has_more = filter_and_page_kline_items(
         items, limit, start_date, end_date, page_token
     )
     if not items:
-        raise HTTPException(status_code=404, detail=f"Kline data not found in requested range: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Kline data not found in requested range: {symbol}"
+        )
 
     return {
         "symbol": symbol,
@@ -2349,6 +2502,7 @@ def get_fallback_kline(
         )
         payload["source_errors"] = []
         return payload
+
     def eastmoney_loader() -> dict[str, Any]:
         try:
             payload = get_eastmoney_kline(
@@ -2400,10 +2554,7 @@ def intraday_item_is_trading_minute(item: dict[str, Any]) -> bool:
     if timestamp is None or timestamp.weekday() >= 5:
         return False
     minute = timestamp.hour * 60 + timestamp.minute
-    return (
-        9 * 60 + 30 <= minute <= 11 * 60 + 30
-        or 13 * 60 <= minute <= 15 * 60
-    )
+    return 9 * 60 + 30 <= minute <= 11 * 60 + 30 or 13 * 60 <= minute <= 15 * 60
 
 
 def filter_intraday_trading_items(
@@ -2431,7 +2582,9 @@ def get_eastmoney_intraday(symbol: str, limit: int) -> dict[str, Any]:
     data = payload.get("data") or {}
     trends = data.get("trends") or []
     if not trends:
-        raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Intraday data not found: {symbol}"
+        )
 
     parsed_items = []
     for trend in trends:
@@ -2518,7 +2671,9 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
                 detail=f"Unexpected Tencent intraday date for {symbol}: {trade_date}",
             ) from exc
     if not rows or not trade_date:
-        raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Intraday data not found: {symbol}"
+        )
 
     parsed = []
     raw_count = 0
@@ -2554,7 +2709,9 @@ def get_tencent_intraday(symbol: str, limit: int) -> dict[str, Any]:
         previous_turnover = cumulative_turnover
     items = parsed[-limit:]
     if not items:
-        raise HTTPException(status_code=404, detail=f"Intraday data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Intraday data not found: {symbol}"
+        )
     quote = (stock.get("qt") or {}).get(code) or []
     quote_open = to_number(quote[5]) if len(quote) > 5 else None
     opening_price = quote_open or to_number(parsed[0].get("price"))
@@ -2609,7 +2766,9 @@ def intraday_item_is_unfinished(item_time: Any) -> bool:
 
 def add_intraday_completion_flags(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in items:
-        item["is_current_minute_unfinished"] = intraday_item_is_unfinished(item.get("time"))
+        item["is_current_minute_unfinished"] = intraday_item_is_unfinished(
+            item.get("time")
+        )
     return items
 
 
@@ -2641,8 +2800,12 @@ def intraday_mechanical_indicators(
             return None
         return percentage_change(current, valid_prices[-(minutes + 1)])
 
-    highs = [to_number(item.get("high")) or to_number(item.get("price")) for item in items]
-    lows = [to_number(item.get("low")) or to_number(item.get("price")) for item in items]
+    highs = [
+        to_number(item.get("high")) or to_number(item.get("price")) for item in items
+    ]
+    lows = [
+        to_number(item.get("low")) or to_number(item.get("price")) for item in items
+    ]
     returned_window_high = max(value for value in highs if value is not None)
     returned_window_low = min(value for value in lows if value is not None)
     day_high = session_high if session_high is not None else returned_window_high
@@ -2682,9 +2845,13 @@ def intraday_mechanical_indicators(
             current, first_returned_price
         ),
         "turnover_last_5_reported_minutes": recent_turnover,
-        "turnover_previous_5_reported_minutes": prior_turnover if len(items) >= 10 else None,
+        "turnover_previous_5_reported_minutes": prior_turnover
+        if len(items) >= 10
+        else None,
         "turnover_speed_5m_vs_previous_5m_pct": (
-            percentage_change(recent_turnover, prior_turnover) if len(items) >= 10 else None
+            percentage_change(recent_turnover, prior_turnover)
+            if len(items) >= 10
+            else None
         ),
         "at_intraday_high": current >= max(valid_prices),
         "at_intraday_low": current <= min(valid_prices),
@@ -2736,7 +2903,9 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
         payload["security_type"] = security_metadata(symbol)["security_type"]
         payload["exchange"] = security_metadata(symbol)["exchange"]
         payload["source_errors"] = errors
-        payload["note"] = "Minute facts and mechanical indicators only; no trading or investment judgement is generated."
+        payload["note"] = (
+            "Minute facts and mechanical indicators only; no trading or investment judgement is generated."
+        )
         return payload
 
     executor = ThreadPoolExecutor(max_workers=len(source_getters))
@@ -2777,7 +2946,9 @@ def get_intraday_data(symbol: str, limit: int) -> dict[str, Any]:
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
-    status_code = 404 if status_codes and all(code == 404 for code in status_codes) else 502
+    status_code = (
+        404 if status_codes and all(code == 404 for code in status_codes) else 502
+    )
     raise HTTPException(status_code=status_code, detail="; ".join(errors))
 
 
@@ -2840,6 +3011,7 @@ def filter_a_share_securities_data(
     above_average_price: bool | None,
     market_cap_max: float | None,
     limit: int,
+    market_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_type = security_type.strip().lower()
     if normalized_type not in {"stock", "a_share"}:
@@ -2852,9 +3024,12 @@ def filter_a_share_securities_data(
         and change_pct_max is not None
         and change_pct_min > change_pct_max
     ):
-        raise HTTPException(status_code=400, detail="change_pct_min cannot be greater than change_pct_max.")
+        raise HTTPException(
+            status_code=400,
+            detail="change_pct_min cannot be greater than change_pct_max.",
+        )
 
-    market_snapshot = get_cached_all_market_quote_snapshot()
+    market_snapshot = market_snapshot or get_cached_all_market_quote_snapshot()
     rows = market_snapshot["rows"]
     matched = []
     for row in rows:
@@ -2870,17 +3045,27 @@ def filter_a_share_securities_data(
             continue
         if exclude_st and is_st_security(name):
             continue
-        if change_pct_min is not None and (change_pct is None or change_pct < change_pct_min):
+        if change_pct_min is not None and (
+            change_pct is None or change_pct < change_pct_min
+        ):
             continue
-        if change_pct_max is not None and (change_pct is None or change_pct > change_pct_max):
+        if change_pct_max is not None and (
+            change_pct is None or change_pct > change_pct_max
+        ):
             continue
         if turnover_min is not None and (turnover is None or turnover < turnover_min):
             continue
-        if turnover_rate_min is not None and (turnover_rate is None or turnover_rate < turnover_rate_min):
+        if turnover_rate_min is not None and (
+            turnover_rate is None or turnover_rate < turnover_rate_min
+        ):
             continue
-        if market_cap_max is not None and (market_cap is None or market_cap > market_cap_max):
+        if market_cap_max is not None and (
+            market_cap is None or market_cap > market_cap_max
+        ):
             continue
-        if above_average_price is True and (average_price is None or price <= average_price):
+        if above_average_price is True and (
+            average_price is None or price <= average_price
+        ):
             continue
         matched.append(
             {
@@ -2901,7 +3086,9 @@ def filter_a_share_securities_data(
             }
         )
 
-    market_times = sorted(item["market_time"] for item in matched if item.get("market_time"))
+    market_times = sorted(
+        item["market_time"] for item in matched if item.get("market_time")
+    )
     conditions = {
         "security_type": "stock",
         "exclude_st": exclude_st,
@@ -2921,7 +3108,9 @@ def filter_a_share_securities_data(
         "results": matched[:limit],
         "sort_order": "public_source_change_pct_desc",
         "source": normalize_sources(market_snapshot.get("source")),
-        "market_time": market_times[-1] if market_times else None,
+        "market_time": (
+            market_times[-1] if market_times else market_snapshot.get("market_time")
+        ),
         "source_fetch_time": market_snapshot.get("queried_at"),
         "queried_at": now_iso(),
         "data_status": (
@@ -2941,6 +3130,8 @@ def candidate_history_gate(
     context: dict[str, Any] | None,
     required_windows: list[int],
     minimum_return_pct: float,
+    market_time: str | None = None,
+    assessment_time: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if not context:
         return {}, ["historical_context_unavailable"]
@@ -2970,6 +3161,16 @@ def candidate_history_gate(
             rejections.append(f"history_return_unavailable:{window}")
         elif return_pct < minimum_return_pct:
             rejections.append(f"history_return_below_minimum:{window}")
+    alignment = completed_history_alignment(
+        clean_value(context.get("latest_trade_date")),
+        market_time,
+        assessment_time,
+    )
+    if alignment["status"] not in {
+        "aligned_to_snapshot",
+        "expected_intraday_one_session_lag",
+    }:
+        rejections.append(str(alignment["status"]))
     return {
         "latest_trade_date": context.get("latest_trade_date"),
         "source_sessions": context.get("source_sessions"),
@@ -2982,7 +3183,404 @@ def candidate_history_gate(
         "source": context.get("source"),
         "served_from_stale_cache": context.get("served_from_stale_cache", False),
         "stale_cache_age_seconds": context.get("stale_cache_age_seconds"),
+        "as_of_alignment": alignment,
     }, rejections
+
+
+def completed_history_alignment(
+    latest_trade_date: str | None,
+    market_time: str | None,
+    assessment_time: str | None = None,
+) -> dict[str, Any]:
+    """Check completed daily evidence against the live snapshot without using future bars."""
+    market_time_value = clean_value(market_time)
+    market_date_value = (
+        market_time_value.split("T", 1)[0] if market_time_value else None
+    )
+    assessment_time_value = clean_value(assessment_time) or market_time_value
+    try:
+        latest = date.fromisoformat(str(latest_trade_date))
+        market_clock = datetime.fromisoformat(
+            str(market_time_value).replace("Z", "+00:00")
+        )
+        if market_clock.tzinfo is None:
+            market_clock = market_clock.replace(tzinfo=MARKET_TIMEZONE)
+        market_clock = market_clock.astimezone(MARKET_TIMEZONE)
+        market_date = market_clock.date()
+        market_date_value = market_date.isoformat()
+        assessment_clock = datetime.fromisoformat(
+            str(assessment_time_value).replace("Z", "+00:00")
+        )
+        if assessment_clock.tzinfo is None:
+            assessment_clock = assessment_clock.replace(tzinfo=MARKET_TIMEZONE)
+        assessment_clock = assessment_clock.astimezone(MARKET_TIMEZONE)
+    except (TypeError, ValueError):
+        return {
+            "status": "alignment_unavailable",
+            "latest_trade_date": latest_trade_date,
+            "market_date": market_date_value,
+            "completed_session_gap": None,
+            "assessment_time": assessment_time_value,
+        }
+    if latest > market_date:
+        status = "history_after_market_snapshot"
+        session_gap = None
+    else:
+        session_gap = 0
+        cursor = latest + timedelta(days=1)
+        while cursor <= market_date:
+            confirmed = is_confirmed_a_share_trading_day(cursor)
+            if confirmed is True or (confirmed is None and cursor.weekday() < 5):
+                session_gap += 1
+            cursor += timedelta(days=1)
+        if session_gap == 0:
+            status = "aligned_to_snapshot"
+        elif (
+            session_gap == 1
+            and assessment_clock.date() == market_date
+            and (assessment_clock.hour, assessment_clock.minute) < (15, 5)
+        ):
+            status = "expected_intraday_one_session_lag"
+        elif session_gap == 1:
+            status = "history_stale_after_session_close"
+        else:
+            status = "history_stale_for_market_snapshot"
+    return {
+        "status": status,
+        "latest_trade_date": latest_trade_date,
+        "market_date": market_date_value,
+        "completed_session_gap": session_gap,
+        "assessment_time": assessment_clock.isoformat(),
+        "assessment_phase": (
+            "before_1505"
+            if assessment_clock.date() == market_date
+            and (assessment_clock.hour, assessment_clock.minute) < (15, 5)
+            else "after_1505_or_later_assessment"
+        ),
+        "lookahead_guard": "latest_completed_history_date_must_not_follow_market_snapshot_date",
+    }
+
+
+def current_snapshot_time_alignment(
+    overview_market_time: str | None,
+    filter_payloads: dict[str, dict[str, Any]],
+    maximum_gap_seconds: int = 300,
+    enforce_live_freshness: bool = False,
+) -> dict[str, Any]:
+    component_times = {
+        "market_overview": clean_value(overview_market_time),
+        **{
+            name: clean_value(payload.get("market_time"))
+            for name, payload in filter_payloads.items()
+        },
+    }
+    missing = [name for name, value in component_times.items() if not value]
+    parsed: dict[str, datetime] = {}
+    parse_errors = []
+    for name, value in component_times.items():
+        if not value:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=MARKET_TIMEZONE)
+            parsed[name] = timestamp.astimezone(MARKET_TIMEZONE)
+        except ValueError:
+            parse_errors.append(name)
+    trade_dates = sorted({value.date().isoformat() for value in parsed.values()})
+    timestamps = [value.timestamp() for value in parsed.values()]
+    maximum_observed_gap = (
+        round(max(timestamps) - min(timestamps), 3) if timestamps else None
+    )
+    stale = (
+        [
+            name
+            for name, value in component_times.items()
+            if value and is_market_time_stale(value)
+        ]
+        if enforce_live_freshness
+        else []
+    )
+    aligned = (
+        not missing
+        and not parse_errors
+        and not stale
+        and len(trade_dates) == 1
+        and maximum_observed_gap is not None
+        and maximum_observed_gap <= maximum_gap_seconds
+    )
+    return {
+        "status": "aligned" if aligned else "quality_hold",
+        "component_market_times": component_times,
+        "trade_dates": trade_dates,
+        "maximum_observed_gap_seconds": maximum_observed_gap,
+        "maximum_allowed_gap_seconds": maximum_gap_seconds,
+        "missing_time_components": missing,
+        "unparseable_time_components": parse_errors,
+        "stale_time_components": stale,
+        "live_freshness_enforced": enforce_live_freshness,
+        "boundary": "Only aligned current snapshots may promote a research candidate; descriptive facts remain visible on quality hold.",
+    }
+
+
+def _candidate_turnover_sort(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda item: (
+            -(to_number(item.get("turnover")) or 0),
+            str(item.get("symbol") or ""),
+        ),
+    )
+
+
+def round_robin_candidate_preselection(
+    lane_results: dict[str, list[dict[str, Any]]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Preserve representation across path families without a hidden composite score."""
+    ordered = {
+        name: _candidate_turnover_sort(items) for name, items in lane_results.items()
+    }
+    cursors = {name: 0 for name in ordered}
+    selected: list[dict[str, Any]] = []
+    by_symbol: dict[str, dict[str, Any]] = {}
+    while len(selected) < limit:
+        progressed = False
+        for lane, rows in ordered.items():
+            while cursors[lane] < len(rows):
+                row = rows[cursors[lane]]
+                cursors[lane] += 1
+                symbol = str(row.get("symbol") or "")
+                if not symbol:
+                    continue
+                existing = by_symbol.get(symbol)
+                if existing:
+                    if lane not in existing["preselection_lanes"]:
+                        existing["preselection_lanes"].append(lane)
+                    continue
+                item = {**row, "preselection_lanes": [lane]}
+                by_symbol[symbol] = item
+                selected.append(item)
+                progressed = True
+                break
+            if len(selected) >= limit:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def candidate_research_lane_evidence(
+    candidate: dict[str, Any],
+    context: dict[str, Any] | None,
+    persistence_rejections: list[str],
+    market_gate_passed: bool,
+    market_breadth_quality_passed: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Compare several observable path families; never convert them into an order."""
+    windows = (context or {}).get("windows") or {}
+    path_windows = ((context or {}).get("path_facts") or {}).get("windows") or {}
+    current_change = to_number(candidate.get("change_pct"))
+    above_average = (to_number(candidate.get("price_above_average_pct")) or 0) > 0
+    return_20 = to_number((windows.get("20") or {}).get("return_pct"))
+    return_60 = to_number((windows.get("60") or {}).get("return_pct"))
+    short_returns = [
+        value
+        for key in ("1", "3", "5")
+        if (value := to_number((path_windows.get(key) or {}).get("return_pct")))
+        is not None
+    ]
+    distance_from_20_high = to_number(
+        (windows.get("20") or {}).get("distance_from_high_pct")
+    )
+    history_gate_reasons = list(dict.fromkeys(persistence_rejections))
+
+    def lane(status: bool, reasons: list[str], facts: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "observed": bool(status and not reasons),
+            "failed_conditions": reasons,
+            "facts": facts,
+            "boundary": "Observable research path only; no continuation, reversal, entry, or trade instruction is implied.",
+        }
+
+    continuation_reasons = list(history_gate_reasons)
+    if "continuation" not in candidate.get("preselection_lanes", []):
+        continuation_reasons.append("not_in_caller_continuation_filter")
+    if not market_breadth_quality_passed:
+        continuation_reasons.append("market_breadth_time_quality_hold")
+    if not market_gate_passed:
+        continuation_reasons.append("market_breadth_gate_failed")
+
+    pullback_reasons = list(history_gate_reasons)
+    if return_20 is None or return_20 <= 0:
+        pullback_reasons.append("positive_20_session_path_not_observed")
+    if current_change is None or not (-3.0 <= current_change <= 1.0):
+        pullback_reasons.append("current_change_outside_pullback_observation_band")
+    if distance_from_20_high is None or not (-15.0 <= distance_from_20_high < 0):
+        pullback_reasons.append(
+            "distance_from_20_session_high_outside_observation_band"
+        )
+
+    repair_reasons = list(history_gate_reasons)
+    if return_20 is None or return_20 >= 0:
+        repair_reasons.append("negative_20_session_path_not_observed")
+    if not short_returns or max(short_returns) <= 0:
+        repair_reasons.append("positive_short_completed_path_not_observed")
+    if current_change is None or current_change <= 0:
+        repair_reasons.append("positive_current_snapshot_not_observed")
+
+    resilience_reasons = list(history_gate_reasons)
+    if not market_breadth_quality_passed:
+        resilience_reasons.append("market_breadth_time_quality_hold")
+    elif market_gate_passed:
+        resilience_reasons.append("broad_market_gate_did_not_fail")
+    if current_change is None or current_change <= 0:
+        resilience_reasons.append("positive_relative_snapshot_not_observed")
+    if return_20 is None or return_20 <= 0:
+        resilience_reasons.append("positive_20_session_path_not_observed")
+    if not above_average:
+        resilience_reasons.append("price_not_above_current_session_average")
+
+    return {
+        "continuation": lane(
+            True,
+            list(dict.fromkeys(continuation_reasons)),
+            {
+                "return_20_pct": return_20,
+                "return_60_pct": return_60,
+                "market_gate_passed": market_gate_passed,
+            },
+        ),
+        "controlled_pullback": lane(
+            True,
+            list(dict.fromkeys(pullback_reasons)),
+            {
+                "current_change_pct": current_change,
+                "return_20_pct": return_20,
+                "distance_from_20_session_high_pct": distance_from_20_high,
+            },
+        ),
+        "early_repair": lane(
+            True,
+            list(dict.fromkeys(repair_reasons)),
+            {
+                "current_change_pct": current_change,
+                "return_20_pct": return_20,
+                "short_completed_returns_pct": short_returns,
+            },
+        ),
+        "relative_resilience_in_weak_breadth": lane(
+            True,
+            list(dict.fromkeys(resilience_reasons)),
+            {
+                "current_change_pct": current_change,
+                "return_20_pct": return_20,
+                "price_above_average": above_average,
+            },
+        ),
+    }
+
+
+def compact_research_lane_candidate(
+    item: dict[str, Any], lane_name: str
+) -> dict[str, Any]:
+    persistence = item.get("history_persistence") or {}
+    windows = persistence.get("windows") or {}
+    return {
+        key: item.get(key)
+        for key in (
+            "symbol",
+            "name",
+            "price",
+            "change_pct",
+            "turnover",
+            "turnover_rate",
+            "total_market_value",
+            "price_above_average_pct",
+            "market_time",
+        )
+    } | {
+        "lane_evidence": (item.get("research_lane_evidence") or {}).get(lane_name),
+        "completed_history": {
+            "latest_trade_date": persistence.get("latest_trade_date"),
+            "as_of_alignment": persistence.get("as_of_alignment"),
+            "return_20_pct": (windows.get("20") or {}).get("return_pct"),
+            "return_60_pct": (windows.get("60") or {}).get("return_pct"),
+            "distance_from_20_session_high_pct": (windows.get("20") or {}).get(
+                "distance_from_high_pct"
+            ),
+        },
+    }
+
+
+def primary_research_lane(observed_lanes: list[str]) -> str | None:
+    for lane in (
+        "controlled_pullback",
+        "early_repair",
+        "relative_resilience_in_weak_breadth",
+        "continuation",
+    ):
+        if lane in observed_lanes:
+            return lane
+    return None
+
+
+def market_breadth_promotion_quality(
+    overview: dict[str, Any], assessment_time: str | None = None
+) -> dict[str, Any]:
+    structure = overview.get("current_market_structure") or {}
+    temporal_alignment = structure.get("temporal_alignment") or {}
+    breadth_component_status = (overview.get("component_status") or {}).get(
+        "market_breadth"
+    ) or {}
+    breadth_market_time = clean_value(
+        (temporal_alignment.get("component_market_times") or {}).get("market_breadth")
+    )
+    overview_market_time = clean_value(
+        (temporal_alignment.get("component_market_times") or {}).get("market_overview")
+    ) or clean_value(overview.get("market_time"))
+    breadth_alignment = current_snapshot_time_alignment(
+        overview_market_time,
+        {"market_breadth": {"market_time": breadth_market_time}},
+    )
+    activity = overview.get("market_activity_facts") or {}
+    reasons: list[str] = []
+    if breadth_alignment.get("status") != "aligned":
+        reasons.append("market_breadth_not_temporally_aligned_with_indices")
+    if breadth_component_status.get("status") not in {"live", "fresh_cache"}:
+        reasons.append("market_breadth_component_not_current")
+    if not breadth_market_time:
+        reasons.append("market_breadth_market_time_unavailable")
+    else:
+        try:
+            assessment_clock = datetime.fromisoformat(
+                str(assessment_time or now_iso()).replace("Z", "+00:00")
+            )
+            if assessment_clock.tzinfo is None:
+                assessment_clock = assessment_clock.replace(tzinfo=MARKET_TIMEZONE)
+            else:
+                assessment_clock = assessment_clock.astimezone(MARKET_TIMEZONE)
+        except ValueError:
+            assessment_clock = datetime.now(MARKET_TIMEZONE)
+        if is_market_time_stale(breadth_market_time, assessment_clock):
+            reasons.append("market_breadth_market_time_stale")
+    if activity.get("rise_count") is None or activity.get("fall_count") is None:
+        reasons.append("market_breadth_counts_unavailable")
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "status": "eligible" if not reasons else "quality_hold",
+        "passed": not reasons,
+        "failed_conditions": reasons,
+        "market_time": breadth_market_time,
+        "component_status": breadth_component_status.get("status"),
+        "temporal_alignment_status": breadth_alignment.get("status"),
+        "overview_structure_alignment_status": temporal_alignment.get("status"),
+        "breadth_to_index_alignment": breadth_alignment,
+        "boundary": (
+            "Continuation and weak-breadth relative-resilience lanes may use breadth only when "
+            "its timestamp is aligned with the index snapshot and its component is current."
+        ),
+    }
 
 
 def screen_a_share_research_candidates_data(
@@ -2999,6 +3597,7 @@ def screen_a_share_research_candidates_data(
     detail_level: str,
 ) -> dict[str, Any]:
     started_at = perf_counter()
+    assessment_time = now_iso()
     overview_results, overview_status, overview_errors = collect_components(
         {"market_overview": lambda: get_market_overview_data(10)},
         10,
@@ -3007,6 +3606,9 @@ def screen_a_share_research_candidates_data(
     overview = overview_results.get("market_overview") or {}
     activity = overview.get("market_activity_facts") or {}
     rise_to_fall_ratio = to_number(activity.get("rise_to_fall_ratio"))
+    breadth_promotion_quality = market_breadth_promotion_quality(
+        overview, assessment_time
+    )
     market_gate = {
         "minimum_rise_to_fall_ratio": minimum_market_rise_to_fall_ratio,
         "observed_rise_to_fall_ratio": rise_to_fall_ratio,
@@ -3014,10 +3616,9 @@ def screen_a_share_research_candidates_data(
         "fall_count": activity.get("fall_count"),
         "limit_up_count": activity.get("limit_up_count"),
         "limit_down_count": activity.get("limit_down_count"),
-        "passed": (
-            rise_to_fall_ratio is not None
-            and rise_to_fall_ratio >= minimum_market_rise_to_fall_ratio
-        ),
+        "passed": rise_to_fall_ratio is not None
+        and rise_to_fall_ratio >= minimum_market_rise_to_fall_ratio,
+        "promotion_quality": breadth_promotion_quality,
     }
     screen_conditions = {
         "exclude_st": True,
@@ -3027,16 +3628,36 @@ def screen_a_share_research_candidates_data(
         "turnover_rate_min_pct": turnover_rate_min,
         "above_average_price": True,
         "market_cap_max_cny": market_cap_max,
-        "preselection_sort": "turnover_desc_then_symbol",
+        "preselection_sort": "lane_round_robin_then_turnover_desc_then_symbol",
         "minimum_market_rise_to_fall_ratio": minimum_market_rise_to_fall_ratio,
         "required_positive_history_windows": required_positive_history_windows,
         "minimum_history_return_pct": minimum_history_return_pct,
+        "comparative_path_filters": {
+            "controlled_pullback": {
+                "change_pct_band": [-3.0, 1.0],
+                "above_average_price": None,
+            },
+            "early_repair": {
+                "change_pct_band": [0.2, 4.0],
+                "above_average_price": True,
+            },
+        },
+    }
+    empty_lanes = {
+        name: {"observed_count": 0, "candidates": []}
+        for name in (
+            "continuation",
+            "controlled_pullback",
+            "early_repair",
+            "relative_resilience_in_weak_breadth",
+        )
     }
     if not overview:
         return {
             "selection_status": "no_candidate_due_to_incomplete_base_evidence",
             "no_candidate": True,
             "research_candidates": [],
+            "research_lanes": empty_lanes,
             "preselected_candidates": [],
             "preselected_count": 0,
             "accepted_count": 0,
@@ -3050,52 +3671,79 @@ def screen_a_share_research_candidates_data(
             "latency_ms": int((perf_counter() - started_at) * 1000),
             "note": "No ticker is forced when the market snapshot or candidate universe is unavailable.",
         }
-    if not market_gate["passed"]:
+
+    repair_change_max = 4.0
+    filter_specs = {
+        "continuation_filter": {
+            "change_pct_min": change_pct_min,
+            "change_pct_max": change_pct_max,
+            "above_average_price": True,
+        },
+        "controlled_pullback_filter": {
+            "change_pct_min": -3.0,
+            "change_pct_max": 1.0,
+            "above_average_price": None,
+        },
+        "early_repair_filter": {
+            "change_pct_min": 0.2,
+            "change_pct_max": repair_change_max,
+            "above_average_price": True,
+        },
+    }
+    snapshot_results, snapshot_status, snapshot_errors = collect_components(
+        {"all_market_snapshot": get_cached_all_market_quote_snapshot},
+        12,
+        COMPOSITE_TOOL_EXECUTOR,
+    )
+    shared_market_snapshot = snapshot_results.get("all_market_snapshot")
+    if not shared_market_snapshot:
         return {
-            "selection_status": "no_candidate_due_to_market_breadth_gate",
+            "selection_status": "no_candidate_due_to_incomplete_base_evidence",
             "no_candidate": True,
             "research_candidates": [],
+            "research_lanes": empty_lanes,
             "preselected_candidates": [],
             "preselected_count": 0,
             "accepted_count": 0,
             "market_gate": market_gate,
             "screen_conditions": screen_conditions,
-            "component_status": overview_status,
+            "component_status": {**overview_status, **snapshot_status},
             "source": normalize_sources(overview.get("source")),
-            "source_errors": overview_errors,
-            "missing_fields": [],
-            "data_status": "full_data" if not overview_errors else "partial_data",
+            "source_errors": [*overview_errors, *snapshot_errors],
+            "missing_fields": ["all_market_snapshot"],
+            "data_status": "partial_data",
             "market_time": overview.get("market_time"),
             "queried_at": now_iso(),
             "latency_ms": int((perf_counter() - started_at) * 1000),
-            "note": "The transparent caller-configurable market-breadth gate failed, so no ticker is promoted. This is a mechanical research screen, not a buy/sell decision.",
+            "note": "No ticker is forced when the current all-market universe is unavailable.",
         }
-
+    filter_loaders = {
+        key: lambda spec=spec: filter_a_share_securities_data(
+            security_type="stock",
+            exclude_st=True,
+            change_pct_min=spec["change_pct_min"],
+            change_pct_max=spec["change_pct_max"],
+            turnover_min=turnover_min,
+            turnover_rate_min=turnover_rate_min,
+            above_average_price=spec["above_average_price"],
+            market_cap_max=market_cap_max,
+            limit=200,
+            market_snapshot=shared_market_snapshot,
+        )
+        for key, spec in filter_specs.items()
+    }
     filter_results, filter_status, filter_errors = collect_components(
-        {
-            "all_market_filter": lambda: filter_a_share_securities_data(
-                security_type="stock",
-                exclude_st=True,
-                change_pct_min=change_pct_min,
-                change_pct_max=change_pct_max,
-                turnover_min=turnover_min,
-                turnover_rate_min=turnover_rate_min,
-                above_average_price=True,
-                market_cap_max=market_cap_max,
-                limit=200,
-            )
-        },
-        12,
-        COMPOSITE_TOOL_EXECUTOR,
+        filter_loaders, 12, COMPOSITE_TOOL_EXECUTOR
     )
-    filtered = filter_results.get("all_market_filter") or {}
-    base_status = {**overview_status, **filter_status}
-    base_errors = [*overview_errors, *filter_errors]
-    if not filtered:
+    base_status = {**overview_status, **snapshot_status, **filter_status}
+    base_errors = [*overview_errors, *snapshot_errors, *filter_errors]
+    available_filters = {key: value for key, value in filter_results.items() if value}
+    if not available_filters:
         return {
             "selection_status": "no_candidate_due_to_incomplete_base_evidence",
             "no_candidate": True,
             "research_candidates": [],
+            "research_lanes": empty_lanes,
             "preselected_candidates": [],
             "preselected_count": 0,
             "accepted_count": 0,
@@ -3104,101 +3752,321 @@ def screen_a_share_research_candidates_data(
             "component_status": base_status,
             "source": normalize_sources(overview.get("source")),
             "source_errors": base_errors,
-            "missing_fields": ["all_market_filter"],
+            "missing_fields": list(filter_specs),
             "data_status": "partial_data",
             "market_time": overview.get("market_time"),
             "queried_at": now_iso(),
             "latency_ms": int((perf_counter() - started_at) * 1000),
             "note": "No ticker is forced when the candidate universe is unavailable.",
         }
-    preselected = sorted(
-        filtered.get("results") or [],
-        key=lambda item: (
-            -(to_number(item.get("turnover")) or 0),
-            str(item.get("symbol") or ""),
-        ),
-    )[:history_pool_limit]
 
-    history_loaders = {
-        f"history:{item['symbol']}": lambda item=item: get_cached_historical_context_data(
-            str(item["symbol"])
+    lane_rows = {
+        "continuation": (filter_results.get("continuation_filter") or {}).get("results")
+        or [],
+        "controlled_pullback": (
+            filter_results.get("controlled_pullback_filter") or {}
+        ).get("results")
+        or [],
+        "early_repair": (filter_results.get("early_repair_filter") or {}).get("results")
+        or [],
+    }
+    snapshot_alignment = current_snapshot_time_alignment(
+        overview.get("market_time"),
+        available_filters,
+        enforce_live_freshness=True,
+    )
+    preselected = round_robin_candidate_preselection(lane_rows, history_pool_limit)
+    candidate_snapshot_alignments = {
+        str(item["symbol"]): current_snapshot_time_alignment(
+            overview.get("market_time"),
+            {"candidate_quote": {"market_time": item.get("market_time")}},
+            enforce_live_freshness=True,
         )
         for item in preselected
     }
+    history_loaders = (
+        {
+            f"history:{item['symbol']}": lambda item=item: (
+                get_cached_historical_context_data(str(item["symbol"]))
+            )
+            for item in preselected
+            if candidate_snapshot_alignments[str(item["symbol"])]["status"] == "aligned"
+        }
+        if snapshot_alignment["status"] == "aligned"
+        else {}
+    )
     histories, history_status, history_errors = (
         collect_components(history_loaders, 15, COMPOSITE_TOOL_EXECUTOR)
         if history_loaders
         else ({}, {}, [])
     )
+    market_time = overview.get("market_time")
+    evaluated = []
     accepted = []
+    legacy_continuation_candidates = []
     rejected = []
+    lane_candidates: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in empty_lanes
+    }
     for candidate in preselected:
         symbol = str(candidate["symbol"])
+        candidate_snapshot_alignment = candidate_snapshot_alignments[symbol]
         context = histories.get(f"history:{symbol}")
         persistence, rejection_reasons = candidate_history_gate(
             context,
             required_positive_history_windows,
             minimum_history_return_pct,
+            clean_value(candidate.get("market_time")),
+            assessment_time,
+        )
+        if snapshot_alignment["status"] != "aligned":
+            rejection_reasons.append("current_snapshot_time_alignment_failed")
+        if candidate_snapshot_alignment["status"] != "aligned":
+            rejection_reasons.append("candidate_quote_time_alignment_failed")
+        lane_evidence = candidate_research_lane_evidence(
+            candidate,
+            context,
+            rejection_reasons,
+            bool(market_gate["passed"]),
+            bool(breadth_promotion_quality["passed"]),
+        )
+        observed_lanes = [
+            name for name, evidence in lane_evidence.items() if evidence["observed"]
+        ]
+        primary_lane = primary_research_lane(observed_lanes)
+        dynamic_rejection_reasons = list(
+            dict.fromkeys(
+                reason
+                for evidence in lane_evidence.values()
+                for reason in evidence["failed_conditions"]
+            )
         )
         item = {
             **candidate,
             "history_persistence": persistence,
-            "evidence_gate_passed": not rejection_reasons,
-            "rejection_reasons": rejection_reasons,
+            "candidate_snapshot_time_alignment": candidate_snapshot_alignment,
+            "research_lane_evidence": lane_evidence,
+            "observed_research_lanes": observed_lanes,
+            "primary_lane": primary_lane,
+            "primary_lane_gate_passed": primary_lane is not None,
+            "evidence_gate_passed": primary_lane is not None,
+            "dynamic_evidence_gate_passed": bool(observed_lanes),
+            "rejection_reasons": (
+                []
+                if primary_lane is not None
+                else ["no_dynamic_research_lane_observed", *dynamic_rejection_reasons]
+            ),
+            "legacy_continuation_gate": {
+                "passed": lane_evidence["continuation"]["observed"],
+                "failed_conditions": lane_evidence["continuation"]["failed_conditions"],
+                "scope": "Compatibility audit only; it does not override the primary dynamic research lane.",
+            },
             "research_status": (
                 "advance_to_deeper_research"
-                if not rejection_reasons
+                if observed_lanes
                 else "screen_rejected_or_incomplete"
             ),
         }
-        (accepted if not rejection_reasons else rejected).append(item)
+        evaluated.append(item)
+        for lane_name in observed_lanes:
+            lane_candidates[lane_name].append(item)
+        if observed_lanes:
+            accepted.append(item)
+        else:
+            rejected.append(item)
+        if lane_evidence["continuation"]["observed"]:
+            legacy_continuation_candidates.append(item)
+
     accepted = accepted[:candidate_limit]
+    legacy_continuation_candidates = legacy_continuation_candidates[:candidate_limit]
+    for name in lane_candidates:
+        lane_candidates[name] = _candidate_turnover_sort(lane_candidates[name])[
+            :candidate_limit
+        ]
+    research_lanes = {
+        name: {
+            "observed_count": len(lane_candidates[name]),
+            "candidates": (
+                lane_candidates[name]
+                if detail_level == "raw"
+                else [
+                    compact_research_lane_candidate(item, name)
+                    for item in lane_candidates[name]
+                ]
+            ),
+            "promotion_semantics": ("eligible_for_dynamic_research_candidate_output"),
+        }
+        for name in lane_candidates
+    }
     unavailable_history = any(
         "historical_context_unavailable" in item["rejection_reasons"]
         for item in rejected
     )
-    selection_status = (
-        "research_candidates_available"
-        if accepted
-        else (
-            "no_candidate_due_to_incomplete_history_evidence"
-            if unavailable_history
-            else "no_candidate_due_to_history_gate"
+    history_alignment_failed = any(
+        any(
+            reason
+            in {
+                "alignment_unavailable",
+                "history_after_market_snapshot",
+                "history_stale_after_session_close",
+                "history_stale_for_market_snapshot",
+            }
+            for reason in item["rejection_reasons"]
         )
+        for item in rejected
+    )
+    caller_history_gate_failed = any(
+        any(
+            reason.startswith("history_window_") or reason.startswith("history_return_")
+            for reason in item["rejection_reasons"]
+        )
+        for item in rejected
+    )
+    selection_status = (
+        "research_candidates_available_across_dynamic_paths"
+        if accepted
+        else "no_candidate_due_to_current_snapshot_time_quality"
+        if snapshot_alignment["status"] != "aligned"
+        else "no_candidate_due_to_candidate_quote_time_quality"
+        if preselected
+        and all(
+            alignment["status"] != "aligned"
+            for alignment in candidate_snapshot_alignments.values()
+        )
+        else "no_candidate_due_to_incomplete_history_evidence"
+        if unavailable_history or history_alignment_failed
+        else "no_candidate_due_to_history_gate"
+        if caller_history_gate_failed
+        else "no_candidate_due_to_dynamic_research_evidence"
     )
     all_errors = [*base_errors, *history_errors]
+    alignment_statuses = [
+        ((item.get("history_persistence") or {}).get("as_of_alignment") or {}).get(
+            "status"
+        )
+        for item in evaluated
+    ]
+    history_alignment_complete = all(
+        status in {"aligned_to_snapshot", "expected_intraday_one_session_lag"}
+        for status in alignment_statuses
+    )
+    filter_sources = {
+        source
+        for payload in available_filters.values()
+        for source in normalize_sources(payload.get("source"))
+    }
+    history_sources = {
+        source
+        for context in histories.values()
+        if context
+        for source in normalize_sources(context.get("source"))
+    }
     return {
         "selection_status": selection_status,
         "no_candidate": not accepted,
         "research_candidates": accepted,
+        "legacy_continuation_candidates": legacy_continuation_candidates,
+        "legacy_continuation_gate": {
+            "market_gate_passed": market_gate["passed"],
+            "market_breadth_promotion_quality": breadth_promotion_quality,
+            "accepted_count": len(legacy_continuation_candidates),
+            "scope": "Compatibility audit field; it no longer suppresses independently qualified pullback, repair, or weak-breadth resilience research paths.",
+        },
+        "research_lanes": research_lanes,
         "rejected_candidates": rejected if detail_level == "raw" else rejected[:5],
+        "preselected_candidates": evaluated
+        if detail_level == "raw"
+        else [
+            {
+                "symbol": item.get("symbol"),
+                "name": item.get("name"),
+                "preselection_lanes": item.get("preselection_lanes"),
+                "observed_research_lanes": item.get("observed_research_lanes"),
+            }
+            for item in evaluated
+        ],
         "preselected_count": len(preselected),
         "accepted_count": len(accepted),
         "market_gate": market_gate,
+        "current_market_snapshot_pattern": (
+            (overview.get("current_market_structure") or {}).get("snapshot_pattern")
+        ),
+        "medium_term_index_background": overview.get("medium_term_index_background"),
         "screen_conditions": screen_conditions,
         "component_status": {**base_status, **history_status},
+        "data_quality": {
+            "lookahead_guard": "only_completed_daily_sessions_at_or_before_the_market_snapshot_are_eligible",
+            "aligned_history_count": sum(
+                status in {"aligned_to_snapshot", "expected_intraday_one_session_lag"}
+                for status in alignment_statuses
+            ),
+            "future_history_count": alignment_statuses.count(
+                "history_after_market_snapshot"
+            ),
+            "stale_history_count": sum(
+                status
+                in {
+                    "history_stale_after_session_close",
+                    "history_stale_for_market_snapshot",
+                }
+                for status in alignment_statuses
+            ),
+            "alignment_unavailable_count": alignment_statuses.count(
+                "alignment_unavailable"
+            ),
+            "current_snapshot_time_alignment": snapshot_alignment,
+            "market_breadth_promotion_quality": breadth_promotion_quality,
+            "candidate_quote_time_alignment": {
+                "aligned_count": sum(
+                    alignment["status"] == "aligned"
+                    for alignment in candidate_snapshot_alignments.values()
+                ),
+                "quality_hold_count": sum(
+                    alignment["status"] != "aligned"
+                    for alignment in candidate_snapshot_alignments.values()
+                ),
+                "by_symbol": candidate_snapshot_alignments
+                if detail_level == "raw"
+                else None,
+            },
+            "historical_universe_reconstruction": "unavailable_current_live_universe_only",
+            "replay_boundary": (
+                "This response is not a six-month point-in-time backtest. Historical prices are completed-session facts, "
+                "while market breadth, tradable-universe membership, ST status, and capitalization filters are current snapshots."
+            ),
+        },
         "source": sorted(
             {
                 *normalize_sources(overview.get("source")),
-                *normalize_sources(filtered.get("source")),
-                *[
-                    source
-                    for context in histories.values()
-                    for source in normalize_sources(context.get("source"))
-                ],
+                *filter_sources,
+                *history_sources,
             }
         ),
         "source_errors": all_errors,
         "missing_fields": [
             key
             for key, status in history_status.items()
-            if status.get("status") in {"unavailable", "unavailable_within_response_budget"}
+            if status.get("status")
+            in {"unavailable", "unavailable_within_response_budget"}
         ],
-        "data_status": "full_data" if not all_errors else "partial_data",
-        "market_time": overview.get("market_time") or filtered.get("market_time"),
+        "data_status": (
+            "full_data"
+            if not all_errors
+            and snapshot_alignment["status"] == "aligned"
+            and history_alignment_complete
+            and breadth_promotion_quality["passed"]
+            else "partial_data"
+        ),
+        "market_time": market_time,
         "queried_at": now_iso(),
         "latency_ms": int((perf_counter() - started_at) * 1000),
-        "note": "Candidates passed transparent market, liquidity, and multi-window history gates for deeper research only. They are not recommendations or instructions to trade.",
+        "note": (
+            "Research candidates may come from continuation, controlled-pullback, early-repair, or weak-breadth "
+            "relative-resilience evidence after current-quote and completed-history quality holds. Breadth-dependent "
+            "lanes additionally require breadth to be current and timestamp-aligned with the indices. The legacy "
+            "continuation result remains separately visible for audit compatibility. Every lane is research only and "
+            "never a buy/sell instruction."
+        ),
     }
 
 
@@ -3220,7 +4088,9 @@ def get_eastmoney_fund_flow(symbol: str, limit: int) -> dict[str, Any]:
     data = payload.get("data") or {}
     klines = data.get("klines") or []
     if not klines:
-        raise HTTPException(status_code=404, detail=f"Fund-flow data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Fund-flow data not found: {symbol}"
+        )
 
     items = []
     for kline in klines[-limit:]:
@@ -3273,7 +4143,9 @@ def get_sina_fund_flow(symbol: str, _: int) -> dict[str, Any]:
         quote_future.cancel()
     trade_date = derive_quote_timestamps(quote.get("source_updated_at"))["trade_date"]
     if not payload or not trade_date:
-        raise HTTPException(status_code=404, detail=f"Fund-flow data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Fund-flow data not found: {symbol}"
+        )
     large_in = to_number(payload.get("r0_in"))
     large_out = to_number(payload.get("r0_out"))
     main_net = (
@@ -3351,7 +4223,9 @@ def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
     result = payload.get("result") or {}
     rows = result.get("data") or []
     if not rows:
-        raise HTTPException(status_code=404, detail=f"Financial data not found: {symbol}")
+        raise HTTPException(
+            status_code=404, detail=f"Financial data not found: {symbol}"
+        )
 
     return {
         "symbol": symbol,
@@ -3370,7 +4244,12 @@ def get_financial_data(symbol: str, limit: int) -> dict[str, Any]:
 def strip_html(value: Any) -> str | None:
     if value in (None, ""):
         return None
-    return unescape(re.sub(r"<[^>]+>", "", str(value))).replace("\r", " ").replace("\n", " ").strip()
+    return (
+        unescape(re.sub(r"<[^>]+>", "", str(value)))
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .strip()
+    )
 
 
 ESTABLISHED_NEWS_SOURCE_MARKERS = (
@@ -3497,17 +4376,23 @@ def get_google_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
             raise ValueError("Google News RSS XML exceeded safety limits.")
         # DTD/entity declarations are rejected above before parsing the fixed-host RSS.
         root = ElementTree.fromstring(payload)  # nosec B314
-        record_source_health("google_news", True, int((perf_counter() - started_at) * 1000))
+        record_source_health(
+            "google_news", True, int((perf_counter() - started_at) * 1000)
+        )
     except (OSError, URLError, ValueError, ElementTree.ParseError) as exc:
         record_source_health(
             "google_news", False, int((perf_counter() - started_at) * 1000), str(exc)
         )
-        raise HTTPException(status_code=502, detail=f"Google News RSS unavailable: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Google News RSS unavailable: {exc}"
+        ) from exc
 
     items = []
     for item in root.findall(".//item")[:limit]:
         source_element = item.find("source")
-        publisher = clean_value(source_element.text if source_element is not None else None)
+        publisher = clean_value(
+            source_element.text if source_element is not None else None
+        )
         title = strip_html(item.findtext("title"))
         if title and publisher and title.endswith(f" - {publisher}"):
             title = title[: -(len(str(publisher)) + 3)].strip()
@@ -3572,8 +4457,12 @@ def news_relevance(
     summary = str(item.get("summary") or "")
     title_lower = title.lower()
     combined_lower = f"{title} {summary}".lower()
-    source_text = f"{item.get('source') or ''} {item.get('publisher_homepage') or ''}".lower()
-    if any(marker.lower() in source_text for marker in EXCLUDED_CURRENT_NEWS_SOURCE_MARKERS):
+    source_text = (
+        f"{item.get('source') or ''} {item.get('publisher_homepage') or ''}".lower()
+    )
+    if any(
+        marker.lower() in source_text for marker in EXCLUDED_CURRENT_NEWS_SOURCE_MARKERS
+    ):
         return None, 0, ["excluded_reference_or_academic_source"]
     if any(marker in title for marker in ROUTINE_MARKET_TABLE_TITLE_MARKERS):
         return None, 0, ["excluded_routine_market_snapshot_or_table"]
@@ -3587,9 +4476,7 @@ def news_relevance(
     ):
         return None, 0, ["excluded_company_used_only_as_comparison"]
     name_position = title_lower.find(name_lower) if name_lower else -1
-    late_roundup_mention = (
-        "etf" in title_lower and name_position > 20
-    ) or (
+    late_roundup_mention = ("etf" in title_lower and name_position > 20) or (
         len(title_lower) > 50 and name_position > 30
     )
     if late_roundup_mention:
@@ -3674,7 +4561,10 @@ def get_news_data(
     per_query_limit = min(max(limit * 3, 12), 30)
     with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
         futures = {
-            executor.submit(loader, keyword, per_query_limit): (keyword, loader.__name__)
+            executor.submit(loader, keyword, per_query_limit): (
+                keyword,
+                loader.__name__,
+            )
             for keyword, loader in jobs
         }
         for future in as_completed(futures):
@@ -3683,7 +4573,10 @@ def get_news_data(
             try:
                 rows = future.result()
                 candidates.extend(rows)
-                provider_status[status_key] = {"status": "available", "count": len(rows)}
+                provider_status[status_key] = {
+                    "status": "available",
+                    "count": len(rows),
+                }
             except HTTPException as exc:
                 provider_status[status_key] = {"status": "unavailable", "count": 0}
                 source_errors.append(f"{status_key}: {exc.detail}")
@@ -3697,7 +4590,11 @@ def get_news_data(
             excluded_count += 1
             continue
         scope, score, reasons = news_relevance(
-            item, symbol, str(company_name or "") or None, industry, include_industry_context
+            item,
+            symbol,
+            str(company_name or "") or None,
+            industry,
+            include_industry_context,
         )
         if scope is None:
             excluded_count += 1
@@ -3717,7 +4614,10 @@ def get_news_data(
         key=lambda item: (
             item.get("relevance_score", 0),
             tier_rank.get(str(item.get("source_tier")), 0),
-            (news_datetime(item.get("published_at")) or datetime.min.replace(tzinfo=timezone.utc)).timestamp(),
+            (
+                news_datetime(item.get("published_at"))
+                or datetime.min.replace(tzinfo=timezone.utc)
+            ).timestamp(),
         ),
         reverse=True,
     )
@@ -3730,7 +4630,10 @@ def get_news_data(
         if not title_key:
             excluded_count += 1
             continue
-        if any(SequenceMatcher(None, title_key, existing).ratio() >= 0.86 for existing in title_keys):
+        if any(
+            SequenceMatcher(None, title_key, existing).ratio() >= 0.86
+            for existing in title_keys
+        ):
             duplicate_count += 1
             continue
         title_keys.append(title_key)
@@ -3741,7 +4644,9 @@ def get_news_data(
             item for item in deduplicated if item["relevance_scope"] == "company"
         ]
         industry_items = [
-            item for item in deduplicated if item["relevance_scope"] == "industry_context"
+            item
+            for item in deduplicated
+            if item["relevance_scope"] == "industry_context"
         ]
         industry_slots = min(len(industry_items), max(1, min(2, limit // 4)))
         selected_items = [
@@ -3837,7 +4742,9 @@ def get_sse_announcements(
         timeout=5,
         attempts=1,
     )
-    groups = payload.get("result") or ((payload.get("pageHelp") or {}).get("data")) or []
+    groups = (
+        payload.get("result") or ((payload.get("pageHelp") or {}).get("data")) or []
+    )
     items: list[dict[str, Any]] = []
     for group in groups:
         rows = group if isinstance(group, list) else [group]
@@ -3931,7 +4838,11 @@ def get_announcement_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
             "queried_at": now_iso(),
             "note": "No third-party announcement source is substituted for the blocked official BSE route.",
         }
-    loader = get_sse_announcements if security["exchange"] == "SSE" else get_szse_announcements
+    loader = (
+        get_sse_announcements
+        if security["exchange"] == "SSE"
+        else get_szse_announcements
+    )
     items = loader(symbol, start.isoformat(), end.isoformat(), limit)
     return {
         "symbol": symbol,
@@ -3958,7 +4869,11 @@ def event_timeline_date(value: Any) -> str | None:
     if not match:
         return None
     try:
-        return datetime.strptime(match.group(0).replace("/", "-"), "%Y-%m-%d").date().isoformat()
+        return (
+            datetime.strptime(match.group(0).replace("/", "-"), "%Y-%m-%d")
+            .date()
+            .isoformat()
+        )
     except ValueError:
         return None
 
@@ -3993,9 +4908,17 @@ def event_price_feedback(
     }
     if not disclosure_date or not bars:
         return result
-    dated = [bar for bar in bars if clean_value(bar.get("date")) and to_number(bar.get("close")) is not None]
+    dated = [
+        bar
+        for bar in bars
+        if clean_value(bar.get("date")) and to_number(bar.get("close")) is not None
+    ]
     anchor_index = next(
-        (index for index, bar in enumerate(dated) if str(bar.get("date")) >= disclosure_date),
+        (
+            index
+            for index, bar in enumerate(dated)
+            if str(bar.get("date")) >= disclosure_date
+        ),
         None,
     )
     if anchor_index is None:
@@ -4013,8 +4936,8 @@ def event_price_feedback(
         target_close = to_number(dated[target_index].get("close"))
         if target_close is None:
             continue
-        result[f"return_after_{sessions}_session{'s' if sessions > 1 else ''}_pct"] = round(
-            (target_close / anchor_close - 1) * 100, 4
+        result[f"return_after_{sessions}_session{'s' if sessions > 1 else ''}_pct"] = (
+            round((target_close / anchor_close - 1) * 100, 4)
         )
         available += 1
     result["status"] = "available" if available == 3 else "partial_or_pending"
@@ -4027,38 +4950,70 @@ def capital_activity_timeline_records(payload: dict[str, Any]) -> list[dict[str,
     dragon = components.get("dragon_tiger") or {}
     latest_seat_date = dragon.get("latest_seat_trade_date")
     for item in dragon.get("items") or []:
-        records.append({
-            "activity_type": "dragon_tiger_disclosure",
-            "activity_date": item.get("trade_date"),
-            "scope": "abnormal_trading_day_only",
-            "facts": {
-                "reason": item.get("reason"),
-                "total_buy_amount_cny": item.get("total_buy_amount_cny"),
-                "total_sell_amount_cny": item.get("total_sell_amount_cny"),
-                "total_net_amount_cny": item.get("total_net_amount_cny"),
-                "institution_seats": dragon.get("latest_institution_seats") if item.get("trade_date") == latest_seat_date else None,
-            },
-        })
-    for item in (components.get("block_trades") or {}).get("institution_related_items") or []:
-        records.append({"activity_type": "institution_labelled_block_trade", "activity_date": item.get("trade_date"),
-                        "scope": "disclosed_counterparty_seat_not_ultimate_owner", "facts": item})
+        records.append(
+            {
+                "activity_type": "dragon_tiger_disclosure",
+                "activity_date": item.get("trade_date"),
+                "scope": "abnormal_trading_day_only",
+                "facts": {
+                    "reason": item.get("reason"),
+                    "total_buy_amount_cny": item.get("total_buy_amount_cny"),
+                    "total_sell_amount_cny": item.get("total_sell_amount_cny"),
+                    "total_net_amount_cny": item.get("total_net_amount_cny"),
+                    "institution_seats": dragon.get("latest_institution_seats")
+                    if item.get("trade_date") == latest_seat_date
+                    else None,
+                },
+            }
+        )
+    for item in (components.get("block_trades") or {}).get(
+        "institution_related_items"
+    ) or []:
+        records.append(
+            {
+                "activity_type": "institution_labelled_block_trade",
+                "activity_date": item.get("trade_date"),
+                "scope": "disclosed_counterparty_seat_not_ultimate_owner",
+                "facts": item,
+            }
+        )
     for item in (components.get("institutional_research") or {}).get("items") or []:
-        records.append({"activity_type": "institutional_research_visit", "activity_date": item.get("research_start_date") or item.get("notice_date"),
-                        "scope": "contact_activity_not_purchase_evidence", "facts": item})
+        records.append(
+            {
+                "activity_type": "institutional_research_visit",
+                "activity_date": item.get("research_start_date")
+                or item.get("notice_date"),
+                "scope": "contact_activity_not_purchase_evidence",
+                "facts": item,
+            }
+        )
     margin_items = (components.get("margin") or {}).get("items") or []
     if margin_items:
-        records.append({"activity_type": "margin_balance_observation", "activity_date": margin_items[0].get("trade_date"),
-                        "scope": "mixed_investor_categories_not_institution_exclusive", "facts": margin_items[0]})
+        records.append(
+            {
+                "activity_type": "margin_balance_observation",
+                "activity_date": margin_items[0].get("trade_date"),
+                "scope": "mixed_investor_categories_not_institution_exclusive",
+                "facts": margin_items[0],
+            }
+        )
     for item in ((components.get("shareholder_count") or {}).get("items") or [])[:2]:
-        records.append({"activity_type": "shareholder_count_disclosure", "activity_date": item.get("period_end"),
-                        "scope": "aggregate_holder_count_not_institution_position", "facts": item})
+        records.append(
+            {
+                "activity_type": "shareholder_count_disclosure",
+                "activity_date": item.get("period_end"),
+                "scope": "aggregate_holder_count_not_institution_position",
+                "facts": item,
+            }
+        )
     records = [item for item in records if item.get("activity_date")]
     records.sort(key=lambda item: str(item.get("activity_date")), reverse=True)
     return records[:40]
 
 
-def nearby_capital_activity(event_date: str | None, records: list[dict[str, Any]],
-                            window_days: int = 3) -> list[dict[str, Any]]:
+def nearby_capital_activity(
+    event_date: str | None, records: list[dict[str, Any]], window_days: int = 3
+) -> list[dict[str, Any]]:
     if not event_date:
         return []
     try:
@@ -4068,13 +5023,20 @@ def nearby_capital_activity(event_date: str | None, records: list[dict[str, Any]
     nearby = []
     for record in records:
         try:
-            activity_date = datetime.fromisoformat(str(record.get("activity_date"))).date()
+            activity_date = datetime.fromisoformat(
+                str(record.get("activity_date"))
+            ).date()
         except ValueError:
             continue
         distance = (activity_date - anchor).days
         if abs(distance) <= window_days:
-            nearby.append({**record, "calendar_days_from_event": distance,
-                           "relationship_status": "temporal_proximity_only_not_causation"})
+            nearby.append(
+                {
+                    **record,
+                    "calendar_days_from_event": distance,
+                    "relationship_status": "temporal_proximity_only_not_causation",
+                }
+            )
     return nearby[:10]
 
 
@@ -4121,18 +5083,28 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
         "capital_activity": lambda: get_cached_component_with_stale(
             cache_key(
                 "get_a_share_capital_activity",
-                {"symbol": symbol, "lookback_days": min(max(days, 30), 365), "limit": 20, "detail_level": "raw"},
+                {
+                    "symbol": symbol,
+                    "lookback_days": min(max(days, 30), 365),
+                    "limit": 20,
+                    "detail_level": "raw",
+                },
             ),
             300,
             86400,
-            lambda: get_a_share_capital_activity_data(symbol, min(max(days, 30), 365), 20, "raw"),
+            lambda: get_a_share_capital_activity_data(
+                symbol, min(max(days, 30), 365), 20, "raw"
+            ),
         ),
     }
     results, component_status, source_errors = collect_components(
         loaders, 10, COMPOSITE_TOOL_EXECUTOR
     )
     if not results.get("official_announcements") and not results.get("news"):
-        raise HTTPException(status_code=502, detail="Both official announcements and news timeline sources failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Both official announcements and news timeline sources failed.",
+        )
 
     candidates: list[dict[str, Any]] = []
     for item in (results.get("official_announcements") or {}).get("items", []):
@@ -4141,9 +5113,13 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
                 "record_type": "official_announcement",
                 "title": clean_value(item.get("title")),
                 "published_at": clean_value(item.get("published_at")),
-                "event_date": event_timeline_date(item.get("event_date") or item.get("published_at")),
-                "event_date_type": item.get("event_date_type") or "announcement_publication_date",
-                "source": clean_value(item.get("official_source")) or "official_exchange_announcement",
+                "event_date": event_timeline_date(
+                    item.get("event_date") or item.get("published_at")
+                ),
+                "event_date_type": item.get("event_date_type")
+                or "announcement_publication_date",
+                "source": clean_value(item.get("official_source"))
+                or "official_exchange_announcement",
                 "source_independence": "official_primary_source",
                 "event_tags": item.get("event_tags") or ["other"],
                 "url": clean_value(item.get("url")),
@@ -4156,9 +5132,12 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
                 "record_type": "media_report",
                 "title": clean_value(item.get("title")),
                 "published_at": clean_value(item.get("published_at")),
-                "event_date": event_timeline_date(item.get("event_date") or item.get("published_at")),
+                "event_date": event_timeline_date(
+                    item.get("event_date") or item.get("published_at")
+                ),
                 "event_date_type": (
-                    item.get("event_date_status") or "media_publication_date_not_verified_event_time"
+                    item.get("event_date_status")
+                    or "media_publication_date_not_verified_event_time"
                 ),
                 "source": clean_value(item.get("source")) or "publisher_not_disclosed",
                 "source_independence": (
@@ -4171,12 +5150,21 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
             }
         )
 
-    candidates.sort(key=lambda item: (str(item.get("event_date") or ""), str(item.get("published_at") or "")))
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("event_date") or ""),
+            str(item.get("published_at") or ""),
+        )
+    )
     clusters: list[dict[str, Any]] = []
     for item in candidates:
         key = event_timeline_title_key(item.get("title"))
         cluster = next(
-            (candidate for candidate in clusters if event_titles_match(key, candidate["title_key"])),
+            (
+                candidate
+                for candidate in clusters
+                if event_titles_match(key, candidate["title_key"])
+            ),
             None,
         )
         if cluster is None:
@@ -4196,17 +5184,24 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
         )
         primary = records[0]
         dates = [str(item["event_date"]) for item in records if item.get("event_date")]
-        source_names = sorted({str(item.get("source")) for item in records if item.get("source")})
+        source_names = sorted(
+            {str(item.get("source")) for item in records if item.get("source")}
+        )
         events.append(
             {
                 "event_title": primary.get("title"),
                 "event_date": min(dates) if dates else None,
                 "event_date_status": (
                     "official_disclosure_date_available"
-                    if any(item["record_type"] == "official_announcement" for item in records)
+                    if any(
+                        item["record_type"] == "official_announcement"
+                        for item in records
+                    )
                     else "media_publication_date_only"
                 ),
-                "event_tags": sorted({tag for item in records for tag in item.get("event_tags", [])}),
+                "event_tags": sorted(
+                    {tag for item in records for tag in item.get("event_tags", [])}
+                ),
                 "record_count": len(records),
                 "source_count": len(source_names),
                 "has_official_primary_source": any(
@@ -4214,20 +5209,30 @@ def get_event_timeline_data(symbol: str, days: int, limit: int) -> dict[str, Any
                 ),
                 "independence_status": (
                     "official_primary_plus_multiple_publishers"
-                    if any(item["record_type"] == "official_announcement" for item in records)
+                    if any(
+                        item["record_type"] == "official_announcement"
+                        for item in records
+                    )
                     and len(source_names) > 1
                     else "official_primary_only"
-                    if any(item["record_type"] == "official_announcement" for item in records)
+                    if any(
+                        item["record_type"] == "official_announcement"
+                        for item in records
+                    )
                     else "multiple_attributed_publishers"
                     if len(source_names) > 1
                     else records[0]["source_independence"]
                 ),
                 "sources": source_names,
                 "records": records,
-                "price_feedback": event_price_feedback(min(dates) if dates else None, bars),
+                "price_feedback": event_price_feedback(
+                    min(dates) if dates else None, bars
+                ),
             }
         )
-    capital_records = capital_activity_timeline_records(results.get("capital_activity") or {})
+    capital_records = capital_activity_timeline_records(
+        results.get("capital_activity") or {}
+    )
     for event in events:
         event["nearby_disclosed_capital_activity"] = nearby_capital_activity(
             event.get("event_date"), capital_records
@@ -4349,7 +5354,9 @@ def historical_window_metrics(
         "requested_sessions": window,
         "available_sessions": len(window_items),
         "window_complete": len(items) >= window + 1,
-        "start_date": clean_value(window_items[0].get("date")) if window_items else None,
+        "start_date": clean_value(window_items[0].get("date"))
+        if window_items
+        else None,
         "end_date": clean_value(latest.get("date")),
         "return_pct": percentage_change(latest_close, comparison_close),
         "annualized_volatility_pct": annualized_volatility_pct(closes),
@@ -4392,8 +5399,7 @@ def historical_path_facts(
 ) -> dict[str, Any]:
     """Describe completed-session price paths without predicting continuation."""
     metrics = {
-        str(window): historical_window_metrics(items, window)
-        for window in windows
+        str(window): historical_window_metrics(items, window) for window in windows
     }
     available_returns = {
         window: to_number(metrics[str(window)].get("return_pct"))
@@ -4432,20 +5438,44 @@ def historical_path_facts(
     }
 
 
+def daily_history_without_future_bars(
+    items: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Remove source rows dated after the local assessment date."""
+    assessment = (now or datetime.now(MARKET_TIMEZONE)).astimezone(MARKET_TIMEZONE)
+    assessment_date = assessment.date()
+    eligible: list[dict[str, Any]] = []
+    future_bar_count = 0
+    for item in items:
+        item_date = clean_value(item.get("date"))
+        try:
+            parsed_date = date.fromisoformat(str(item_date))
+        except (TypeError, ValueError):
+            eligible.append(item)
+            continue
+        if parsed_date > assessment_date:
+            future_bar_count += 1
+            continue
+        eligible.append(item)
+    return eligible, future_bar_count
+
+
 def completed_daily_history(
     items: list[dict[str, Any]],
     now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Exclude today's daily bar until the continuous session has safely closed."""
-    if not items:
-        return items, False
+    """Exclude future bars and today's bar until the session has safely closed."""
     now = (now or datetime.now(MARKET_TIMEZONE)).astimezone(MARKET_TIMEZONE)
-    latest_date = clean_value(items[-1].get("date"))
+    eligible, _ = daily_history_without_future_bars(items, now)
+    if not eligible:
+        return eligible, False
+    latest_date = clean_value(eligible[-1].get("date"))
     if latest_date != now.date().isoformat():
-        return items, False
+        return eligible, False
     trading_day = is_confirmed_a_share_trading_day(now.date())
     session_is_complete = trading_day is not False and (now.hour, now.minute) >= (15, 5)
-    return (items if session_is_complete else items[:-1]), not session_is_complete
+    return (eligible if session_is_complete else eligible[:-1]), not session_is_complete
 
 
 def get_historical_context_data(symbol: str) -> dict[str, Any]:
@@ -4481,10 +5511,23 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
     )
     items = payload["items"]
     if not items:
-        raise HTTPException(status_code=404, detail=f"Historical context not found: {symbol}")
-    latest_observation = items[-1]
+        raise HTTPException(
+            status_code=404, detail=f"Historical context not found: {symbol}"
+        )
+    historical_now = datetime.now(MARKET_TIMEZONE)
+    eligible_observations, future_bar_count = daily_history_without_future_bars(
+        items, historical_now
+    )
+    if not eligible_observations:
+        raise HTTPException(
+            status_code=502,
+            detail="No non-future daily observation is available for historical metrics.",
+        )
+    latest_observation = eligible_observations[-1]
     latest_observation_date = clean_value(latest_observation.get("date"))
-    completed_items, is_incomplete_session = completed_daily_history(items)
+    completed_items, is_incomplete_session = completed_daily_history(
+        eligible_observations, historical_now
+    )
     if not completed_items:
         raise HTTPException(
             status_code=502,
@@ -4513,27 +5556,54 @@ def get_historical_context_data(symbol: str) -> dict[str, Any]:
         "latest_session_may_be_incomplete": is_incomplete_session,
         "excluded_incomplete_session": is_incomplete_session,
         "source_sessions": len(items),
+        "eligible_observation_sessions": len(eligible_observations),
         "complete_sessions_used": len(completed_items),
         "windows": windows,
         "path_facts": path_facts,
+        "data_quality": {
+            "lookahead_guard": "future_and_current_incomplete_daily_bars_excluded_before_metric_calculation",
+            "metrics_end_date": latest_date,
+            "latest_observation_date": latest_observation_date,
+            "future_bar_count": future_bar_count,
+            "future_bar_used": False,
+            "point_in_time_universe_status": "single_security_price_history_only",
+        },
         "source": payload.get("source"),
         "source_errors": payload.get("source_errors", []),
         "queried_at": now_iso(),
         "data_status": (
             "full_data"
-            if all(item["window_complete"] for item in windows.values())
+            if future_bar_count == 0
+            and all(item["window_complete"] for item in windows.values())
             else "partial_data"
         ),
-        "note": "Historical values use completed forward-adjusted daily sessions only. A current-day bar observed before 15:05 Asia/Shanghai is disclosed but excluded from exact return and percentile metrics. Percentiles are not scores or recommendations.",
+        "note": "Historical values use completed forward-adjusted daily sessions only. Future-dated source rows are discarded. A current-day bar observed before 15:05 Asia/Shanghai is disclosed but excluded from exact return and percentile metrics. Percentiles are not scores or recommendations.",
+    }
+
+
+def historical_context_cache_scope(now: datetime | None = None) -> dict[str, str]:
+    cache_now = (now or datetime.now(MARKET_TIMEZONE)).astimezone(MARKET_TIMEZONE)
+    completion_phase = (
+        "after_1505" if (cache_now.hour, cache_now.minute) >= (15, 5) else "before_1505"
+    )
+    return {
+        "trade_date": cache_now.date().isoformat(),
+        "completion_phase": completion_phase,
     }
 
 
 def get_cached_historical_context_data(symbol: str) -> dict[str, Any]:
     normalized_symbol = normalize_symbol(symbol)
+    cache_scope = historical_context_cache_scope()
     return get_cached_component_with_stale(
         cache_key(
             "historical_context_internal",
-            {"symbol": normalized_symbol, "adjust": "forward", "sessions": 260},
+            {
+                "symbol": normalized_symbol,
+                "adjust": "forward",
+                "sessions": 260,
+                **cache_scope,
+            },
         ),
         300,
         604800,
@@ -4771,7 +5841,9 @@ def build_security_status_data(
         "is_st_name_flag": is_st,
         "is_delisting_arrangement_name_flag": "退" in str(name or ""),
         "current_quote_observation": {
-            "status": "quote_available" if quote.get("price") is not None else "unavailable",
+            "status": "quote_available"
+            if quote.get("price") is not None
+            else "unavailable",
             "price": quote.get("price"),
             "trade_date": quote.get("trade_date"),
             "quote_time": quote.get("quote_time"),
@@ -4809,7 +5881,10 @@ def build_security_status_data(
             )
             if source
         ],
-        "source_errors": [*(source_errors or []), *(reference.get("source_errors") or [])],
+        "source_errors": [
+            *(source_errors or []),
+            *(reference.get("source_errors") or []),
+        ],
         "queried_at": now_iso(),
         "data_status": "full_data" if quote_payload and reference else "partial_data",
         "note": "This tool reports observable status facts and standard rule references. It does not infer whether a security should be traded.",
@@ -4828,10 +5903,14 @@ def get_security_status_data(symbol: str) -> dict[str, Any]:
         "security_reference": lambda: get_resilient_security_reference_data(symbol),
     }
     if security["security_type"] not in {"etf", "lof"}:
-        loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 20)
+        loaders["official_announcements"] = lambda: get_announcement_data(
+            symbol, 180, 20
+        )
     results, statuses, errors = collect_components(loaders, 8)
     if not results.get("quote") and not results.get("security_reference"):
-        raise HTTPException(status_code=502, detail="Security status sources were unavailable.")
+        raise HTTPException(
+            status_code=502, detail="Security status sources were unavailable."
+        )
     return build_security_status_data(
         symbol,
         results.get("quote"),
@@ -4921,7 +6000,9 @@ def decision_context_follow_up_tools(
     return recommendations
 
 
-def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict[str, Any]:
+def get_decision_context_data(
+    symbol: str, benchmark_symbol: str | None
+) -> dict[str, Any]:
     started_at = perf_counter()
     started_iso = now_iso()
     symbol = normalize_symbol(symbol)
@@ -4932,12 +6013,16 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
         "intraday": lambda: get_intraday_data(symbol, 60),
         "historical_context": lambda: get_cached_historical_context_data(symbol),
         "security_reference": lambda: get_resilient_security_reference_data(symbol),
-        "relative_strength": lambda: get_relative_strength_data(symbol, benchmark, None),
+        "relative_strength": lambda: get_relative_strength_data(
+            symbol, benchmark, None
+        ),
         "market_overview": lambda: get_market_overview_data(5),
         "news": lambda: get_news_data(symbol, 8, 30, False),
     }
     if security["security_type"] not in {"etf", "lof"}:
-        loaders["official_announcements"] = lambda: get_announcement_data(symbol, 180, 10)
+        loaders["official_announcements"] = lambda: get_announcement_data(
+            symbol, 180, 10
+        )
         loaders["financials"] = lambda: get_financial_data(symbol, 4)
     results, statuses, errors = collect_components(loaders, 12)
     if security["security_type"] in {"etf", "lof"}:
@@ -4960,12 +6045,15 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
             for key in ("quote", "security_reference", "official_announcements")
             if key in statuses
         },
-        [error for error in errors if error["source"] in {"quote", "security_reference", "official_announcements"}],
+        [
+            error
+            for error in errors
+            if error["source"]
+            in {"quote", "security_reference", "official_announcements"}
+        ],
     )
     completed_iso = now_iso()
-    snapshot_id = (
-        f"{symbol}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
-    )
+    snapshot_id = f"{symbol}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
     decision_inputs = {
         "quote": quote_payload,
         "intraday": (
@@ -4991,11 +6079,11 @@ def get_decision_context_data(symbol: str, benchmark_symbol: str | None) -> dict
     recommended_follow_ups = decision_context_follow_up_tools(
         symbol, benchmark, statuses
     )
-    market_cross_checks = (
-        (decision_inputs.get("market_overview") or {}).get("market_cross_checks")
+    market_cross_checks = (decision_inputs.get("market_overview") or {}).get(
+        "market_cross_checks"
     )
-    current_market_structure = (
-        (decision_inputs.get("market_overview") or {}).get("current_market_structure")
+    current_market_structure = (decision_inputs.get("market_overview") or {}).get(
+        "current_market_structure"
     )
     return {
         "snapshot_id": snapshot_id,
@@ -5093,7 +6181,9 @@ def get_relative_strength_data(
         for item in peer_quotes
         if (value := to_number(item.get("change_pct"))) is not None
     ]
-    peer_average = round(sum(peer_changes) / len(peer_changes), 3) if peer_changes else None
+    peer_average = (
+        round(sum(peer_changes) / len(peer_changes), 3) if peer_changes else None
+    )
     relative_to_benchmark = (
         round(target_change - benchmark_change, 3)
         if target_change is not None and benchmark_change is not None
@@ -5282,9 +6372,7 @@ def scan_intraday_anomalies_data(
     return {
         "requested_count": len(symbols),
         "evaluated_count": len([symbol for symbol in symbols if symbol in quotes]),
-        "triggered_count": len(
-            [item for item in results if item["trigger_count"] > 0]
-        ),
+        "triggered_count": len([item for item in results if item["trigger_count"] > 0]),
         "benchmark_identifier": benchmark,
         "benchmark": benchmark_quote,
         "thresholds": {
@@ -5319,24 +6407,28 @@ def get_eastmoney_indices() -> list[dict[str, Any]]:
     )
     index_rows = ((index_payload.get("data") or {}).get("diff")) or []
     if not index_rows:
-        raise HTTPException(status_code=502, detail="Eastmoney returned no major-index rows.")
+        raise HTTPException(
+            status_code=502, detail="Eastmoney returned no major-index rows."
+        )
     return [
-        enrich_index_identity({
-            "symbol": clean_value(row.get("f12")),
-            "name": clean_value(row.get("f14")),
-            "price": to_number(row.get("f2")),
-            "change_pct": to_number(row.get("f3")),
-            "change": to_number(row.get("f4")),
-            "open": to_number(row.get("f17")),
-            "high": to_number(row.get("f15")),
-            "low": to_number(row.get("f16")),
-            "previous_close": to_number(row.get("f18")),
-            "turnover": to_number(row.get("f6")),
-            "source_updated_at": format_unix_market_time(row.get("f124")),
-            "market_time": market_time_from_source_update(
-                format_unix_market_time(row.get("f124"))
-            ),
-        })
+        enrich_index_identity(
+            {
+                "symbol": clean_value(row.get("f12")),
+                "name": clean_value(row.get("f14")),
+                "price": to_number(row.get("f2")),
+                "change_pct": to_number(row.get("f3")),
+                "change": to_number(row.get("f4")),
+                "open": to_number(row.get("f17")),
+                "high": to_number(row.get("f15")),
+                "low": to_number(row.get("f16")),
+                "previous_close": to_number(row.get("f18")),
+                "turnover": to_number(row.get("f6")),
+                "source_updated_at": format_unix_market_time(row.get("f124")),
+                "market_time": market_time_from_source_update(
+                    format_unix_market_time(row.get("f124"))
+                ),
+            }
+        )
         for row in index_rows
     ]
 
@@ -5348,31 +6440,37 @@ def get_tencent_indices() -> list[dict[str, Any]]:
             "https://stockapp.finance.qq.com/",
         )
     except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Tencent indices: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch Tencent indices: {exc}"
+        ) from exc
     indices = []
     for match in re.finditer(r'v_\w+="([^"]*)"', text):
         values = match.group(1).split("~")
         if len(values) < 33:
             continue
         indices.append(
-            enrich_index_identity({
-                "symbol": clean_value(values[2]),
-                "name": clean_value(values[1]),
-                "price": to_number(values[3]),
-                "change_pct": to_number(values[32]),
-                "change": to_number(values[31]),
-                "open": to_number(values[5]),
-                "high": to_number(values[33]) if len(values) > 33 else None,
-                "low": to_number(values[34]) if len(values) > 34 else None,
-                "previous_close": to_number(values[4]),
-                "source_updated_at": format_market_time(values[30]),
-                "market_time": market_time_from_source_update(
-                    format_market_time(values[30])
-                ),
-            })
+            enrich_index_identity(
+                {
+                    "symbol": clean_value(values[2]),
+                    "name": clean_value(values[1]),
+                    "price": to_number(values[3]),
+                    "change_pct": to_number(values[32]),
+                    "change": to_number(values[31]),
+                    "open": to_number(values[5]),
+                    "high": to_number(values[33]) if len(values) > 33 else None,
+                    "low": to_number(values[34]) if len(values) > 34 else None,
+                    "previous_close": to_number(values[4]),
+                    "source_updated_at": format_market_time(values[30]),
+                    "market_time": market_time_from_source_update(
+                        format_market_time(values[30])
+                    ),
+                }
+            )
         )
     if not indices:
-        raise HTTPException(status_code=502, detail="Unexpected Tencent index response.")
+        raise HTTPException(
+            status_code=502, detail="Unexpected Tencent index response."
+        )
     return indices
 
 
@@ -5383,25 +6481,29 @@ def get_sina_indices() -> list[dict[str, Any]]:
             "https://finance.sina.com.cn/",
         )
     except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch Sina indices: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Failed to fetch Sina indices: {exc}"
+        ) from exc
     indices = []
     for match in re.finditer(r'var hq_str_s_(?:sh|sz)(\d+)="([^"]*)";', text):
         values = match.group(2).split(",")
         if len(values) < 4 or not values[0]:
             continue
         indices.append(
-            enrich_index_identity({
-                "symbol": match.group(1),
-                "name": clean_value(values[0]),
-                "price": to_number(values[1]),
-                "change": to_number(values[2]),
-                "change_pct": to_number(values[3]),
-                "open": None,
-                "high": None,
-                "low": None,
-                "previous_close": None,
-                "market_time": None,
-            })
+            enrich_index_identity(
+                {
+                    "symbol": match.group(1),
+                    "name": clean_value(values[0]),
+                    "price": to_number(values[1]),
+                    "change": to_number(values[2]),
+                    "change_pct": to_number(values[3]),
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "previous_close": None,
+                    "market_time": None,
+                }
+            )
         )
     if not indices:
         raise HTTPException(status_code=502, detail="Unexpected Sina index response.")
@@ -5413,9 +6515,13 @@ def _to_int(value: Any) -> int | None:
     return int(number) if number is not None else None
 
 
-def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) -> list[dict[str, Any]]:
+def get_eastmoney_sector_boards(
+    sector_type: str, candidate_limit: int = 500
+) -> list[dict[str, Any]]:
     if sector_type not in SECTOR_TYPE_CONFIG:
-        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
+        raise HTTPException(
+            status_code=400, detail="sector_type must be industry or concept."
+        )
     query = urlencode(
         {
             "pn": 1,
@@ -5439,9 +6545,9 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
             2,
         ): host
         for host in (
-        "push2.eastmoney.com",
-        "push2delay.eastmoney.com",
-        "82.push2.eastmoney.com",
+            "push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+            "82.push2.eastmoney.com",
         )
     }
     for future in as_completed(futures):
@@ -5459,7 +6565,9 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
                 name = clean_value(row.get("f14"))
                 if not name:
                     continue
-                metadata = industry_name_metadata(name) if sector_type == "industry" else {}
+                metadata = (
+                    industry_name_metadata(name) if sector_type == "industry" else {}
+                )
                 rise_count = _to_int(row.get("f104"))
                 fall_count = _to_int(row.get("f105"))
                 leader_symbol = clean_value(row.get("f140"))
@@ -5479,7 +6587,9 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
                         "symbol": clean_value(row.get("f12")),
                         "name": name,
                         "sector_type": sector_type,
-                        "level": INDUSTRY_LEVEL_RANK.get(metadata.get("industry_level")),
+                        "level": INDUSTRY_LEVEL_RANK.get(
+                            metadata.get("industry_level")
+                        ),
                         **metadata,
                         "price": to_number(row.get("f2")),
                         "current": to_number(row.get("f2")),
@@ -5491,7 +6601,9 @@ def get_eastmoney_sector_boards(sector_type: str, candidate_limit: int = 500) ->
                         "flat_count": None,
                         "rise_ratio": (
                             round(rise_count / (rise_count + fall_count), 4)
-                            if rise_count is not None and fall_count is not None and rise_count + fall_count
+                            if rise_count is not None
+                            and fall_count is not None
+                            and rise_count + fall_count
                             else None
                         ),
                         "rise_ratio_scope": "rising_vs_falling_constituents_only; flat count unavailable",
@@ -5562,7 +6674,11 @@ def deduplicate_industry_boards(
 
     return sorted(
         selected.values(),
-        key=lambda item: item.get("change_pct") if item.get("change_pct") is not None else float("-inf"),
+        key=lambda item: (
+            item.get("change_pct")
+            if item.get("change_pct") is not None
+            else float("-inf")
+        ),
         reverse=True,
     )[:limit]
 
@@ -5586,9 +6702,11 @@ def select_industry_level_boards(
             )
             selected.append(item)
         selected.sort(
-            key=lambda item: item.get("change_pct")
-            if item.get("change_pct") is not None
-            else float("-inf"),
+            key=lambda item: (
+                item.get("change_pct")
+                if item.get("change_pct") is not None
+                else float("-inf")
+            ),
             reverse=True,
         )
         return selected, "partial_level_metadata_unlabeled_boards_included"
@@ -5598,11 +6716,17 @@ def select_industry_level_boards(
 def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
     data = get_all_realtime_quotes()
     industry_column = next(
-        (column for column in ("所属行业", "所处行业", "行业") if column in data.columns),
+        (
+            column
+            for column in ("所属行业", "所处行业", "行业")
+            if column in data.columns
+        ),
         None,
     )
     if not industry_column or "涨跌幅" not in data.columns:
-        raise HTTPException(status_code=502, detail="Realtime quotes did not include industry data.")
+        raise HTTPException(
+            status_code=502, detail="Realtime quotes did not include industry data."
+        )
 
     grouped: dict[str, list[float]] = {}
     for _, row in data.iterrows():
@@ -5625,7 +6749,9 @@ def get_calculated_industry_boards(limit: int) -> list[dict[str, Any]]:
     ]
     boards.sort(key=lambda item: item["change_pct"], reverse=True)
     if not boards:
-        raise HTTPException(status_code=502, detail="Realtime quotes produced no industry-board data.")
+        raise HTTPException(
+            status_code=502, detail="Realtime quotes produced no industry-board data."
+        )
     return boards[:limit]
 
 
@@ -5666,14 +6792,21 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
             first_data = first_payload.get("data") or {}
             first_rows = first_data.get("diff") or []
             if not first_rows:
-                raise HTTPException(status_code=502, detail=f"{host} returned no stock rows.")
+                raise HTTPException(
+                    status_code=502, detail=f"{host} returned no stock rows."
+                )
             total = _to_int(first_data.get("total")) or len(first_rows)
             page_count = ceil(total / page_size)
             pages: dict[int, list[dict[str, Any]]] = {1: first_rows}
             if page_count > 1:
-                fallback_hosts = (host, *(candidate for candidate in hosts if candidate != host))
+                fallback_hosts = (
+                    host,
+                    *(candidate for candidate in hosts if candidate != host),
+                )
 
-                def fetch_page_with_fallback(page: int) -> tuple[int, list[dict[str, Any]]]:
+                def fetch_page_with_fallback(
+                    page: int,
+                ) -> tuple[int, list[dict[str, Any]]]:
                     page_errors = []
                     for candidate_host in fallback_hosts:
                         try:
@@ -5737,31 +6870,29 @@ def get_eastmoney_market_quotes() -> list[dict[str, Any]]:
 def load_all_market_quote_snapshot() -> dict[str, Any]:
     source_errors = []
     try:
-        sina = get_sina_market_quotes()
-        rows = sina["rows"]
-        source = ["sina_all_a_share_snapshot"]
-        source_errors.extend(sina.get("source_errors") or [])
-        data_status = (
-            "full_data"
-            if sina.get("coverage_status") == "complete" and not source_errors
-            else "partial_data"
-        )
+        rows = get_eastmoney_market_quotes()
+        source = ["eastmoney_all_a_share_snapshot"]
+        data_status = "full_data"
     except HTTPException as exc:
-        source_errors.append(f"sina_all_a_share_snapshot: {exc.detail}")
+        source_errors.append(f"eastmoney_all_a_share_snapshot: {exc.detail}")
         try:
-            rows = get_eastmoney_market_quotes()
+            sina = get_sina_market_quotes()
+            rows = sina["rows"]
+            source_errors.extend(sina.get("source_errors") or [])
         except HTTPException as fallback_exc:
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    f"{source_errors[0]}; eastmoney_all_a_share_snapshot: "
+                    f"{source_errors[0]}; sina_all_a_share_snapshot: "
                     f"{fallback_exc.detail}"
                 ),
             ) from fallback_exc
-        source = ["eastmoney_all_a_share_snapshot"]
+        source = ["sina_all_a_share_snapshot"]
         data_status = "partial_data"
     if not rows:
-        raise HTTPException(status_code=502, detail="All-market quote snapshot returned no rows.")
+        raise HTTPException(
+            status_code=502, detail="All-market quote snapshot returned no rows."
+        )
     market_times = sorted(row["market_time"] for row in rows if row.get("market_time"))
     return {
         "rows": rows,
@@ -5769,6 +6900,12 @@ def load_all_market_quote_snapshot() -> dict[str, Any]:
         "source": source,
         "source_errors": source_errors,
         "market_time": market_times[-1] if market_times else None,
+        "timestamp_coverage_count": len(market_times),
+        "promotion_time_status": (
+            "source_timestamp_available"
+            if market_times
+            else "descriptive_only_source_timestamp_unavailable"
+        ),
         "queried_at": now_iso(),
         "data_status": data_status,
     }
@@ -5802,7 +6939,9 @@ def get_sina_market_quotes() -> dict[str, Any]:
         ) from exc
     match = re.search(r"\d+", count_text)
     if match is None:
-        raise HTTPException(status_code=502, detail="Unexpected Sina market-count response.")
+        raise HTTPException(
+            status_code=502, detail="Unexpected Sina market-count response."
+        )
 
     expected_count = int(match.group(0))
     page_size = 100
@@ -5833,7 +6972,9 @@ def get_sina_market_quotes() -> dict[str, Any]:
         return page, payload
 
     executor = ThreadPoolExecutor(max_workers=20)
-    futures = {executor.submit(fetch_page, page): page for page in range(1, page_count + 1)}
+    futures = {
+        executor.submit(fetch_page, page): page for page in range(1, page_count + 1)
+    }
     done, pending = wait(futures, timeout=5)
     pages: dict[int, list[dict[str, Any]]] = {}
     errors: list[str] = []
@@ -5847,7 +6988,9 @@ def get_sina_market_quotes() -> dict[str, Any]:
             errors.append(f"sina page {page}: {detail}")
     for future in pending:
         future.cancel()
-        errors.append(f"sina page {futures[future]}: request exceeded the 5 second budget")
+        errors.append(
+            f"sina page {futures[future]}: request exceeded the 5 second budget"
+        )
     executor.shutdown(wait=False, cancel_futures=True)
 
     raw_rows = [row for page in sorted(pages) for row in pages[page]]
@@ -5892,7 +7035,9 @@ def get_sina_market_quotes() -> dict[str, Any]:
         "rows": rows,
         "expected_count": expected_count,
         "returned_count": len(rows),
-        "coverage_status": "complete" if not errors and len(raw_rows) >= expected_count else "partial",
+        "coverage_status": "complete"
+        if not errors and len(raw_rows) >= expected_count
+        else "partial",
         "source_errors": errors,
     }
 
@@ -5984,7 +7129,9 @@ def add_breadth_row(counts: dict[str, Any], row: dict[str, Any]) -> None:
 
 def calculate_market_breadth(rows: list[dict[str, Any]]) -> dict[str, Any]:
     all_market = empty_breadth_counts()
-    by_exchange = {exchange: empty_breadth_counts() for exchange in ("SSE", "SZSE", "BSE")}
+    by_exchange = {
+        exchange: empty_breadth_counts() for exchange in ("SSE", "SZSE", "BSE")
+    }
     for row in rows:
         exchange = exchange_for_symbol(str(row.get("symbol") or ""))
         name = str(row.get("name") or "")
@@ -6007,14 +7154,20 @@ def parse_market_datetime(value: Any) -> datetime | None:
         result = datetime.fromisoformat(str(value))
     except ValueError:
         return None
-    return result.replace(tzinfo=MARKET_TIMEZONE) if result.tzinfo is None else result.astimezone(MARKET_TIMEZONE)
+    return (
+        result.replace(tzinfo=MARKET_TIMEZONE)
+        if result.tzinfo is None
+        else result.astimezone(MARKET_TIMEZONE)
+    )
 
 
 def parse_calendar_date(value: str, field: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"{field} must use YYYY-MM-DD format.") from exc
+        raise HTTPException(
+            status_code=400, detail=f"{field} must use YYYY-MM-DD format."
+        ) from exc
 
 
 def a_share_calendar_day(day: date) -> dict[str, Any]:
@@ -6023,7 +7176,11 @@ def a_share_calendar_day(day: date) -> dict[str, Any]:
     elif day.weekday() >= 5:
         status, kind, closure = False, "closed_weekend", "Weekend"
     elif day in A_SHARE_2026_HOLIDAYS:
-        status, kind, closure = False, "closed_official_holiday", A_SHARE_2026_HOLIDAYS[day]
+        status, kind, closure = (
+            False,
+            "closed_official_holiday",
+            A_SHARE_2026_HOLIDAYS[day],
+        )
     else:
         status, kind, closure = True, "full_day", None
     sessions = []
@@ -6034,8 +7191,14 @@ def a_share_calendar_day(day: date) -> dict[str, Any]:
             {"phase": "continuous_trading", "start": "13:00", "end": "14:57"},
             {"phase": "closing_call_auction", "start": "14:57", "end": "15:00"},
         ]
-    return {"date": day.isoformat(), "weekday": day.strftime("%A"), "is_trading_day": status,
-            "session_type": kind, "closure_name": closure, "sessions": sessions}
+    return {
+        "date": day.isoformat(),
+        "weekday": day.strftime("%A"),
+        "is_trading_day": status,
+        "session_type": kind,
+        "closure_name": closure,
+        "sessions": sessions,
+    }
 
 
 def is_confirmed_a_share_trading_day(day: date) -> bool | None:
@@ -6053,29 +7216,63 @@ def nearest_confirmed_trading_day(day: date, direction: int) -> str | None:
     return None
 
 
-def get_a_share_trading_calendar_data(start_date: str | None, end_date: str | None,
-                                      detail_level: str) -> dict[str, Any]:
+def get_a_share_trading_calendar_data(
+    start_date: str | None, end_date: str | None, detail_level: str
+) -> dict[str, Any]:
     today = datetime.now(MARKET_TIMEZONE).date()
-    start = parse_calendar_date(start_date, "start_date") if start_date else today - timedelta(days=7)
-    end = parse_calendar_date(end_date, "end_date") if end_date else today + timedelta(days=14)
+    start = (
+        parse_calendar_date(start_date, "start_date")
+        if start_date
+        else today - timedelta(days=7)
+    )
+    end = (
+        parse_calendar_date(end_date, "end_date")
+        if end_date
+        else today + timedelta(days=14)
+    )
     if end < start or (end - start).days > 366:
-        raise HTTPException(status_code=400, detail="Calendar range must be ordered and no longer than 366 days.")
-    items = [a_share_calendar_day(start + timedelta(days=i)) for i in range((end - start).days + 1)]
-    unsupported = sorted({int(item["date"][:4]) for item in items if item["is_trading_day"] is None})
+        raise HTTPException(
+            status_code=400,
+            detail="Calendar range must be ordered and no longer than 366 days.",
+        )
+    items = [
+        a_share_calendar_day(start + timedelta(days=i))
+        for i in range((end - start).days + 1)
+    ]
+    unsupported = sorted(
+        {int(item["date"][:4]) for item in items if item["is_trading_day"] is None}
+    )
     if detail_level == "summary":
-        items = [{key: item[key] for key in ("date", "weekday", "is_trading_day", "session_type", "closure_name")}
-                 for item in items]
+        items = [
+            {
+                key: item[key]
+                for key in (
+                    "date",
+                    "weekday",
+                    "is_trading_day",
+                    "session_type",
+                    "closure_name",
+                )
+            }
+            for item in items
+        ]
     return {
-        "start_date": start.isoformat(), "end_date": end.isoformat(),
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
         "calendar_revision": A_SHARE_CALENDAR_REVISION,
-        "supported_years": sorted(A_SHARE_SUPPORTED_CALENDAR_YEARS), "unsupported_years": unsupported,
+        "supported_years": sorted(A_SHARE_SUPPORTED_CALENDAR_YEARS),
+        "unsupported_years": unsupported,
         "trading_day_count": sum(item["is_trading_day"] is True for item in items),
-        "closed_day_count": sum(item["is_trading_day"] is False for item in items), "items": items,
+        "closed_day_count": sum(item["is_trading_day"] is False for item in items),
+        "items": items,
         "previous_trading_day_before_range": nearest_confirmed_trading_day(start, -1),
         "next_trading_day_after_range": nearest_confirmed_trading_day(end, 1),
         "source": ["sse_official_closure_schedule", "sse_official_trading_rules"],
-        "source_urls": A_SHARE_CALENDAR_SOURCES, "source_updated_at": "2025-12-22", "source_errors": [],
-        "data_status": "partial_data" if unsupported else "full_data", "detail_level": detail_level,
+        "source_urls": A_SHARE_CALENDAR_SOURCES,
+        "source_updated_at": "2025-12-22",
+        "source_errors": [],
+        "data_status": "partial_data" if unsupported else "full_data",
+        "detail_level": detail_level,
         "queried_at": now_iso(),
         "note": "Exchange calendar only; it does not establish an individual security suspension. Unsupported years remain unknown.",
     }
@@ -6112,7 +7309,9 @@ def trading_minutes_elapsed(market_time: str | None) -> int | None:
     return 240
 
 
-def market_turnover_summary(rows: list[dict[str, Any]], market_time: str | None) -> dict[str, Any]:
+def market_turnover_summary(
+    rows: list[dict[str, Any]], market_time: str | None
+) -> dict[str, Any]:
     eligible_rows = [
         row
         for row in rows
@@ -6130,8 +7329,16 @@ def market_turnover_summary(rows: list[dict[str, Any]], market_time: str | None)
     }
     current = sum(row["turnover"] for row in eligible_rows)
     elapsed = trading_minutes_elapsed(market_time)
-    estimated = round(current / elapsed * 240, 2) if elapsed and 0 < elapsed < 240 else current if elapsed == 240 else None
-    top_rows = sorted(eligible_rows, key=lambda item: item["turnover"], reverse=True)[:10]
+    estimated = (
+        round(current / elapsed * 240, 2)
+        if elapsed and 0 < elapsed < 240
+        else current
+        if elapsed == 240
+        else None
+    )
+    top_rows = sorted(eligible_rows, key=lambda item: item["turnover"], reverse=True)[
+        :10
+    ]
     return {
         "current": current,
         "unit": "CNY",
@@ -6140,7 +7347,9 @@ def market_turnover_summary(rows: list[dict[str, Any]], market_time: str | None)
         "change_pct": None,
         "comparison_status": "unavailable_without_a_reliable_prior-day_market-wide_intraday_series",
         "estimated_full_day": estimated,
-        "estimated_full_day_status": "mechanical_elapsed-time_extrapolation" if estimated is not None else "unavailable_before_open",
+        "estimated_full_day_status": "mechanical_elapsed-time_extrapolation"
+        if estimated is not None
+        else "unavailable_before_open",
         "by_exchange": by_exchange,
         "top_turnover_securities": [
             {
@@ -6205,7 +7414,9 @@ def fetch_eastmoney_limit_pool(pool_type: str, trade_date: str) -> dict[str, Any
     data = payload.get("data") or {}
     qdate = str(data.get("qdate") or "")
     if not re.fullmatch(r"\d{8}", qdate):
-        raise HTTPException(status_code=404, detail=f"No {pool_type} pool for {trade_date}.")
+        raise HTTPException(
+            status_code=404, detail=f"No {pool_type} pool for {trade_date}."
+        )
     return {
         "pool_type": pool_type,
         "trade_date": qdate,
@@ -6355,7 +7566,9 @@ def get_limit_activity_data(limit: int) -> dict[str, Any]:
         requested_date = candidate.strftime("%Y%m%d")
         executor = ThreadPoolExecutor(max_workers=3)
         futures = {
-            executor.submit(fetch_eastmoney_limit_pool, pool_type, requested_date): pool_type
+            executor.submit(
+                fetch_eastmoney_limit_pool, pool_type, requested_date
+            ): pool_type
             for pool_type in LIMIT_POOL_CONFIG
         }
         pool_results = {}
@@ -6377,7 +7590,8 @@ def get_limit_activity_data(limit: int) -> dict[str, Any]:
     if not pool_results:
         raise HTTPException(
             status_code=502,
-            detail="Eastmoney limit-activity pools unavailable: " + "; ".join(last_errors),
+            detail="Eastmoney limit-activity pools unavailable: "
+            + "; ".join(last_errors),
         )
 
     trade_date = max(result["trade_date"] for result in pool_results.values())
@@ -6393,7 +7607,10 @@ def get_limit_activity_data(limit: int) -> dict[str, Any]:
         ]
 
     parsed["limit_up"].sort(
-        key=lambda item: (item.get("consecutive_limit_up") or 0, item.get("seal_fund") or 0),
+        key=lambda item: (
+            item.get("consecutive_limit_up") or 0,
+            item.get("seal_fund") or 0,
+        ),
         reverse=True,
     )
     parsed["open_board"].sort(
@@ -6421,9 +7638,15 @@ def get_limit_activity_data(limit: int) -> dict[str, Any]:
         "limit_up_items": parsed["limit_up"][:limit],
         "open_board_items": parsed["open_board"][:limit],
         "limit_down_items": parsed["limit_down"][:limit],
-        "source": ["eastmoney_limit_up_pool", "eastmoney_open_board_pool", "eastmoney_limit_down_pool"],
+        "source": [
+            "eastmoney_limit_up_pool",
+            "eastmoney_open_board_pool",
+            "eastmoney_limit_down_pool",
+        ],
         "source_errors": last_errors,
-        "data_status": "full_data" if len(pool_results) == 3 and not last_errors else "partial_data",
+        "data_status": "full_data"
+        if len(pool_results) == 3 and not last_errors
+        else "partial_data",
         "queried_at": now_iso(),
         "note": "Mechanical public limit-pool facts only. Counts, seal rate, and board height are not sentiment labels or trading signals.",
     }
@@ -6438,16 +7661,27 @@ def latest_market_time(indices: list[dict[str, Any]]) -> str | None:
     return max(timestamps) if timestamps else None
 
 
-def is_market_time_stale(
-    market_time: str | None, now: datetime | None = None
-) -> bool:
+def is_market_time_stale(market_time: str | None, now: datetime | None = None) -> bool:
     now = now or datetime.now(MARKET_TIMEZONE)
+    now = (
+        now.replace(tzinfo=MARKET_TIMEZONE)
+        if now.tzinfo is None
+        else now.astimezone(MARKET_TIMEZONE)
+    )
     status = market_status_at(now)
-    if status not in {"open", "lunch_break"}:
-        return False
     source_time = parse_market_datetime(market_time)
     if source_time is None:
         return True
+    if status == "closed":
+        trading_day = is_confirmed_a_share_trading_day(now.date())
+        if trading_day is True and (now.hour, now.minute) >= (15, 0):
+            return source_time.date() != now.date() or (
+                source_time.hour,
+                source_time.minute,
+            ) < (15, 0)
+        return False
+    if status not in {"open", "lunch_break"}:
+        return False
     if source_time.date() != now.date():
         return True
     freshness_reference = (
@@ -6475,11 +7709,19 @@ def get_sector_rankings_data(
 ) -> dict[str, Any]:
     normalized_type = sector_type.strip().lower()
     if normalized_type not in SECTOR_TYPE_CONFIG:
-        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
+        raise HTTPException(
+            status_code=400, detail="sector_type must be industry or concept."
+        )
     normalized_level = str(level).strip().lower()
     if normalized_level not in {"1", "2", "3", "all"}:
         raise HTTPException(status_code=400, detail="level must be 1, 2, 3, or all.")
-    if sort_by not in {"change_pct", "turnover", "momentum_5m", "momentum_15m", "momentum_30m"}:
+    if sort_by not in {
+        "change_pct",
+        "turnover",
+        "momentum_5m",
+        "momentum_15m",
+        "momentum_30m",
+    }:
         raise HTTPException(
             status_code=400,
             detail="sort_by must be change_pct, turnover, momentum_5m, momentum_15m, or momentum_30m.",
@@ -6502,7 +7744,9 @@ def get_sector_rankings_data(
             boards, normalized_level
         )
     boards.sort(
-        key=lambda item: item.get(sort_by) if item.get(sort_by) is not None else float("-inf"),
+        key=lambda item: (
+            item.get(sort_by) if item.get(sort_by) is not None else float("-inf")
+        ),
         reverse=True,
     )
     items = boards[:limit]
@@ -6533,6 +7777,7 @@ def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
     )
+
     def load_host(host: str) -> dict[str, Any]:
         payload = read_public_json(
             f"https://{host}/api/qt/stock/kline/get?{query}",
@@ -6576,6 +7821,7 @@ def get_eastmoney_generic_daily_kline(secid: str, limit: int) -> dict[str, Any]:
 
 def get_10jqka_industry_code_map() -> dict[str, str]:
     key = cache_key("10jqka_industry_code_map", {})
+
     def load() -> dict[str, Any]:
         text = read_market_text(
             "https://q.10jqka.com.cn/thshy/",
@@ -6584,11 +7830,16 @@ def get_10jqka_industry_code_map() -> dict[str, str]:
         )
         mapping = {
             unescape(name).strip(): code
-            for code, name in re.findall(r'/thshy/detail/code/(\d+)/[^>]*>([^<]+)', text)
+            for code, name in re.findall(
+                r"/thshy/detail/code/(\d+)/[^>]*>([^<]+)", text
+            )
         }
         if not mapping:
-            raise HTTPException(status_code=502, detail="No 10jqka industry mapping rows.")
+            raise HTTPException(
+                status_code=502, detail="No 10jqka industry mapping rows."
+            )
         return {"mapping": mapping}
+
     component, _ = get_cached_tool_data(key, 21600, load)
     return component["mapping"]
 
@@ -6596,7 +7847,9 @@ def get_10jqka_industry_code_map() -> dict[str, str]:
 def read_swsresearch_json(path: str, parameters: dict[str, Any]) -> dict[str, Any]:
     """Read a fixed official public endpoint whose server omits an intermediate certificate."""
     if not path.startswith("/institute-sw/api/"):
-        raise HTTPException(status_code=400, detail="Invalid SWS Research public endpoint path.")
+        raise HTTPException(
+            status_code=400, detail="Invalid SWS Research public endpoint path."
+        )
     url = f"https://www.swsresearch.com{path}?{urlencode(parameters)}"
     request = Request(
         url,
@@ -6615,14 +7868,17 @@ def read_swsresearch_json(path: str, parameters: dict[str, Any]) -> dict[str, An
             payload = json.loads(response.read().decode("utf-8"))
         if str(payload.get("code")) != "200":
             raise ValueError(str(payload.get("message") or "unexpected response code"))
-        record_source_health("swsresearch", True, int((perf_counter() - started_at) * 1000))
+        record_source_health(
+            "swsresearch", True, int((perf_counter() - started_at) * 1000)
+        )
         return payload
     except (URLError, OSError, ValueError, json.JSONDecodeError) as exc:
         record_source_health(
             "swsresearch", False, int((perf_counter() - started_at) * 1000), str(exc)
         )
         raise HTTPException(
-            status_code=502, detail=f"Failed to fetch official SWS Research public data: {exc}"
+            status_code=502,
+            detail=f"Failed to fetch official SWS Research public data: {exc}",
         ) from exc
 
 
@@ -6676,7 +7932,11 @@ def get_swsresearch_recent_level2_history(limit: int) -> dict[str, Any]:
                     continue
                 history = histories.setdefault(
                     normalized_name,
-                    {"provider_name": provider_name, "provider_identifier": code, "items": []},
+                    {
+                        "provider_name": provider_name,
+                        "provider_identifier": code,
+                        "items": [],
+                    },
                 )
                 history["items"].append(
                     {
@@ -6707,7 +7967,8 @@ def get_swsresearch_industry_daily_kline(board_name: str, limit: int) -> dict[st
     matched = (component.get("histories") or {}).get(normalized_name)
     if not matched:
         raise HTTPException(
-            status_code=404, detail=f"No exact official SWS Research industry match: {normalized_name}"
+            status_code=404,
+            detail=f"No exact official SWS Research industry match: {normalized_name}",
         )
     rows = matched.get("items") or []
     if len(rows) <= max(5, limit - 6):
@@ -6737,7 +7998,8 @@ def matched_10jqka_industry_code(board_name: str) -> tuple[str, str] | None:
     matches = [
         (name, code)
         for name, code in mapping.items()
-        if len(normalized_name) >= 3 and len(name) >= 3
+        if len(normalized_name) >= 3
+        and len(name) >= 3
         and (normalized_name in name or name in normalized_name)
     ]
     return min(matches, key=lambda item: len(item[0])) if matches else None
@@ -6747,7 +8009,10 @@ def get_10jqka_industry_daily_kline(board_name: str, limit: int) -> dict[str, An
     normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board_name or "")).strip()
     matched = matched_10jqka_industry_code(board_name)
     if not matched:
-        raise HTTPException(status_code=404, detail=f"No matched 10jqka industry code: {normalized_name}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No matched 10jqka industry code: {normalized_name}",
+        )
     matched_name, code = matched
     rows = []
     current_year = datetime.now(MARKET_TIMEZONE).year
@@ -6772,10 +8037,18 @@ def get_10jqka_industry_daily_kline(board_name: str, limit: int) -> dict[str, An
                 trade_date = datetime.strptime(values[0], "%Y%m%d").date().isoformat()
             except ValueError:
                 continue
-            rows.append({"date": trade_date, "open": to_number(values[1]), "high": to_number(values[2]),
-                         "low": to_number(values[3]), "close": to_number(values[4]),
-                         "volume": to_number(values[5]), "turnover": to_number(values[6]),
-                         "turnover_rate": None})
+            rows.append(
+                {
+                    "date": trade_date,
+                    "open": to_number(values[1]),
+                    "high": to_number(values[2]),
+                    "low": to_number(values[3]),
+                    "close": to_number(values[4]),
+                    "volume": to_number(values[5]),
+                    "turnover": to_number(values[6]),
+                    "turnover_rate": None,
+                }
+            )
         if len(rows) >= limit + 1:
             break
     rows.sort(key=lambda item: str(item.get("date")))
@@ -6784,53 +8057,89 @@ def get_10jqka_industry_daily_kline(board_name: str, limit: int) -> dict[str, An
         row["change_pct"] = value_change_pct(row.get("close"), previous_close)
         previous_close = row.get("close")
     if not rows:
-        raise HTTPException(status_code=502, detail=f"No 10jqka history rows: {normalized_name}")
-    return {"name": normalized_name, "matched_provider_name": matched_name,
-            "items": rows[-limit:], "source": "10jqka_industry_daily_history"}
+        raise HTTPException(
+            status_code=502, detail=f"No 10jqka history rows: {normalized_name}"
+        )
+    return {
+        "name": normalized_name,
+        "matched_provider_name": matched_name,
+        "items": rows[-limit:],
+        "source": "10jqka_industry_daily_history",
+    }
 
 
 def get_tencent_index_daily_kline(symbol: str, limit: int) -> dict[str, Any]:
     market_code = "sh" if symbol.startswith("000") else "sz"
-    url = (
-        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
-        + urlencode({"param": f"{market_code}{symbol},day,,,{limit},qfq"})
+    url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?" + urlencode(
+        {"param": f"{market_code}{symbol},day,,,{limit},qfq"}
     )
-    payload = read_public_json(url, "https://stockapp.finance.qq.com/", timeout=4, attempts=1)
+    payload = read_public_json(
+        url, "https://stockapp.finance.qq.com/", timeout=4, attempts=1
+    )
     data = (payload.get("data") or {}).get(f"{market_code}{symbol}") or {}
     raw_rows = data.get("qfqday") or data.get("day") or []
     rows = []
     for values in raw_rows:
         if not isinstance(values, list) or len(values) < 6:
             continue
-        rows.append({"date": clean_value(values[0]), "open": to_number(values[1]), "close": to_number(values[2]),
-                     "high": to_number(values[3]), "low": to_number(values[4]), "volume": to_number(values[5]),
-                     "turnover": None, "turnover_rate": None})
+        rows.append(
+            {
+                "date": clean_value(values[0]),
+                "open": to_number(values[1]),
+                "close": to_number(values[2]),
+                "high": to_number(values[3]),
+                "low": to_number(values[4]),
+                "volume": to_number(values[5]),
+                "turnover": None,
+                "turnover_rate": None,
+            }
+        )
     previous_close = None
     for row in rows:
         row["change_pct"] = value_change_pct(row.get("close"), previous_close)
         previous_close = row.get("close")
     if not rows:
-        raise HTTPException(status_code=502, detail=f"No Tencent index history rows: {symbol}")
-    return {"name": clean_value((data.get("qt") or {}).get(f"{market_code}{symbol}", [None, None])[1]),
-            "items": rows, "source": "tencent_index_daily_history"}
+        raise HTTPException(
+            status_code=502, detail=f"No Tencent index history rows: {symbol}"
+        )
+    return {
+        "name": clean_value(
+            (data.get("qt") or {}).get(f"{market_code}{symbol}", [None, None])[1]
+        ),
+        "items": rows,
+        "source": "tencent_index_daily_history",
+    }
 
 
 def sector_history_cache_key(secid: str, limit: int) -> str:
     return cache_key("sector_daily_history", {"secid": secid, "limit": limit})
 
 
-def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None = None,
-                                  sector_type: str | None = None) -> dict[str, Any]:
+def get_cached_sector_daily_kline(
+    secid: str,
+    limit: int,
+    board_name: str | None = None,
+    sector_type: str | None = None,
+) -> dict[str, Any]:
     def load() -> dict[str, Any]:
         if secid == "1.000300":
             payload, _, errors = race_public_sources(
                 (
-                    ("eastmoney_index_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
-                    ("tencent_index_history", lambda: get_tencent_index_daily_kline("000300", limit)),
+                    (
+                        "eastmoney_index_history",
+                        lambda: get_eastmoney_generic_daily_kline(secid, limit),
+                    ),
+                    (
+                        "tencent_index_history",
+                        lambda: get_tencent_index_daily_kline("000300", limit),
+                    ),
                 ),
                 5,
             )
-            payload["source_errors"] = [*normalize_source_errors(payload.get("source_errors")), *errors]
+            payload["source_errors"] = [
+                *normalize_source_errors(payload.get("source_errors")),
+                *errors,
+            ]
             return payload
         if board_name and sector_type == "industry":
             try:
@@ -6838,8 +8147,14 @@ def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None
             except HTTPException as official_error:
                 payload, _, errors = race_public_sources(
                     (
-                        ("eastmoney_sector_history", lambda: get_eastmoney_generic_daily_kline(secid, limit)),
-                        ("10jqka_industry_history", lambda: get_10jqka_industry_daily_kline(board_name, limit)),
+                        (
+                            "eastmoney_sector_history",
+                            lambda: get_eastmoney_generic_daily_kline(secid, limit),
+                        ),
+                        (
+                            "10jqka_industry_history",
+                            lambda: get_10jqka_industry_daily_kline(board_name, limit),
+                        ),
                     ),
                     5,
                 )
@@ -6850,6 +8165,7 @@ def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None
                 ]
                 return payload
         return get_eastmoney_generic_daily_kline(secid, limit)
+
     return get_cached_component_with_stale(
         sector_history_cache_key(secid, limit),
         300,
@@ -6858,9 +8174,7 @@ def get_cached_sector_daily_kline(secid: str, limit: int, board_name: str | None
     )
 
 
-def get_recent_sector_history_snapshot(
-    secid: str, limit: int
-) -> dict[str, Any] | None:
+def get_recent_sector_history_snapshot(secid: str, limit: int) -> dict[str, Any] | None:
     snapshot = get_cached_tool_snapshot(sector_history_cache_key(secid, limit), 3600)
     if snapshot is None:
         return None
@@ -6870,14 +8184,18 @@ def get_recent_sector_history_snapshot(
     return data
 
 
-def kline_lookback_returns(items: list[dict[str, Any]], lookbacks: list[int]) -> dict[str, float | None]:
+def kline_lookback_returns(
+    items: list[dict[str, Any]], lookbacks: list[int]
+) -> dict[str, float | None]:
     closes = [to_number(item.get("close")) for item in items]
     valid = [value for value in closes if value is not None]
     latest = valid[-1] if valid else None
     return {
         str(window): (
             round((latest / valid[-window - 1] - 1) * 100, 4)
-            if latest is not None and len(valid) > window and valid[-window - 1] not in (None, 0)
+            if latest is not None
+            and len(valid) > window
+            and valid[-window - 1] not in (None, 0)
             else None
         )
         for window in lookbacks
@@ -6896,20 +8214,22 @@ def median_number(values: list[float]) -> float | None:
 
 def summarize_change_participation(rows: list[dict[str, Any]]) -> dict[str, Any]:
     changes = [
-        value
-        for row in rows
-        if (value := to_number(row.get("change_pct"))) is not None
+        value for row in rows if (value := to_number(row.get("change_pct"))) is not None
     ]
     return {
         "observed_count": len(changes),
         "positive_count": sum(value > 0 for value in changes),
         "negative_count": sum(value < 0 for value in changes),
         "flat_count": sum(value == 0 for value in changes),
-        "positive_share_pct": round(sum(value > 0 for value in changes) / len(changes) * 100, 4)
+        "positive_share_pct": round(
+            sum(value > 0 for value in changes) / len(changes) * 100, 4
+        )
         if changes
         else None,
         "median_change_pct": median_number(changes),
-        "dispersion_range_pct": round(max(changes) - min(changes), 4) if changes else None,
+        "dispersion_range_pct": round(max(changes) - min(changes), 4)
+        if changes
+        else None,
     }
 
 
@@ -6971,7 +8291,8 @@ def summarize_sector_paths(
         values = [
             value
             for item in items
-            if (value := to_number((item.get("returns_pct") or {}).get(key))) is not None
+            if (value := to_number((item.get("returns_pct") or {}).get(key)))
+            is not None
         ]
         relative_values = [
             value
@@ -6983,19 +8304,28 @@ def summarize_sector_paths(
             "available_count": len(values),
             "positive_count": sum(value > 0 for value in values),
             "negative_count": sum(value < 0 for value in values),
-            "positive_share_pct": round(sum(value > 0 for value in values) / len(values) * 100, 4)
+            "positive_share_pct": round(
+                sum(value > 0 for value in values) / len(values) * 100, 4
+            )
             if values
             else None,
             "median_return_pct": median_number(values),
             "median_relative_to_csi300_pct": median_number(relative_values),
-            "dispersion_range_pct": round(max(values) - min(values), 4) if values else None,
+            "dispersion_range_pct": round(max(values) - min(values), 4)
+            if values
+            else None,
         }
     path_counts: dict[str, int] = {}
     for item in items:
-        path = str((item.get("path_facts") or {}).get("current_vs_completed_history") or "unavailable")
+        path = str(
+            (item.get("path_facts") or {}).get("current_vs_completed_history")
+            or "unavailable"
+        )
         path_counts[path] = path_counts.get(path, 0) + 1
     confirmed = [
-        item for item in items if (item.get("path_facts") or {}).get("multi_session_confirmation")
+        item
+        for item in items
+        if (item.get("path_facts") or {}).get("multi_session_confirmation")
     ]
     return {
         "coverage_scope": coverage_scope,
@@ -7019,13 +8349,19 @@ def get_sector_rotation_data(
 ) -> dict[str, Any]:
     normalized_type = sector_type.strip().lower()
     if normalized_type not in SECTOR_TYPE_CONFIG:
-        raise HTTPException(status_code=400, detail="sector_type must be industry or concept.")
+        raise HTTPException(
+            status_code=400, detail="sector_type must be industry or concept."
+        )
     normalized_level = str(level).strip().lower()
     if normalized_level not in {"1", "2", "3", "all"}:
         raise HTTPException(status_code=400, detail="level must be 1, 2, 3, or all.")
     normalized_lookbacks = sorted({int(value) for value in lookbacks})
-    if not normalized_lookbacks or any(value < 1 or value > 20 for value in normalized_lookbacks):
-        raise HTTPException(status_code=400, detail="lookbacks must contain integers from 1 through 20.")
+    if not normalized_lookbacks or any(
+        value < 1 or value > 20 for value in normalized_lookbacks
+    ):
+        raise HTTPException(
+            status_code=400, detail="lookbacks must contain integers from 1 through 20."
+        )
 
     board_component = get_cached_sector_board_component(normalized_type)
     boards = board_component.get("items") or []
@@ -7045,10 +8381,15 @@ def get_sector_rotation_data(
         ),
         reverse=True,
     )
-    by_turnover = sorted(boards, key=lambda item: item.get("turnover") or 0, reverse=True)
+    by_turnover = sorted(
+        boards, key=lambda item: item.get("turnover") or 0, reverse=True
+    )
     candidates = []
     seen_board_symbols = set()
-    for board in [*by_change[: candidate_count // 2], *by_turnover[: candidate_count // 2]]:
+    for board in [
+        *by_change[: candidate_count // 2],
+        *by_turnover[: candidate_count // 2],
+    ]:
         board_symbol = str(board.get("symbol") or "")
         if not board_symbol or board_symbol in seen_board_symbols:
             continue
@@ -7070,11 +8411,13 @@ def get_sector_rotation_data(
             "1.000300", history_limit
         ),
         **{
-            f"sector_history:{board['symbol']}": lambda board=board: get_cached_sector_daily_kline(
-                f"90.{board['symbol']}",
-                history_limit,
-                board.get("name"),
-                normalized_type,
+            f"sector_history:{board['symbol']}": lambda board=board: (
+                get_cached_sector_daily_kline(
+                    f"90.{board['symbol']}",
+                    history_limit,
+                    board.get("name"),
+                    normalized_type,
+                )
             )
             for board in candidates
             if board.get("symbol")
@@ -7116,18 +8459,23 @@ def get_sector_rotation_data(
             for error in source_errors
             if not (
                 isinstance(error, str)
-                and any(f"sector_history:{symbol}:" in error for symbol in recovered_symbols)
+                and any(
+                    f"sector_history:{symbol}:" in error for symbol in recovered_symbols
+                )
             )
         ]
     if not benchmark_history.get("items"):
-        benchmark_history = get_recent_sector_history_snapshot(
-            "1.000300", history_limit
-        ) or benchmark_history
+        benchmark_history = (
+            get_recent_sector_history_snapshot("1.000300", history_limit)
+            or benchmark_history
+        )
     for board in candidates:
         board_symbol = str(board.get("symbol") or "")
         if not board_symbol or board_symbol in history_results:
             continue
-        snapshot = get_recent_sector_history_snapshot(f"90.{board_symbol}", history_limit)
+        snapshot = get_recent_sector_history_snapshot(
+            f"90.{board_symbol}", history_limit
+        )
         if snapshot:
             history_results[board_symbol] = snapshot
 
@@ -7137,8 +8485,12 @@ def get_sector_rotation_data(
     official_universe_histories: dict[str, dict[str, Any]] = {}
     if normalized_type == "industry" and normalized_level == "2":
         try:
-            official_universe_component = get_swsresearch_recent_level2_history(history_limit)
-            official_universe_histories = official_universe_component.get("histories") or {}
+            official_universe_component = get_swsresearch_recent_level2_history(
+                history_limit
+            )
+            official_universe_histories = (
+                official_universe_component.get("histories") or {}
+            )
         except HTTPException as exc:
             source_errors.append(f"swsresearch_official_universe: {exc.detail}")
 
@@ -7148,7 +8500,9 @@ def get_sector_rotation_data(
     historical_additions = []
     if official_universe_histories:
         for board in boards:
-            normalized_name = re.sub(r"[ⅠⅡⅢ]$", "", str(board.get("name") or "")).strip()
+            normalized_name = re.sub(
+                r"[ⅠⅡⅢ]$", "", str(board.get("name") or "")
+            ).strip()
             history = official_universe_histories.get(normalized_name)
             if not history:
                 continue
@@ -7227,16 +8581,21 @@ def get_sector_rotation_data(
                 "returns_pct": returns,
                 "benchmark_returns_pct": benchmark_returns,
                 "relative_to_csi300_pct": relative_returns,
-                "positive_sessions_last_5": sum(value > 0 for value in recent_changes) if recent_changes else None,
+                "positive_sessions_last_5": sum(value > 0 for value in recent_changes)
+                if recent_changes
+                else None,
                 "available_sessions_last_5": len(recent_changes),
                 "at_20_session_closing_high": (
                     recent_closes[-1] == max(recent_closes) if recent_closes else None
                 ),
                 "history_status": "available" if rows else "unavailable",
                 "history_source": history.get("source"),
-                "history_provider_name": history.get("matched_provider_name") or history.get("name"),
+                "history_provider_name": history.get("matched_provider_name")
+                or history.get("name"),
                 "history_provider_identifier": history.get("provider_identifier"),
-                "history_transport_security_note": history.get("transport_security_note"),
+                "history_transport_security_note": history.get(
+                    "transport_security_note"
+                ),
                 "history_name_match_status": (
                     "exact_name_match_to_official_sw_industry_index"
                     if history.get("source") == "swsresearch_official_index_history"
@@ -7249,8 +8608,14 @@ def get_sector_rotation_data(
                 "history_is_stale": bool(history.get("served_from_stale_cache")),
                 "history_cache_age_seconds": history.get("stale_cache_age_seconds"),
                 "turnover_share_of_a_share_market_pct": (
-                    round((to_number(board.get("turnover")) or 0) / total_market_turnover * 100, 6)
-                    if total_market_turnover not in (None, 0) and to_number(board.get("turnover")) is not None
+                    round(
+                        (to_number(board.get("turnover")) or 0)
+                        / total_market_turnover
+                        * 100,
+                        6,
+                    )
+                    if total_market_turnover not in (None, 0)
+                    and to_number(board.get("turnover")) is not None
                     else None
                 ),
                 "leader_continuity": None,
@@ -7260,7 +8625,11 @@ def get_sector_rotation_data(
         )
         items.append(item)
 
-    ranking_window = "5" if "5" in {str(value) for value in normalized_lookbacks} else str(normalized_lookbacks[0])
+    ranking_window = (
+        "5"
+        if "5" in {str(value) for value in normalized_lookbacks}
+        else str(normalized_lookbacks[0])
+    )
     items.sort(
         key=lambda item: (
             item["relative_to_csi300_pct"].get(ranking_window)
@@ -7322,17 +8691,25 @@ def get_sector_rotation_data(
         "level": normalized_level if normalized_type == "industry" else None,
         "level_coverage_status": level_coverage_status,
         "lookbacks": normalized_lookbacks,
-        "benchmark": {"identifier": "index:000300", "name": "CSI 300", "returns_pct": benchmark_returns},
+        "benchmark": {
+            "identifier": "index:000300",
+            "name": "CSI 300",
+            "returns_pct": benchmark_returns,
+        },
         "a_share_market_turnover": total_market_turnover,
-        "a_share_market_turnover_unit": "CNY" if total_market_turnover is not None else None,
+        "a_share_market_turnover_unit": "CNY"
+        if total_market_turnover is not None
+        else None,
         "ranking_basis": f"{ranking_window}-session relative return when available, otherwise current change_pct",
         "count": len(items),
         "history_available_count": histories_available,
         "cross_provider_history_count": sum(
-            item.get("history_source") == "10jqka_industry_daily_history" for item in items
+            item.get("history_source") == "10jqka_industry_daily_history"
+            for item in items
         ),
         "official_sw_history_count": sum(
-            item.get("history_source") == "swsresearch_official_index_history" for item in items
+            item.get("history_source") == "swsresearch_official_index_history"
+            for item in items
         ),
         "rotation_structure": {
             "returned_sample": returned_sample_structure,
@@ -7340,7 +8717,11 @@ def get_sector_rotation_data(
             "selection_sources": [
                 "current_change_leaders",
                 "current_turnover_leaders",
-                *(["official_multi_session_relative_leaders"] if official_universe_histories else []),
+                *(
+                    ["official_multi_session_relative_leaders"]
+                    if official_universe_histories
+                    else []
+                ),
             ],
             "current_session_and_completed_history_are_separate": True,
         },
@@ -7348,9 +8729,21 @@ def get_sector_rotation_data(
         "source": sorted(
             {
                 "eastmoney_sector_snapshot",
-                *[str(item.get("history_source")) for item in items if item.get("history_source")],
-                *([str(benchmark_history.get("source"))] if benchmark_history.get("source") else []),
-                *([str(market_component.get("source"))] if market_component.get("source") else []),
+                *[
+                    str(item.get("history_source"))
+                    for item in items
+                    if item.get("history_source")
+                ],
+                *(
+                    [str(benchmark_history.get("source"))]
+                    if benchmark_history.get("source")
+                    else []
+                ),
+                *(
+                    [str(market_component.get("source"))]
+                    if market_component.get("source")
+                    else []
+                ),
             }
         ),
         "source_errors": source_errors,
@@ -7446,7 +8839,9 @@ OVERNIGHT_INSTRUMENT_METADATA = {
 }
 
 
-def parse_sina_overnight_record(identifier: str, category: str, values: list[str]) -> dict[str, Any] | None:
+def parse_sina_overnight_record(
+    identifier: str, category: str, values: list[str]
+) -> dict[str, Any] | None:
     if not values or not any(str(value).strip() for value in values):
         return None
     if category == "domestic_futures" and len(values) >= 18:
@@ -7458,9 +8853,15 @@ def parse_sina_overnight_record(identifier: str, category: str, values: list[str
         return {
             "name": clean_value(values[0]),
             "price": current,
-            "change": round(current - previous, 6) if current is not None and previous is not None else None,
-            "change_pct": round((current / previous - 1) * 100, 4) if current is not None and previous not in (None, 0) else None,
-            "market_time": format_market_time(f"{values[17]} {clock}") if values[17] and clock else None,
+            "change": round(current - previous, 6)
+            if current is not None and previous is not None
+            else None,
+            "change_pct": round((current / previous - 1) * 100, 4)
+            if current is not None and previous not in (None, 0)
+            else None,
+            "market_time": format_market_time(f"{values[17]} {clock}")
+            if values[17] and clock
+            else None,
             "previous_reference": previous,
             "reference_type": "previous_settlement",
         }
@@ -7470,9 +8871,15 @@ def parse_sina_overnight_record(identifier: str, category: str, values: list[str
         return {
             "name": clean_value(values[13]),
             "price": current,
-            "change": round(current - previous, 6) if current is not None and previous is not None else None,
-            "change_pct": round((current / previous - 1) * 100, 4) if current is not None and previous not in (None, 0) else None,
-            "market_time": format_market_time(f"{values[12]} {values[6]}") if values[12] and values[6] else None,
+            "change": round(current - previous, 6)
+            if current is not None and previous is not None
+            else None,
+            "change_pct": round((current / previous - 1) * 100, 4)
+            if current is not None and previous not in (None, 0)
+            else None,
+            "market_time": format_market_time(f"{values[12]} {values[6]}")
+            if values[12] and values[6]
+            else None,
             "previous_reference": previous,
             "reference_type": "previous_settlement",
         }
@@ -7482,7 +8889,9 @@ def parse_sina_overnight_record(identifier: str, category: str, values: list[str
             "price": to_number(values[1]),
             "change": to_number(values[11]),
             "change_pct": to_number(values[10]),
-            "market_time": format_market_time(f"{values[17]} {values[0]}") if values[17] and values[0] else None,
+            "market_time": format_market_time(f"{values[17]} {values[0]}")
+            if values[17] and values[0]
+            else None,
             "previous_reference": to_number(values[8]),
             "reference_type": "provider_reference",
         }
@@ -7508,7 +8917,9 @@ def get_sina_overnight_observations() -> dict[str, dict[str, Any]]:
             timeout=5,
         )
     except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Sina overnight quote route unavailable: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Sina overnight quote route unavailable: {exc}"
+        ) from exc
     raw_by_code = {
         match.group(1): match.group(2).split(",")
         for match in re.finditer(r'var hq_str_([^=]+)="([^"]*)";', text)
@@ -7526,7 +8937,9 @@ def get_sina_overnight_observations() -> dict[str, dict[str, Any]]:
                 "source": "sina_public_quote",
             }
     if not observations:
-        raise HTTPException(status_code=502, detail="Sina returned no usable overnight observations.")
+        raise HTTPException(
+            status_code=502, detail="Sina returned no usable overnight observations."
+        )
     return observations
 
 
@@ -7623,14 +9036,31 @@ def datacenter_date(value: Any) -> str | None:
         return None
 
 
-def get_eastmoney_datacenter_rows(report: str, row_filter: str, sort: str,
-                                  page_size: int = 20) -> list[dict[str, Any]]:
-    params = {"reportName": report, "columns": "ALL", "filter": row_filter, "pageNumber": 1,
-              "pageSize": max(1, min(page_size, 100)), "sortColumns": sort, "sortTypes": -1,
-              "source": "WEB", "client": "WEB"}
-    payload = read_public_json(f"{EASTMONEY_DATACENTER_API}?{urlencode(params)}",
-                               "https://data.eastmoney.com/", timeout=4, attempts=1)
-    if isinstance(payload, dict) and payload.get("success") is False and payload.get("code") == 9201:
+def get_eastmoney_datacenter_rows(
+    report: str, row_filter: str, sort: str, page_size: int = 20
+) -> list[dict[str, Any]]:
+    params = {
+        "reportName": report,
+        "columns": "ALL",
+        "filter": row_filter,
+        "pageNumber": 1,
+        "pageSize": max(1, min(page_size, 100)),
+        "sortColumns": sort,
+        "sortTypes": -1,
+        "source": "WEB",
+        "client": "WEB",
+    }
+    payload = read_public_json(
+        f"{EASTMONEY_DATACENTER_API}?{urlencode(params)}",
+        "https://data.eastmoney.com/",
+        timeout=4,
+        attempts=1,
+    )
+    if (
+        isinstance(payload, dict)
+        and payload.get("success") is False
+        and payload.get("code") == 9201
+    ):
         return []
     if not isinstance(payload, dict) or payload.get("success") is False:
         raise HTTPException(status_code=502, detail=f"Unexpected {report} response.")
@@ -7655,7 +9085,10 @@ def value_change_pct(current: Any, previous: Any) -> float | None:
 
 
 def dated_window_totals(
-    items: list[dict[str, Any]], date_field: str, amount_fields: tuple[str, ...], window_days: int = 30
+    items: list[dict[str, Any]],
+    date_field: str,
+    amount_fields: tuple[str, ...],
+    window_days: int = 30,
 ) -> dict[str, Any]:
     today = datetime.now(MARKET_TIMEZONE).date()
     recent_start = (today - timedelta(days=window_days - 1)).isoformat()
@@ -7669,13 +9102,18 @@ def dated_window_totals(
     result: dict[str, Any] = {
         "window_days": window_days,
         "recent_range": {"start": recent_start, "end": today.isoformat()},
-        "previous_range": {"start": previous_start, "end": (today - timedelta(days=window_days)).isoformat()},
+        "previous_range": {
+            "start": previous_start,
+            "end": (today - timedelta(days=window_days)).isoformat(),
+        },
         "recent_record_count": len(recent),
         "previous_record_count": len(previous),
     }
     for field in amount_fields:
         recent_total = round(sum(to_number(item.get(field)) or 0 for item in recent), 2)
-        previous_total = round(sum(to_number(item.get(field)) or 0 for item in previous), 2)
+        previous_total = round(
+            sum(to_number(item.get(field)) or 0 for item in previous), 2
+        )
         result[field] = {
             "recent_total": recent_total,
             "previous_total": previous_total,
@@ -7685,20 +9123,28 @@ def dated_window_totals(
 
 
 def capital_activity_margin(symbol: str, start: str, limit: int) -> dict[str, Any]:
-    rows = get_eastmoney_datacenter_rows("RPTA_WEB_RZRQ_GGMX", f'(SCODE="{symbol}")', "DATE", max(limit, 30))
+    rows = get_eastmoney_datacenter_rows(
+        "RPTA_WEB_RZRQ_GGMX", f'(SCODE="{symbol}")', "DATE", max(limit, 30)
+    )
     items = []
     for row in rows:
         day = datacenter_date(row.get("DATE"))
         if day and day >= start:
-            items.append({"trade_date": day, "financing_balance_cny": to_number(row.get("RZYE")),
-                          "financing_purchase_cny": to_number(row.get("RZMRE")),
-                          "financing_repayment_cny": to_number(row.get("RZCHE")),
-                          "financing_net_purchase_cny": to_number(row.get("RZJME")),
-                          "securities_lending_balance_cny": to_number(row.get("RQYE")),
-                          "securities_lending_remaining_shares": to_number(row.get("RQYL")),
-                          "securities_lending_sold_shares": to_number(row.get("RQMCL")),
-                          "margin_total_balance_cny": to_number(row.get("RZRQYE")),
-                          "close_price_cny": to_number(row.get("SPJ")), "change_pct": to_number(row.get("ZDF"))})
+            items.append(
+                {
+                    "trade_date": day,
+                    "financing_balance_cny": to_number(row.get("RZYE")),
+                    "financing_purchase_cny": to_number(row.get("RZMRE")),
+                    "financing_repayment_cny": to_number(row.get("RZCHE")),
+                    "financing_net_purchase_cny": to_number(row.get("RZJME")),
+                    "securities_lending_balance_cny": to_number(row.get("RQYE")),
+                    "securities_lending_remaining_shares": to_number(row.get("RQYL")),
+                    "securities_lending_sold_shares": to_number(row.get("RQMCL")),
+                    "margin_total_balance_cny": to_number(row.get("RZRQYE")),
+                    "close_price_cny": to_number(row.get("SPJ")),
+                    "change_pct": to_number(row.get("ZDF")),
+                }
+            )
     latest = items[0] if items else {}
     comparisons = {}
     for sessions in (5, 20):
@@ -7706,57 +9152,111 @@ def capital_activity_margin(symbol: str, start: str, limit: int) -> dict[str, An
         comparisons[str(sessions)] = {
             "comparison_trade_date": previous.get("trade_date"),
             "financing_balance_change_pct": value_change_pct(
-                latest.get("financing_balance_cny"), previous.get("financing_balance_cny")
+                latest.get("financing_balance_cny"),
+                previous.get("financing_balance_cny"),
             ),
             "securities_lending_balance_change_pct": value_change_pct(
-                latest.get("securities_lending_balance_cny"), previous.get("securities_lending_balance_cny")
+                latest.get("securities_lending_balance_cny"),
+                previous.get("securities_lending_balance_cny"),
             ),
             "margin_total_balance_change_pct": value_change_pct(
-                latest.get("margin_total_balance_cny"), previous.get("margin_total_balance_cny")
+                latest.get("margin_total_balance_cny"),
+                previous.get("margin_total_balance_cny"),
             ),
         }
-    return {"items": items[:limit], "historical_comparison_by_sessions": comparisons,
-            "source": "eastmoney_margin_detail"}
+    return {
+        "items": items[:limit],
+        "historical_comparison_by_sessions": comparisons,
+        "source": "eastmoney_margin_detail",
+    }
 
 
-def capital_activity_block_trades(symbol: str, start: str, limit: int) -> dict[str, Any]:
-    rows = get_eastmoney_datacenter_rows("RPT_DATA_BLOCKTRADE", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 50)
+def capital_activity_block_trades(
+    symbol: str, start: str, limit: int
+) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows(
+        "RPT_DATA_BLOCKTRADE", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 50
+    )
     items = []
     for row in rows:
         day = datacenter_date(row.get("TRADE_DATE"))
         if not day or day < start:
             continue
-        buyer = is_disclosed_institution_seat(row.get("BUYER_CODE"), row.get("BUYER_NAME"))
-        seller = is_disclosed_institution_seat(row.get("SELLER_CODE"), row.get("SELLER_NAME"))
-        price, close = to_number(row.get("DEAL_PRICE")), to_number(row.get("CLOSE_PRICE"))
-        items.append({"trade_date": day, "deal_price_cny": price, "close_price_cny": close,
-                      "deal_volume_shares": to_number(row.get("DEAL_VOLUME")),
-                      "deal_amount_cny": to_number(row.get("DEAL_AMT")),
-                      "premium_discount_pct": percentage_change(price, close),
-                      "buyer_name": clean_value(row.get("BUYER_NAME")), "seller_name": clean_value(row.get("SELLER_NAME")),
-                      "buyer_is_disclosed_institution_seat": buyer, "seller_is_disclosed_institution_seat": seller,
-                      "institution_buy_amount_cny": to_number(row.get("DEAL_AMT")) if buyer else 0,
-                      "institution_sell_amount_cny": to_number(row.get("DEAL_AMT")) if seller else 0})
-    institution = [item for item in items if item["buyer_is_disclosed_institution_seat"] or item["seller_is_disclosed_institution_seat"]]
-    return {"items": items[:limit], "institution_related_items": institution[:limit],
-            "institution_buy_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["buyer_is_disclosed_institution_seat"]),
-            "institution_sell_amount_cny": sum(item["deal_amount_cny"] or 0 for item in institution if item["seller_is_disclosed_institution_seat"]),
-            "historical_comparison": dated_window_totals(
-                institution, "trade_date", ("institution_buy_amount_cny", "institution_sell_amount_cny")
-            ),
-            "source": "eastmoney_block_trade_disclosure"}
+        buyer = is_disclosed_institution_seat(
+            row.get("BUYER_CODE"), row.get("BUYER_NAME")
+        )
+        seller = is_disclosed_institution_seat(
+            row.get("SELLER_CODE"), row.get("SELLER_NAME")
+        )
+        price, close = (
+            to_number(row.get("DEAL_PRICE")),
+            to_number(row.get("CLOSE_PRICE")),
+        )
+        items.append(
+            {
+                "trade_date": day,
+                "deal_price_cny": price,
+                "close_price_cny": close,
+                "deal_volume_shares": to_number(row.get("DEAL_VOLUME")),
+                "deal_amount_cny": to_number(row.get("DEAL_AMT")),
+                "premium_discount_pct": percentage_change(price, close),
+                "buyer_name": clean_value(row.get("BUYER_NAME")),
+                "seller_name": clean_value(row.get("SELLER_NAME")),
+                "buyer_is_disclosed_institution_seat": buyer,
+                "seller_is_disclosed_institution_seat": seller,
+                "institution_buy_amount_cny": to_number(row.get("DEAL_AMT"))
+                if buyer
+                else 0,
+                "institution_sell_amount_cny": to_number(row.get("DEAL_AMT"))
+                if seller
+                else 0,
+            }
+        )
+    institution = [
+        item
+        for item in items
+        if item["buyer_is_disclosed_institution_seat"]
+        or item["seller_is_disclosed_institution_seat"]
+    ]
+    return {
+        "items": items[:limit],
+        "institution_related_items": institution[:limit],
+        "institution_buy_amount_cny": sum(
+            item["deal_amount_cny"] or 0
+            for item in institution
+            if item["buyer_is_disclosed_institution_seat"]
+        ),
+        "institution_sell_amount_cny": sum(
+            item["deal_amount_cny"] or 0
+            for item in institution
+            if item["seller_is_disclosed_institution_seat"]
+        ),
+        "historical_comparison": dated_window_totals(
+            institution,
+            "trade_date",
+            ("institution_buy_amount_cny", "institution_sell_amount_cny"),
+        ),
+        "source": "eastmoney_block_trade_disclosure",
+    }
 
 
 def capital_activity_shareholders(symbol: str, limit: int) -> dict[str, Any]:
-    rows = get_eastmoney_datacenter_rows("RPT_HOLDERNUMLATEST", f'(SECURITY_CODE="{symbol}")', "END_DATE", max(limit, 8))
-    items = [{"period_end": datacenter_date(row.get("END_DATE")),
-              "notice_date": datacenter_date(row.get("HOLD_NOTICE_DATE")),
-              "shareholder_count": to_number(row.get("HOLDER_NUM")),
-              "previous_shareholder_count": to_number(row.get("PRE_HOLDER_NUM")),
-              "shareholder_count_change": to_number(row.get("HOLDER_NUM_CHANGE")),
-              "shareholder_count_change_pct": to_number(row.get("HOLDER_NUM_RATIO")),
-              "average_shares_per_holder": to_number(row.get("AVG_HOLD_NUM")),
-              "average_market_value_per_holder_cny": to_number(row.get("AVG_MARKET_CAP"))} for row in rows[:limit]]
+    rows = get_eastmoney_datacenter_rows(
+        "RPT_HOLDERNUMLATEST", f'(SECURITY_CODE="{symbol}")', "END_DATE", max(limit, 8)
+    )
+    items = [
+        {
+            "period_end": datacenter_date(row.get("END_DATE")),
+            "notice_date": datacenter_date(row.get("HOLD_NOTICE_DATE")),
+            "shareholder_count": to_number(row.get("HOLDER_NUM")),
+            "previous_shareholder_count": to_number(row.get("PRE_HOLDER_NUM")),
+            "shareholder_count_change": to_number(row.get("HOLDER_NUM_CHANGE")),
+            "shareholder_count_change_pct": to_number(row.get("HOLDER_NUM_RATIO")),
+            "average_shares_per_holder": to_number(row.get("AVG_HOLD_NUM")),
+            "average_market_value_per_holder_cny": to_number(row.get("AVG_MARKET_CAP")),
+        }
+        for row in rows[:limit]
+    ]
     latest, previous = (items + [{}, {}])[:2]
     return {
         "items": items,
@@ -7773,106 +9273,242 @@ def capital_activity_shareholders(symbol: str, limit: int) -> dict[str, Any]:
 
 def capital_activity_research(symbol: str, start: str, limit: int) -> dict[str, Any]:
     query = f'(NUMBERNEW="1")(IS_SOURCE="1")(NOTICE_DATE>\'{start}\')(SECURITY_CODE="{symbol}")'
-    rows = get_eastmoney_datacenter_rows("RPT_ORG_SURVEYNEW", query, "NOTICE_DATE", max(limit, 50))
-    items = [{"notice_date": datacenter_date(row.get("NOTICE_DATE")),
-              "research_start_date": datacenter_date(row.get("RECEIVE_START_DATE")),
-              "research_end_date": datacenter_date(row.get("RECEIVE_END_DATE")),
-              "participant_count": int(to_number(row.get("SUM")) or 0) or None,
-              "participant_example": clean_value(row.get("RECEIVE_OBJECT")),
-              "method": clean_value(row.get("RECEIVE_WAY_EXPLAIN")), "place": clean_value(row.get("RECEIVE_PLACE")),
-              "company_representatives": clean_value(row.get("RECEPTIONIST"))} for row in rows]
+    rows = get_eastmoney_datacenter_rows(
+        "RPT_ORG_SURVEYNEW", query, "NOTICE_DATE", max(limit, 50)
+    )
+    items = [
+        {
+            "notice_date": datacenter_date(row.get("NOTICE_DATE")),
+            "research_start_date": datacenter_date(row.get("RECEIVE_START_DATE")),
+            "research_end_date": datacenter_date(row.get("RECEIVE_END_DATE")),
+            "participant_count": int(to_number(row.get("SUM")) or 0) or None,
+            "participant_example": clean_value(row.get("RECEIVE_OBJECT")),
+            "method": clean_value(row.get("RECEIVE_WAY_EXPLAIN")),
+            "place": clean_value(row.get("RECEIVE_PLACE")),
+            "company_representatives": clean_value(row.get("RECEPTIONIST")),
+        }
+        for row in rows
+    ]
     return {
         "items": items[:limit],
-        "historical_comparison": dated_window_totals(items, "notice_date", ("participant_count",)),
+        "historical_comparison": dated_window_totals(
+            items, "notice_date", ("participant_count",)
+        ),
         "historical_comparison_scope": "first_page_up_to_50_disclosures",
         "source": "eastmoney_institutional_research_disclosure",
     }
 
 
-def capital_activity_dragon_tiger(symbol: str, start: str, limit: int) -> dict[str, Any]:
-    rows = get_eastmoney_datacenter_rows("RPT_DAILYBILLBOARD_DETAILSNEW", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 30)
+def capital_activity_dragon_tiger(
+    symbol: str, start: str, limit: int
+) -> dict[str, Any]:
+    rows = get_eastmoney_datacenter_rows(
+        "RPT_DAILYBILLBOARD_DETAILSNEW", f'(SECURITY_CODE="{symbol}")', "TRADE_DATE", 30
+    )
     records = []
     for row in rows:
         day = datacenter_date(row.get("TRADE_DATE"))
         if day and day >= start:
-            records.append({"trade_date": day, "reason": clean_value(row.get("EXPLANATION") or row.get("EXPLAIN")),
-                            "total_buy_amount_cny": to_number(row.get("BILLBOARD_BUY_AMT")),
-                            "total_sell_amount_cny": to_number(row.get("BILLBOARD_SELL_AMT")),
-                            "total_net_amount_cny": to_number(row.get("BILLBOARD_NET_AMT")),
-                            "close_price_cny": to_number(row.get("CLOSE_PRICE")),
-                            "change_pct": to_number(row.get("CHANGE_RATE")), "turnover_rate_pct": to_number(row.get("TURNOVERRATE"))})
+            records.append(
+                {
+                    "trade_date": day,
+                    "reason": clean_value(row.get("EXPLANATION") or row.get("EXPLAIN")),
+                    "total_buy_amount_cny": to_number(row.get("BILLBOARD_BUY_AMT")),
+                    "total_sell_amount_cny": to_number(row.get("BILLBOARD_SELL_AMT")),
+                    "total_net_amount_cny": to_number(row.get("BILLBOARD_NET_AMT")),
+                    "close_price_cny": to_number(row.get("CLOSE_PRICE")),
+                    "change_pct": to_number(row.get("CHANGE_RATE")),
+                    "turnover_rate_pct": to_number(row.get("TURNOVERRATE")),
+                }
+            )
     if not records:
-        return {"items": [], "latest_institution_seats": [], "source": "eastmoney_dragon_tiger_disclosure"}
+        return {
+            "items": [],
+            "latest_institution_seats": [],
+            "source": "eastmoney_dragon_tiger_disclosure",
+        }
     latest = records[0]["trade_date"]
-    seat_filter = f'(TRADE_DATE=\'{latest}\')(SECURITY_CODE="{symbol}")'
-    loaders = {"buy": lambda: get_eastmoney_datacenter_rows("RPT_BILLBOARD_DAILYDETAILSBUY", seat_filter, "BUY", 10),
-               "sell": lambda: get_eastmoney_datacenter_rows("RPT_BILLBOARD_DAILYDETAILSSELL", seat_filter, "SELL", 10)}
+    seat_filter = f"(TRADE_DATE='{latest}')(SECURITY_CODE=\"{symbol}\")"
+    loaders = {
+        "buy": lambda: get_eastmoney_datacenter_rows(
+            "RPT_BILLBOARD_DAILYDETAILSBUY", seat_filter, "BUY", 10
+        ),
+        "sell": lambda: get_eastmoney_datacenter_rows(
+            "RPT_BILLBOARD_DAILYDETAILSSELL", seat_filter, "SELL", 10
+        ),
+    }
     results, _, errors = collect_components(loaders, 5, COMPOSITE_TOOL_EXECUTOR)
     merged = {}
     for side, seat_rows in results.items():
         for row in seat_rows:
-            key = (str(row.get("OPERATEDEPT_CODE") or ""), str(row.get("OPERATEDEPT_NAME") or ""))
-            item = merged.setdefault(key, {"seat_code": clean_value(row.get("OPERATEDEPT_CODE")),
-                "seat_name": clean_value(row.get("OPERATEDEPT_NAME")), "buy_amount_cny": to_number(row.get("BUY")),
-                "sell_amount_cny": to_number(row.get("SELL")), "net_amount_cny": to_number(row.get("NET")),
-                "is_disclosed_institution_seat": is_disclosed_institution_seat(row.get("OPERATEDEPT_CODE"), row.get("OPERATEDEPT_NAME")), "appears_in": []})
+            key = (
+                str(row.get("OPERATEDEPT_CODE") or ""),
+                str(row.get("OPERATEDEPT_NAME") or ""),
+            )
+            item = merged.setdefault(
+                key,
+                {
+                    "seat_code": clean_value(row.get("OPERATEDEPT_CODE")),
+                    "seat_name": clean_value(row.get("OPERATEDEPT_NAME")),
+                    "buy_amount_cny": to_number(row.get("BUY")),
+                    "sell_amount_cny": to_number(row.get("SELL")),
+                    "net_amount_cny": to_number(row.get("NET")),
+                    "is_disclosed_institution_seat": is_disclosed_institution_seat(
+                        row.get("OPERATEDEPT_CODE"), row.get("OPERATEDEPT_NAME")
+                    ),
+                    "appears_in": [],
+                },
+            )
             item["appears_in"].append(f"{side}_ranking")
     seats = list(merged.values())
     institutions = [item for item in seats if item["is_disclosed_institution_seat"]]
-    return {"items": records[:limit], "latest_seat_trade_date": latest, "latest_disclosed_seats": seats,
-            "latest_institution_seats": institutions,
-            "latest_institution_buy_amount_cny": sum(item["buy_amount_cny"] or 0 for item in institutions),
-            "latest_institution_sell_amount_cny": sum(item["sell_amount_cny"] or 0 for item in institutions),
-            "latest_institution_net_amount_cny": sum(item["net_amount_cny"] or 0 for item in institutions),
-            "historical_comparison": dated_window_totals(records, "trade_date", ("total_buy_amount_cny", "total_sell_amount_cny", "total_net_amount_cny")),
-            "historical_comparison_scope": "all_disclosed_dragon_tiger_totals_not_institution_only; first_page_up_to_30_disclosures",
-            "seat_source_errors": errors, "source": "eastmoney_dragon_tiger_disclosure"}
+    return {
+        "items": records[:limit],
+        "latest_seat_trade_date": latest,
+        "latest_disclosed_seats": seats,
+        "latest_institution_seats": institutions,
+        "latest_institution_buy_amount_cny": sum(
+            item["buy_amount_cny"] or 0 for item in institutions
+        ),
+        "latest_institution_sell_amount_cny": sum(
+            item["sell_amount_cny"] or 0 for item in institutions
+        ),
+        "latest_institution_net_amount_cny": sum(
+            item["net_amount_cny"] or 0 for item in institutions
+        ),
+        "historical_comparison": dated_window_totals(
+            records,
+            "trade_date",
+            ("total_buy_amount_cny", "total_sell_amount_cny", "total_net_amount_cny"),
+        ),
+        "historical_comparison_scope": "all_disclosed_dragon_tiger_totals_not_institution_only; first_page_up_to_30_disclosures",
+        "seat_source_errors": errors,
+        "source": "eastmoney_dragon_tiger_disclosure",
+    }
 
 
-def get_a_share_capital_activity_data(symbol: str, lookback_days: int, limit: int,
-                                      detail_level: str) -> dict[str, Any]:
+def get_a_share_capital_activity_data(
+    symbol: str, lookback_days: int, limit: int, detail_level: str
+) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     security = security_metadata(symbol)
     if security["security_type"] != "a_share":
-        raise HTTPException(status_code=400, detail="capital activity currently supports ordinary A-share company codes only.")
-    start = (datetime.now(MARKET_TIMEZONE).date() - timedelta(days=lookback_days)).isoformat()
-    loaders = {"dragon_tiger": lambda: capital_activity_dragon_tiger(symbol, start, limit),
-               "block_trades": lambda: capital_activity_block_trades(symbol, start, limit),
-               "institutional_research": lambda: capital_activity_research(symbol, start, limit),
-               "margin": lambda: capital_activity_margin(symbol, start, limit),
-               "shareholder_count": lambda: capital_activity_shareholders(symbol, min(limit, 8))}
-    components, statuses, errors = collect_components(loaders, 10, COMPOSITE_TOOL_EXECUTOR)
+        raise HTTPException(
+            status_code=400,
+            detail="capital activity currently supports ordinary A-share company codes only.",
+        )
+    start = (
+        datetime.now(MARKET_TIMEZONE).date() - timedelta(days=lookback_days)
+    ).isoformat()
+    loaders = {
+        "dragon_tiger": lambda: capital_activity_dragon_tiger(symbol, start, limit),
+        "block_trades": lambda: capital_activity_block_trades(symbol, start, limit),
+        "institutional_research": lambda: capital_activity_research(
+            symbol, start, limit
+        ),
+        "margin": lambda: capital_activity_margin(symbol, start, limit),
+        "shareholder_count": lambda: capital_activity_shareholders(
+            symbol, min(limit, 8)
+        ),
+    }
+    components, statuses, errors = collect_components(
+        loaders, 10, COMPOSITE_TOOL_EXECUTOR
+    )
     if detail_level == "summary":
-        dragon, block = components.get("dragon_tiger", {}), components.get("block_trades", {})
-        research, margin, holders = (components.get("institutional_research", {}), components.get("margin", {}),
-                                     components.get("shareholder_count", {}))
+        dragon, block = (
+            components.get("dragon_tiger", {}),
+            components.get("block_trades", {}),
+        )
+        research, margin, holders = (
+            components.get("institutional_research", {}),
+            components.get("margin", {}),
+            components.get("shareholder_count", {}),
+        )
         components = {
-            "dragon_tiger": {key: dragon.get(key) for key in ("latest_seat_trade_date", "latest_institution_seats", "latest_institution_buy_amount_cny", "latest_institution_sell_amount_cny", "latest_institution_net_amount_cny", "historical_comparison", "source")},
-            "block_trades": {key: block.get(key) for key in ("institution_related_items", "institution_buy_amount_cny", "institution_sell_amount_cny", "historical_comparison", "source")},
-            "institutional_research": {"items": (research.get("items") or [])[:3], "historical_comparison": research.get("historical_comparison"), "source": research.get("source")},
-            "margin": {"latest": next(iter(margin.get("items") or []), None), "historical_comparison_by_sessions": margin.get("historical_comparison_by_sessions"), "source": margin.get("source")},
-            "shareholder_count": {"latest": next(iter(holders.get("items") or []), None), "historical_comparison": holders.get("historical_comparison"), "source": holders.get("source")}}
-    missing = [name for name, status in statuses.items() if status["status"] != "available"]
-    return {"symbol": symbol, "security_type": security["security_type"], "exchange": security["exchange"],
-            "lookback_start_date": start, "lookback_days": lookback_days, "components": components,
-            "component_status": statuses, "missing_fields": missing,
-            "source": sorted({value.get("source") for value in components.values() if isinstance(value, dict) and value.get("source")}),
-            "historical_comparisons": {
-                name: payload.get("historical_comparison") or payload.get("historical_comparison_by_sessions")
-                for name, payload in components.items()
-                if isinstance(payload, dict)
-                and (payload.get("historical_comparison") or payload.get("historical_comparison_by_sessions"))
+            "dragon_tiger": {
+                key: dragon.get(key)
+                for key in (
+                    "latest_seat_trade_date",
+                    "latest_institution_seats",
+                    "latest_institution_buy_amount_cny",
+                    "latest_institution_sell_amount_cny",
+                    "latest_institution_net_amount_cny",
+                    "historical_comparison",
+                    "source",
+                )
             },
-            "source_urls": CAPITAL_ACTIVITY_SOURCE_URLS, "source_errors": errors,
-            "data_status": "full_data" if not missing else "partial_data", "detail_level": detail_level, "queried_at": now_iso(),
-            "interpretation_boundary": {
-                "dragon_tiger": "Only abnormal-trading days and named seats; not all institutional trading or holdings.",
-                "block_trades": "Named seats do not establish the ultimate beneficial owner or future direction.",
-                "institutional_research": "A research visit is contact activity, not evidence of a purchase or endorsement.",
-                "margin": "Margin data are investor-category mixed and not institution-exclusive.",
-                "shareholder_count": "Aggregate holder-count changes do not prove institutional accumulation or distribution.",
-                "overall": "Categories remain separate; no unified real-time institutional net position or trading conclusion is inferred."},
-            "related_tools": ["get_a_share_announcements", "get_fund_exposure"]}
+            "block_trades": {
+                key: block.get(key)
+                for key in (
+                    "institution_related_items",
+                    "institution_buy_amount_cny",
+                    "institution_sell_amount_cny",
+                    "historical_comparison",
+                    "source",
+                )
+            },
+            "institutional_research": {
+                "items": (research.get("items") or [])[:3],
+                "historical_comparison": research.get("historical_comparison"),
+                "source": research.get("source"),
+            },
+            "margin": {
+                "latest": next(iter(margin.get("items") or []), None),
+                "historical_comparison_by_sessions": margin.get(
+                    "historical_comparison_by_sessions"
+                ),
+                "source": margin.get("source"),
+            },
+            "shareholder_count": {
+                "latest": next(iter(holders.get("items") or []), None),
+                "historical_comparison": holders.get("historical_comparison"),
+                "source": holders.get("source"),
+            },
+        }
+    missing = [
+        name for name, status in statuses.items() if status["status"] != "available"
+    ]
+    return {
+        "symbol": symbol,
+        "security_type": security["security_type"],
+        "exchange": security["exchange"],
+        "lookback_start_date": start,
+        "lookback_days": lookback_days,
+        "components": components,
+        "component_status": statuses,
+        "missing_fields": missing,
+        "source": sorted(
+            {
+                value.get("source")
+                for value in components.values()
+                if isinstance(value, dict) and value.get("source")
+            }
+        ),
+        "historical_comparisons": {
+            name: payload.get("historical_comparison")
+            or payload.get("historical_comparison_by_sessions")
+            for name, payload in components.items()
+            if isinstance(payload, dict)
+            and (
+                payload.get("historical_comparison")
+                or payload.get("historical_comparison_by_sessions")
+            )
+        },
+        "source_urls": CAPITAL_ACTIVITY_SOURCE_URLS,
+        "source_errors": errors,
+        "data_status": "full_data" if not missing else "partial_data",
+        "detail_level": detail_level,
+        "queried_at": now_iso(),
+        "interpretation_boundary": {
+            "dragon_tiger": "Only abnormal-trading days and named seats; not all institutional trading or holdings.",
+            "block_trades": "Named seats do not establish the ultimate beneficial owner or future direction.",
+            "institutional_research": "A research visit is contact activity, not evidence of a purchase or endorsement.",
+            "margin": "Margin data are investor-category mixed and not institution-exclusive.",
+            "shareholder_count": "Aggregate holder-count changes do not prove institutional accumulation or distribution.",
+            "overall": "Categories remain separate; no unified real-time institutional net position or trading conclusion is inferred.",
+        },
+        "related_tools": ["get_a_share_announcements", "get_fund_exposure"],
+    }
 
 
 IPO_CALENDAR_API = EASTMONEY_DATACENTER_API
@@ -7898,7 +9534,9 @@ def normalize_ipo_query(symbol_or_name: str | None) -> str | None:
     normalized = str(symbol_or_name).strip()
     if not normalized:
         return None
-    if len(normalized) > 30 or not re.fullmatch(r"[0-9A-Za-z\u4e00-\u9fff·()（）-]+", normalized):
+    if len(normalized) > 30 or not re.fullmatch(
+        r"[0-9A-Za-z\u4e00-\u9fff·()（）-]+", normalized
+    ):
         raise HTTPException(
             status_code=400,
             detail="symbol_or_name must be an exact six-digit IPO code or a short company name.",
@@ -7962,10 +9600,14 @@ def get_fast_ipo_calendar_rows(fetch_limit: int) -> list[dict[str, Any]]:
             attempts=1,
         )
         if not isinstance(payload, dict) or payload.get("success") is False:
-            raise HTTPException(status_code=502, detail="Unexpected fast IPO calendar response.")
+            raise HTTPException(
+                status_code=502, detail="Unexpected fast IPO calendar response."
+            )
         result = payload.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("data"), list):
-            raise HTTPException(status_code=502, detail="Unexpected fast IPO calendar response.")
+            raise HTTPException(
+                status_code=502, detail="Unexpected fast IPO calendar response."
+            )
         return {
             "rows": [
                 normalize_fast_ipo_row(row)
@@ -7991,7 +9633,9 @@ def get_datacenter_ipo_calendar_rows(
         "pageNumber": 1,
     }
     if query:
-        field = "SECURITY_CODE" if SYMBOL_PATTERN.fullmatch(query) else "SECURITY_NAME_ABBR"
+        field = (
+            "SECURITY_CODE" if SYMBOL_PATTERN.fullmatch(query) else "SECURITY_NAME_ABBR"
+        )
         parameters["filter"] = f'({field}="{query}")'
 
     def load_rows() -> list[Any]:
@@ -8002,16 +9646,22 @@ def get_datacenter_ipo_calendar_rows(
             attempts=1,
         )
         if not isinstance(payload, dict):
-            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+            raise HTTPException(
+                status_code=502, detail="Unexpected public IPO calendar response."
+            )
         if payload.get("success") is False:
             if "数据为空" in str(payload.get("message") or ""):
                 return []
-            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+            raise HTTPException(
+                status_code=502, detail="Unexpected public IPO calendar response."
+            )
         result = payload.get("result")
         if result is None:
             return []
         if not isinstance(result, dict):
-            raise HTTPException(status_code=502, detail="Unexpected public IPO calendar response.")
+            raise HTTPException(
+                status_code=502, detail="Unexpected public IPO calendar response."
+            )
         return result.get("data") or []
 
     rows = load_rows()
@@ -8019,7 +9669,9 @@ def get_datacenter_ipo_calendar_rows(
         parameters["filter"] = f'(APPLY_CODE="{query}")'
         rows = load_rows()
     if not isinstance(rows, list):
-        raise HTTPException(status_code=502, detail="IPO calendar rows had an unexpected format.")
+        raise HTTPException(
+            status_code=502, detail="IPO calendar rows had an unexpected format."
+        )
     return [row for row in rows if isinstance(row, dict)]
 
 
@@ -8062,7 +9714,9 @@ def ipo_subscription_stage(row: dict[str, Any], today: str) -> str:
     apply_date = ipo_calendar_date(row.get("APPLY_DATE"))
     assign_date = ipo_calendar_date(row.get("ASSIGN_DATE"))
     ballot_date = ipo_calendar_date(row.get("BALLOT_NUM_DATE"))
-    payment_date = ipo_calendar_date(row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE"))
+    payment_date = ipo_calendar_date(
+        row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE")
+    )
     listing_date = ipo_calendar_date(row.get("LISTING_DATE"))
     if listing_date and listing_date <= today:
         return "listed"
@@ -8097,11 +9751,17 @@ def ipo_market_rules(row: dict[str, Any]) -> dict[str, Any]:
             "market_value_per_subscription_unit_cny": None,
             "market_value_calculation": None,
             "eligible_securities_scope": None,
-            "subscription_unit_shares": int(to_number(row.get("EACHBALLOT_SHARES")) or 100),
+            "subscription_unit_shares": int(
+                to_number(row.get("EACHBALLOT_SHARES")) or 100
+            ),
             "funding_timing": "full_subscription_cash_required_on_subscription_day",
             "official_rule_url": IPO_RULE_SOURCES["bse"],
         }
-    exchange = "SSE" if "上交所" in market or str(row.get("SECURITY_CODE") or "").startswith("6") else "SZSE"
+    exchange = (
+        "SSE"
+        if "上交所" in market or str(row.get("SECURITY_CODE") or "").startswith("6")
+        else "SZSE"
+    )
     required_permission = "corresponding_a_share_market_account"
     if "科创板" in market:
         required_permission = "star_market_trading_permission"
@@ -8121,7 +9781,9 @@ def ipo_market_rules(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[str, Any]:
+def build_ipo_subscription_item(
+    row: dict[str, Any], detail_level: str
+) -> dict[str, Any]:
     today = datetime.now(MARKET_TIMEZONE).date().isoformat()
     rules = ipo_market_rules(row)
     issue_price = to_number(row.get("ISSUE_PRICE") or row.get("ONLINE_APPLY_PRICE"))
@@ -8138,18 +9800,32 @@ def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[
     ]
     item = {
         "security_code": clean_value(row.get("SECURITY_CODE")),
-        "security_name": clean_value(row.get("SECURITY_NAME_ABBR") or row.get("SECURITY_NAME")),
+        "security_name": clean_value(
+            row.get("SECURITY_NAME_ABBR") or row.get("SECURITY_NAME")
+        ),
         "subscription_code": clean_value(row.get("APPLY_CODE")),
         "market": clean_value(row.get("MARKET") or row.get("TRADE_MARKET"))
-        or ({"SSE": "上海证券交易所", "SZSE": "深圳证券交易所", "BSE": "北京证券交易所"}[rules["exchange"]]),
+        or (
+            {
+                "SSE": "上海证券交易所",
+                "SZSE": "深圳证券交易所",
+                "BSE": "北京证券交易所",
+            }[rules["exchange"]]
+        ),
         "subscription_stage": ipo_subscription_stage(row, today),
         "subscription_date": ipo_calendar_date(row.get("APPLY_DATE")),
         "allocation_number_date": ipo_calendar_date(row.get("ASSIGN_DATE")),
-        "ballot_result_date": ipo_calendar_date(row.get("BALLOT_NUM_DATE") or row.get("RESULT_NOTICE_DATE")),
-        "payment_date": ipo_calendar_date(row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE")),
+        "ballot_result_date": ipo_calendar_date(
+            row.get("BALLOT_NUM_DATE") or row.get("RESULT_NOTICE_DATE")
+        ),
+        "payment_date": ipo_calendar_date(
+            row.get("BALLOT_PAY_DATE") or row.get("ONLINE_PAY_DATE")
+        ),
         "listing_date": ipo_calendar_date(row.get("LISTING_DATE")),
         "issue_price_cny": issue_price,
-        "online_subscription_limit_shares": int(online_apply_upper) if online_apply_upper is not None else None,
+        "online_subscription_limit_shares": int(online_apply_upper)
+        if online_apply_upper is not None
+        else None,
         "subscription_unit_shares": unit_shares,
         "maximum_subscription_cash_cny": (
             round(online_apply_upper * issue_price, 2)
@@ -8157,7 +9833,11 @@ def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[
             else None
         ),
         "maximum_subscription_market_value_requirement_cny": (
-            int(online_apply_upper / unit_shares * rules["market_value_per_subscription_unit_cny"])
+            int(
+                online_apply_upper
+                / unit_shares
+                * rules["market_value_per_subscription_unit_cny"]
+            )
             if online_apply_upper is not None
             and rules["market_value_per_subscription_unit_cny"] is not None
             else None
@@ -8170,7 +9850,8 @@ def build_ipo_subscription_item(row: dict[str, Any], detail_level: str) -> dict[
     if detail_level == "raw":
         item.update(
             {
-                "online_issue_shares": int(to_number(row.get("ONLINE_ISSUE_NUM")) or 0) or None,
+                "online_issue_shares": int(to_number(row.get("ONLINE_ISSUE_NUM")) or 0)
+                or None,
                 "issue_method": clean_value(row.get("ISSUE_WAY")),
                 "main_business": clean_value(row.get("MAIN_BUSINESS")),
                 "provider_information_code": clean_value(row.get("INFO_CODE")),
@@ -8203,7 +9884,9 @@ def get_ipo_subscription_status_data(
             and range_start <= apply_date <= range_end
         ][:limit]
     if query and not selected:
-        raise HTTPException(status_code=404, detail=f"No public IPO calendar record found for {query}.")
+        raise HTTPException(
+            status_code=404, detail=f"No public IPO calendar record found for {query}."
+        )
     items = [build_ipo_subscription_item(row, detail_level) for row in selected]
     pending_fields = sorted(
         {
@@ -8219,11 +9902,15 @@ def get_ipo_subscription_status_data(
     )
     return {
         "query": query,
-        "schedule_range": {"start": range_start, "end": range_end} if query is None else None,
+        "schedule_range": {"start": range_start, "end": range_end}
+        if query is None
+        else None,
         "count": len(items),
         "items": items,
         "personalized_eligibility": "not_available_without_brokerage_account_market_value_and_board_permissions",
-        "rule_source_urls": sorted({item["eligibility_rules"]["official_rule_url"] for item in items}),
+        "rule_source_urls": sorted(
+            {item["eligibility_rules"]["official_rule_url"] for item in items}
+        ),
         "source": [route["source"]],
         "source_updated_at": source_update_dates[-1] if source_update_dates else None,
         "source_errors": normalize_source_errors(route.get("source_errors")),
@@ -8242,7 +9929,9 @@ FUND_API_DEVICE_ID = "00000000-0000-0000-0000-000000000000"
 def normalize_fund_code(fund_code: str) -> str:
     normalized = str(fund_code or "").strip()
     if not SYMBOL_PATTERN.fullmatch(normalized):
-        raise HTTPException(status_code=400, detail="fund_code must be a six-digit public fund code.")
+        raise HTTPException(
+            status_code=400, detail="fund_code must be a six-digit public fund code."
+        )
     return normalized
 
 
@@ -8263,7 +9952,9 @@ def get_eastmoney_fund_component(fund_code: str, endpoint: str) -> dict[str, Any
         attempts=2,
     )
     if not isinstance(payload, dict) or payload.get("Success") is False:
-        raise HTTPException(status_code=502, detail=f"Unexpected fund response from {endpoint}.")
+        raise HTTPException(
+            status_code=502, detail=f"Unexpected fund response from {endpoint}."
+        )
     return payload
 
 
@@ -8279,7 +9970,9 @@ def get_cached_fund_component(fund_code: str, endpoint: str) -> dict[str, Any]:
     )
 
 
-def fund_component_date(payload: dict[str, Any], rows: list[dict[str, Any]], field: str) -> str | None:
+def fund_component_date(
+    payload: dict[str, Any], rows: list[dict[str, Any]], field: str
+) -> str | None:
     expansion = clean_value(payload.get("Expansion"))
     if expansion and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(expansion)):
         return str(expansion)
@@ -8311,7 +10004,10 @@ def get_fund_exposure_data(
         loaders, 7, FUND_COMPONENT_EXECUTOR
     )
     if not results:
-        raise HTTPException(status_code=502, detail=f"All public fund exposure sources failed: {fund_code}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"All public fund exposure sources failed: {fund_code}",
+        )
 
     basic = (results.get("basic_information") or {}).get("Datas") or {}
     raw_holdings_container = (results.get("holdings") or {}).get("Datas") or {}
@@ -8347,7 +10043,9 @@ def get_fund_exposure_data(
                 "provider_security_identifier": provider_identifier,
                 "name": clean_value(row.get("GPJC")),
                 "weight_pct": weight,
-                "change_from_previous_disclosure_pct_points": to_number(row.get("PCTNVCHG")),
+                "change_from_previous_disclosure_pct_points": to_number(
+                    row.get("PCTNVCHG")
+                ),
                 "provider_industry_code": clean_value(row.get("INDEXCODE")),
                 "provider_industry_name": clean_value(row.get("INDEXNAME")),
             }
@@ -8440,9 +10138,7 @@ def get_fund_exposure_data(
                     }
                 )
     allocation_sum = sum(
-        value or 0
-        for key, value in asset_allocation.items()
-        if key.endswith("_pct")
+        value or 0 for key, value in asset_allocation.items() if key.endswith("_pct")
     )
     holdings_date = fund_component_date(
         results.get("holdings") or {}, raw_holdings, "FSRQ"
@@ -8461,7 +10157,11 @@ def get_fund_exposure_data(
         missing_fields.append("top_holdings")
     if not industries:
         missing_fields.append("industry_distribution")
-    if not any(value is not None for key, value in asset_allocation.items() if key.endswith("_pct")):
+    if not any(
+        value is not None
+        for key, value in asset_allocation.items()
+        if key.endswith("_pct")
+    ):
         missing_fields.append("asset_allocation")
     if underlying_fund_code and look_through_depth > 0 and not look_through_holdings:
         missing_fields.append("look_through_holdings")
@@ -8489,9 +10189,15 @@ def get_fund_exposure_data(
     all_source_errors = [*source_errors, *nested_errors, *look_through_source_errors]
     return {
         "fund_code": fund_code,
-        "fund_name": clean_value(basic.get("SHORTNAME")) if isinstance(basic, dict) else None,
-        "fund_company": clean_value(basic.get("JJGS")) if isinstance(basic, dict) else None,
-        "established_date": clean_value(basic.get("ESTABDATE")) if isinstance(basic, dict) else None,
+        "fund_name": clean_value(basic.get("SHORTNAME"))
+        if isinstance(basic, dict)
+        else None,
+        "fund_company": clean_value(basic.get("JJGS"))
+        if isinstance(basic, dict)
+        else None,
+        "established_date": clean_value(basic.get("ESTABDATE"))
+        if isinstance(basic, dict)
+        else None,
         "latest_nav": to_number(basic.get("DWJZ")) if isinstance(basic, dict) else None,
         "nav_date": clean_value(basic.get("FSRQ")) if isinstance(basic, dict) else None,
         "disclosure_dates": disclosure_dates,
@@ -8621,35 +10327,59 @@ def normalized_portfolio_positions(
     positions: list[dict[str, Any]], normalize_weights: bool
 ) -> tuple[list[dict[str, Any]], float]:
     if not positions:
-        raise HTTPException(status_code=400, detail="positions must contain at least one position.")
+        raise HTTPException(
+            status_code=400, detail="positions must contain at least one position."
+        )
     if len(positions) > 20:
-        raise HTTPException(status_code=400, detail="At most 20 portfolio positions are supported.")
+        raise HTTPException(
+            status_code=400, detail="At most 20 portfolio positions are supported."
+        )
     combined: dict[tuple[str, str], dict[str, Any]] = {}
     for raw in positions:
         if not isinstance(raw, dict):
-            raise HTTPException(status_code=400, detail="Each position must be an object.")
-        identifier = str(raw.get("identifier") or raw.get("symbol") or raw.get("fund_code") or "").strip()
+            raise HTTPException(
+                status_code=400, detail="Each position must be an object."
+            )
+        identifier = str(
+            raw.get("identifier") or raw.get("symbol") or raw.get("fund_code") or ""
+        ).strip()
         if not SYMBOL_PATTERN.fullmatch(identifier):
-            raise HTTPException(status_code=400, detail="Each position identifier must be a six-digit code.")
+            raise HTTPException(
+                status_code=400,
+                detail="Each position identifier must be a six-digit code.",
+            )
         weight = to_number(raw.get("weight_pct"))
         if weight is None or weight <= 0:
-            raise HTTPException(status_code=400, detail=f"weight_pct must be positive for {identifier}.")
+            raise HTTPException(
+                status_code=400, detail=f"weight_pct must be positive for {identifier}."
+            )
         asset_type = str(raw.get("asset_type") or "auto").strip().lower()
         if asset_type not in {"auto", "fund", "stock"}:
-            raise HTTPException(status_code=400, detail="asset_type must be auto, fund, or stock.")
+            raise HTTPException(
+                status_code=400, detail="asset_type must be auto, fund, or stock."
+            )
         if asset_type == "auto":
             security = security_metadata(identifier)
-            asset_type = "fund" if security["security_type"] in {"etf", "lof"} else "stock"
+            asset_type = (
+                "fund" if security["security_type"] in {"etf", "lof"} else "stock"
+            )
         key = (identifier, asset_type)
         combined.setdefault(
             key,
-            {"identifier": identifier, "asset_type": asset_type, "input_weight_pct": 0.0},
+            {
+                "identifier": identifier,
+                "asset_type": asset_type,
+                "input_weight_pct": 0.0,
+            },
         )
         combined[key]["input_weight_pct"] += weight
     normalized = list(combined.values())
     total = sum(item["input_weight_pct"] for item in normalized)
     if not normalize_weights and total > 100.0001:
-        raise HTTPException(status_code=400, detail="Total weight_pct must not exceed 100 when normalize_weights is false.")
+        raise HTTPException(
+            status_code=400,
+            detail="Total weight_pct must not exceed 100 when normalize_weights is false.",
+        )
     factor = 100 / total if normalize_weights else 1
     for item in normalized:
         item["portfolio_weight_pct"] = round(item["input_weight_pct"] * factor, 8)
@@ -8662,21 +10392,26 @@ def get_portfolio_exposure_data(
     holdings_limit: int,
     detail_level: str,
 ) -> dict[str, Any]:
-    normalized, input_total = normalized_portfolio_positions(positions, normalize_weights)
+    normalized, input_total = normalized_portfolio_positions(
+        positions, normalize_weights
+    )
     fund_positions = [item for item in normalized if item["asset_type"] == "fund"]
     stock_positions = [item for item in normalized if item["asset_type"] == "stock"]
     if len(fund_positions) > 10:
-        raise HTTPException(status_code=400, detail="At most 10 fund positions can be looked through per request.")
+        raise HTTPException(
+            status_code=400,
+            detail="At most 10 fund positions can be looked through per request.",
+        )
     loaders = {
         **{
-            f"fund:{item['identifier']}": lambda item=item: get_cached_fund_exposure_data(
-                item["identifier"], holdings_limit, "raw"
+            f"fund:{item['identifier']}": lambda item=item: (
+                get_cached_fund_exposure_data(item["identifier"], holdings_limit, "raw")
             )
             for item in fund_positions
         },
         **{
-            f"stock:{item['identifier']}": lambda item=item: get_fast_portfolio_security_reference(
-                item["identifier"]
+            f"stock:{item['identifier']}": lambda item=item: (
+                get_fast_portfolio_security_reference(item["identifier"])
             )
             for item in stock_positions
         },
@@ -8690,7 +10425,13 @@ def get_portfolio_exposure_data(
     underlying: dict[str, dict[str, Any]] = {}
     known_underlying_industry_exposure: dict[str, float] = {}
     fund_reported_industry_exposure: dict[str, float] = {}
-    allocation = {"stock_pct": 0.0, "bond_pct": 0.0, "cash_pct": 0.0, "other_pct": 0.0, "fund_pct": 0.0}
+    allocation = {
+        "stock_pct": 0.0,
+        "bond_pct": 0.0,
+        "cash_pct": 0.0,
+        "other_pct": 0.0,
+        "fund_pct": 0.0,
+    }
     unresolved_weight = 0.0
     fund_disclosure_dates: dict[str, str | None] = {}
     position_results = []
@@ -8757,17 +10498,26 @@ def get_portfolio_exposure_data(
                     known_underlying_industry_exposure.get(str(industry), 0.0) + weight
                 )
             position_results.append(
-                {**position, "status": "available" if payload else "partial_data", "name": clean_value((payload or {}).get("name")), "industry": industry}
+                {
+                    **position,
+                    "status": "available" if payload else "partial_data",
+                    "name": clean_value((payload or {}).get("name")),
+                    "industry": industry,
+                }
             )
             continue
 
-        fund_disclosure_dates[identifier] = (payload or {}).get("holdings_disclosure_date")
+        fund_disclosure_dates[identifier] = (payload or {}).get(
+            "holdings_disclosure_date"
+        )
         if not payload:
             unresolved_weight += weight
             position_results.append({**position, "status": "unavailable"})
             continue
         child_status = str(payload.get("data_status") or "")
-        component_status.setdefault(component_key, {})["child_data_status"] = child_status or None
+        component_status.setdefault(component_key, {})["child_data_status"] = (
+            child_status or None
+        )
         if child_status and child_status != "full_data":
             partial_child_components.append(component_key)
         for error in normalize_source_errors(payload.get("source_errors")):
@@ -8931,7 +10681,9 @@ def get_portfolio_exposure_data(
         "unresolved_asset_allocation_weight_pct": round(unresolved_weight, 8),
         "represented_position_weight_pct": round(represented_weight, 8),
         "unallocated_input_weight_pct": round(max(0.0, 100 - represented_weight), 8),
-        "disclosed_underlying_covered_weight_pct": round(disclosed_underlying_weight, 8),
+        "disclosed_underlying_covered_weight_pct": round(
+            disclosed_underlying_weight, 8
+        ),
         "not_looked_through_position_weight_pct": round(
             max(0.0, represented_weight - disclosed_underlying_weight), 8
         ),
@@ -9150,7 +10902,8 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
     if payload is None:
         raise HTTPException(
             status_code=502,
-            detail="Fast market aggregate unavailable within 6.5 seconds: " + "; ".join(errors),
+            detail="Fast market aggregate unavailable within 6.5 seconds: "
+            + "; ".join(errors),
         )
     rows = ((payload.get("data") or {}).get("diff")) or []
     exchange_by_symbol = {"000002": "SSE", "399107": "SZSE", "899050": "BSE"}
@@ -9206,7 +10959,9 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
             result[key] = None
         return result
 
-    market_times = [item["market_time"] for item in parsed.values() if item["market_time"]]
+    market_times = [
+        item["market_time"] for item in parsed.values() if item["market_time"]
+    ]
     market_time = max(market_times) if market_times else None
     by_exchange_turnover = {
         exchange: parsed[exchange]["turnover"] for exchange in ("SSE", "SZSE", "BSE")
@@ -9216,7 +10971,8 @@ def get_eastmoney_market_aggregate() -> dict[str, Any]:
             "scope": "Ordinary A-share exchange aggregates for SSE, SZSE, and BSE; detailed price-band and limit statistics require the slower security-level fallback.",
             "all_market": aggregate_counts(),
             "by_exchange": {
-                exchange: aggregate_counts(exchange) for exchange in ("SSE", "SZSE", "BSE")
+                exchange: aggregate_counts(exchange)
+                for exchange in ("SSE", "SZSE", "BSE")
             },
             "consecutive_limit_up_status": "unavailable_without_a_historical_limit-up_pool",
         },
@@ -9280,7 +11036,10 @@ def build_market_cross_checks(
     if primary_index_equal_weight_change_pct is not None:
         for board in industry_boards:
             change_pct = to_number(board.get("change_pct"))
-            if change_pct is None or change_pct <= primary_index_equal_weight_change_pct:
+            if (
+                change_pct is None
+                or change_pct <= primary_index_equal_weight_change_pct
+            ):
                 continue
             relative_resilience_candidates.append(
                 {
@@ -9331,6 +11090,343 @@ def build_market_cross_checks(
     }
 
 
+MEDIUM_TERM_INDEX_PANEL = {
+    "000300": "large_core",
+    "000905": "mid_cap",
+    "399852": "small_cap",
+    "399006": "growth",
+    "000922": "defensive_dividend",
+}
+MEDIUM_TERM_INDEX_WINDOWS = (20, 60, 120)
+
+
+def get_cached_index_daily_history(symbol: str, limit: int = 130) -> dict[str, Any]:
+    secid = INDEX_SECID_BY_SYMBOL[symbol]
+    now = datetime.now(MARKET_TIMEZONE)
+    completion_phase = (
+        "after_1505" if (now.hour, now.minute) >= (15, 5) else "before_1505"
+    )
+    key = cache_key(
+        "representative_index_daily_history",
+        {
+            "symbol": symbol,
+            "limit": limit,
+            "trade_date": now.date().isoformat(),
+            "completion_phase": completion_phase,
+        },
+    )
+
+    def load() -> dict[str, Any]:
+        payload, _, errors = race_public_sources(
+            (
+                (
+                    "eastmoney_index_history",
+                    lambda: get_eastmoney_generic_daily_kline(secid, limit),
+                ),
+                (
+                    "tencent_index_history",
+                    lambda: get_tencent_index_daily_kline(symbol, limit),
+                ),
+            ),
+            5,
+        )
+        payload["source_errors"] = [
+            *normalize_source_errors(payload.get("source_errors")),
+            *normalize_source_errors(errors),
+        ]
+        return payload
+
+    return get_cached_component_with_stale(key, 900, 604800, load)
+
+
+def _representative_index_window_metrics(
+    completed_items: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    windows = {}
+    for window in MEDIUM_TERM_INDEX_WINDOWS:
+        metrics = historical_window_metrics(completed_items, window)
+        windows[str(window)] = {
+            key: metrics.get(key)
+            for key in (
+                "window_complete",
+                "start_date",
+                "end_date",
+                "return_pct",
+                "annualized_volatility_pct",
+                "maximum_drawdown_pct",
+                "distance_from_high_pct",
+                "distance_from_low_pct",
+            )
+        }
+    return windows
+
+
+def _medium_term_path_pattern(
+    coverage_sufficient: bool,
+    window_summary: dict[str, dict[str, Any]],
+) -> str:
+    if not coverage_sufficient:
+        return "insufficient_panel_coverage"
+
+    directions = {}
+    for window in MEDIUM_TERM_INDEX_WINDOWS:
+        summary = window_summary.get(str(window)) or {}
+        positive_share = to_number(summary.get("positive_share_pct"))
+        negative_share = to_number(summary.get("negative_share_pct"))
+        directions[window] = (
+            "positive"
+            if positive_share is not None and positive_share >= 60
+            else "negative"
+            if negative_share is not None and negative_share >= 60
+            else "mixed"
+        )
+    if all(directions[window] == "positive" for window in MEDIUM_TERM_INDEX_WINDOWS):
+        return "positive_across_20_60_120"
+    if all(directions[window] == "negative" for window in MEDIUM_TERM_INDEX_WINDOWS):
+        return "negative_across_20_60_120"
+    if directions[20] == "positive" and directions[60] == directions[120] == "negative":
+        return "short_repair_against_negative_60_120"
+    if directions[20] == "negative" and directions[60] == directions[120] == "positive":
+        return "short_pullback_with_positive_60_120"
+    return "mixed_cross_index_paths"
+
+
+def build_medium_term_index_background(
+    histories: dict[str, dict[str, Any]],
+    component_status: dict[str, dict[str, Any]],
+    source_errors: list[dict[str, Any]],
+    reference_time: str | None = None,
+) -> dict[str, Any]:
+    reference_clock = parse_market_datetime(reference_time) or datetime.now(
+        MARKET_TIMEZONE
+    )
+    reference_iso = reference_clock.isoformat()
+    panel = []
+    future_bar_count = 0
+    for symbol, cohort in MEDIUM_TERM_INDEX_PANEL.items():
+        payload = histories.get(symbol)
+        if not payload:
+            continue
+        by_date: dict[str, dict[str, Any]] = {}
+        for item in payload.get("items") or []:
+            trade_date = clean_value(item.get("date"))
+            if not trade_date:
+                continue
+            try:
+                parsed_date = date.fromisoformat(str(trade_date)[:10])
+            except ValueError:
+                continue
+            if parsed_date > reference_clock.date():
+                future_bar_count += 1
+                continue
+            by_date[parsed_date.isoformat()] = item
+        ordered = [by_date[key] for key in sorted(by_date)]
+        completed_items, excluded_incomplete = completed_daily_history(
+            ordered, reference_clock
+        )
+        latest_date = (
+            clean_value(completed_items[-1].get("date")) if completed_items else None
+        )
+        alignment = completed_history_alignment(latest_date, reference_iso)
+        panel.append(
+            {
+                "identifier": f"index:{symbol}",
+                "symbol": symbol,
+                "name": payload.get("name") or INDEX_IDENTITY[symbol]["expected_name"],
+                "cohort": cohort,
+                "latest_complete_trade_date": latest_date,
+                "alignment_status": alignment["status"],
+                "excluded_current_incomplete_bar": excluded_incomplete,
+                "windows": _representative_index_window_metrics(completed_items),
+                "source": payload.get("source"),
+                "source_errors": normalize_source_errors(payload.get("source_errors")),
+                "served_from_stale_cache": bool(payload.get("served_from_stale_cache")),
+                "data_status": (
+                    "full_data"
+                    if len(completed_items) >= max(MEDIUM_TERM_INDEX_WINDOWS) + 1
+                    else "partial_data"
+                ),
+            }
+        )
+
+    date_counts: dict[str, int] = {}
+    for item in panel:
+        value = item.get("latest_complete_trade_date")
+        if value:
+            date_counts[str(value)] = date_counts.get(str(value), 0) + 1
+    common_date = (
+        max(date_counts, key=lambda value: (date_counts[value], value))
+        if date_counts
+        else None
+    )
+    eligible = [
+        item
+        for item in panel
+        if item.get("latest_complete_trade_date") == common_date
+        and item.get("alignment_status")
+        in {"aligned_to_snapshot", "expected_intraday_one_session_lag"}
+    ]
+    eligible_cohorts = {str(item.get("cohort")) for item in eligible}
+    balanced_panel_coverage = (
+        len(eligible) >= 4
+        and "large_core" in eligible_cohorts
+        and bool({"mid_cap", "small_cap"} & eligible_cohorts)
+        and bool({"growth", "defensive_dividend"} & eligible_cohorts)
+    )
+    window_summary = {}
+    for window in MEDIUM_TERM_INDEX_WINDOWS:
+        values = [
+            value
+            for item in eligible
+            if (item.get("windows") or {}).get(str(window), {}).get("window_complete")
+            and (
+                value := to_number(
+                    (item.get("windows") or {}).get(str(window), {}).get("return_pct")
+                )
+            )
+            is not None
+        ]
+        window_summary[str(window)] = {
+            "eligible_index_count": len(values),
+            "positive_count": sum(value > 0 for value in values),
+            "negative_count": sum(value < 0 for value in values),
+            "flat_count": sum(value == 0 for value in values),
+            "positive_share_pct": (
+                round(sum(value > 0 for value in values) / len(values) * 100, 4)
+                if values
+                else None
+            ),
+            "negative_share_pct": (
+                round(sum(value < 0 for value in values) / len(values) * 100, 4)
+                if values
+                else None
+            ),
+            "median_return_pct": median_number(values),
+            "minimum_return_pct": min(values) if values else None,
+            "maximum_return_pct": max(values) if values else None,
+            "cross_sectional_range_pct_points": (
+                round(max(values) - min(values), 4) if values else None
+            ),
+        }
+    coverage_sufficient = balanced_panel_coverage and all(
+        (window_summary.get(str(window)) or {}).get("eligible_index_count", 0) >= 4
+        for window in MEDIUM_TERM_INDEX_WINDOWS
+    )
+    excluded_unaligned = [item["identifier"] for item in panel if item not in eligible]
+    path_pattern = _medium_term_path_pattern(coverage_sufficient, window_summary)
+    return {
+        "scope": "representative_index_completed_daily_price_history",
+        "point_in_time_market_breadth_available": False,
+        "reference_time": reference_iso,
+        "common_complete_trade_date": common_date,
+        "panel": panel,
+        "window_summary": window_summary,
+        "mechanical_path_pattern": path_pattern,
+        "coverage_status": (
+            "sufficient_balanced_panel"
+            if coverage_sufficient
+            else "insufficient_panel_coverage"
+        ),
+        "component_status": component_status,
+        "source_errors": source_errors,
+        "data_quality": {
+            "lookahead_guard": "future_and_current_incomplete_daily_bars_excluded_before_metrics",
+            "future_bar_count": future_bar_count,
+            "excluded_unaligned_indices": excluded_unaligned,
+            "historical_breadth_status": "unavailable_not_estimated",
+            "boundary": (
+                "Representative index price paths only; not historical all-market breadth, "
+                "a forecast, a market regime assignment, or a trade signal."
+            ),
+        },
+        "data_status": (
+            "full_data"
+            if coverage_sufficient and not source_errors and future_bar_count == 0
+            else "partial_data"
+            if panel
+            else "no_data"
+        ),
+    }
+
+
+def get_medium_term_index_background() -> dict[str, Any]:
+    histories, statuses, errors = collect_components(
+        {
+            symbol: lambda symbol=symbol: get_cached_index_daily_history(symbol, 130)
+            for symbol in MEDIUM_TERM_INDEX_PANEL
+        },
+        6,
+        COMPOSITE_TOOL_EXECUTOR,
+    )
+    return build_medium_term_index_background(histories, statuses, errors)
+
+
+def classify_current_market_snapshot_pattern(
+    breadth_participation: dict[str, Any],
+    primary_index_participation: dict[str, Any],
+    style_index_participation: dict[str, Any],
+    industry_board_universe_participation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify only simultaneous participation facts, never a future regime."""
+    rise_share = to_number(breadth_participation.get("rise_share_pct"))
+    primary_positive_share = to_number(
+        primary_index_participation.get("positive_share_pct")
+    )
+    style_positive_share = to_number(
+        style_index_participation.get("positive_share_pct")
+    )
+    board_positive_share = to_number(
+        (industry_board_universe_participation or {}).get("positive_share_pct")
+    )
+    missing = [
+        name
+        for name, value in (
+            ("market_breadth", rise_share),
+            ("primary_indices", primary_positive_share),
+            ("industry_board_universe", board_positive_share),
+        )
+        if value is None
+    ]
+    if rise_share is None or primary_positive_share is None:
+        pattern = "insufficient_current_participation_evidence"
+    elif rise_share >= 60 and primary_positive_share >= 66.6667:
+        pattern = (
+            "broad_positive_participation"
+            if board_positive_share is not None and board_positive_share >= 55
+            else "broad_stock_and_index_participation_board_confirmation_unavailable"
+        )
+    elif rise_share <= 40 and primary_positive_share <= 33.3333:
+        pattern = (
+            "broad_negative_participation"
+            if board_positive_share is not None and board_positive_share <= 45
+            else "broad_stock_and_index_weakness_board_confirmation_unavailable"
+        )
+    elif rise_share < 50 and primary_positive_share > 50:
+        pattern = "index_resilience_with_narrow_stock_participation"
+    elif rise_share >= 55 and primary_positive_share <= 50:
+        pattern = "stock_participation_stronger_than_primary_indices"
+    elif (
+        board_positive_share is not None
+        and board_positive_share >= 55
+        and rise_share < 50
+    ):
+        pattern = "selective_sector_participation_with_weak_breadth"
+    else:
+        pattern = "mixed_or_selective_current_participation"
+    return {
+        "pattern": pattern,
+        "inputs": {
+            "stock_rise_share_pct": rise_share,
+            "primary_index_positive_share_pct": primary_positive_share,
+            "style_index_positive_share_pct": style_positive_share,
+            "industry_board_positive_share_pct": board_positive_share,
+        },
+        "missing_inputs": missing,
+        "time_scope": "single_current_snapshot",
+        "prediction_status": "not_a_forecast_or_regime_assignment",
+    }
+
+
 def build_current_market_structure(
     indices: list[dict[str, Any]],
     style_indices: list[dict[str, Any]],
@@ -9360,16 +11456,25 @@ def build_current_market_structure(
         if fall_count is not None and observed_total
         else None,
     }
+    primary_participation = summarize_change_participation(indices)
+    style_participation = summarize_change_participation(style_indices)
+    snapshot_pattern = classify_current_market_snapshot_pattern(
+        breadth_participation,
+        primary_participation,
+        style_participation,
+        industry_board_universe_summary,
+    )
     return {
         "current_snapshot_only": True,
         "breadth_participation": breadth_participation,
-        "primary_index_participation": summarize_change_participation(indices),
-        "style_index_participation": summarize_change_participation(style_indices),
+        "primary_index_participation": primary_participation,
+        "style_index_participation": style_participation,
         "returned_leading_board_sample": {
             **summarize_change_participation(industry_boards),
             "selection_bias": "top_current_change_sample_not_sector_universe",
         },
         "industry_board_universe_participation": industry_board_universe_summary,
+        "snapshot_pattern": snapshot_pattern,
         "stabilization_confirmation_status": (
             "current_snapshot_cannot_confirm_multi_session_stabilization"
         ),
@@ -9391,6 +11496,12 @@ def build_current_market_structure(
 def get_market_overview_data(limit: int) -> dict[str, Any]:
     started_at = perf_counter()
     response_budget_seconds = 9.0
+    overview_now = datetime.now(MARKET_TIMEZONE)
+    history_completion_phase = (
+        "after_1505"
+        if (overview_now.hour, overview_now.minute) >= (15, 5)
+        else "before_1505"
+    )
     component_specs = {
         "indices": {
             "key": cache_key("overview_component_indices", {}),
@@ -9415,6 +11526,18 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             "ttl": 30,
             "max_stale_age": 3600,
             "loader": lambda: get_limit_activity_data(10),
+        },
+        "medium_term_index_background": {
+            "key": cache_key(
+                "overview_component_medium_term_index_background",
+                {
+                    "trade_date": overview_now.date().isoformat(),
+                    "completion_phase": history_completion_phase,
+                },
+            ),
+            "ttl": 300,
+            "max_stale_age": 3600,
+            "loader": get_medium_term_index_background,
         },
     }
 
@@ -9448,7 +11571,9 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             source_errors.append(f"{name}: {exc}")
 
     missing_names = {futures[future] for future in pending} | (
-        set(component_specs) - set(component_results) - {futures[future] for future in pending}
+        set(component_specs)
+        - set(component_results)
+        - {futures[future] for future in pending}
     )
     for name in missing_names:
         spec = component_specs[name]
@@ -9487,6 +11612,24 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     turnover = breadth_component.get("turnover")
     limit_component = component_results.get("limit_activity") or {}
     limit_activity_stats = limit_component.get("statistics")
+    medium_term_index_background = deepcopy(
+        component_results.get("medium_term_index_background") or {}
+    ) or {
+        "scope": "representative_index_completed_daily_price_history",
+        "point_in_time_market_breadth_available": False,
+        "panel": [],
+        "window_summary": {},
+        "mechanical_path_pattern": "insufficient_panel_coverage",
+        "coverage_status": "unavailable",
+        "data_status": "no_data",
+        "data_quality": {
+            "historical_breadth_status": "unavailable_not_estimated",
+            "boundary": (
+                "Representative index price paths only; not historical all-market breadth, "
+                "a forecast, a market regime assignment, or a trade signal."
+            ),
+        },
+    }
     if breadth and limit_activity_stats:
         all_counts = breadth.get("all_market") or {}
         for key in (
@@ -9498,12 +11641,35 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             "st_limit_down_count",
         ):
             all_counts[key] = limit_activity_stats.get(key)
-        for exchange, exchange_counts in (limit_component.get("by_exchange") or {}).items():
+        for exchange, exchange_counts in (
+            limit_component.get("by_exchange") or {}
+        ).items():
             breadth_exchange = (breadth.get("by_exchange") or {}).get(exchange)
             if breadth_exchange:
                 breadth_exchange.update(exchange_counts)
         breadth["consecutive_limit_up_status"] = "available_from_public_limit_up_pool"
     market_time = latest_market_time(indices) or breadth_component.get("market_time")
+    medium_term_overview_alignment = completed_history_alignment(
+        clean_value(medium_term_index_background.get("common_complete_trade_date")),
+        market_time,
+        overview_now.isoformat(),
+    )
+    medium_term_index_background.setdefault("data_quality", {})[
+        "market_overview_alignment"
+    ] = medium_term_overview_alignment
+    if medium_term_overview_alignment["status"] not in {
+        "aligned_to_snapshot",
+        "expected_intraday_one_session_lag",
+    }:
+        medium_term_index_background["coverage_status"] = (
+            "quality_hold_market_overview_time_mismatch"
+        )
+        medium_term_index_background["mechanical_path_pattern"] = (
+            "insufficient_panel_coverage"
+        )
+        medium_term_index_background["data_status"] = (
+            "partial_data" if medium_term_index_background.get("panel") else "no_data"
+        )
     if turnover and market_time:
         elapsed = trading_minutes_elapsed(market_time)
         current_turnover = turnover.get("current")
@@ -9523,13 +11689,25 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
     source_errors.extend(board_component.get("source_errors", []))
     source_errors.extend(breadth_component.get("source_errors", []))
     source_errors.extend(limit_component.get("source_errors", []))
+    source_errors.extend(
+        f"medium_term_index_background:{error.get('source', 'unknown')}: {error.get('message', error)}"
+        if isinstance(error, dict)
+        else f"medium_term_index_background: {error}"
+        for error in medium_term_index_background.get("source_errors", [])
+    )
     sources = [f"indices:{index_source}"]
     if boards:
         sources.append(f"industry_boards:{board_source}")
     if breadth:
-        sources.append(f"market_breadth:{breadth_component.get('source', 'unavailable')}")
+        sources.append(
+            f"market_breadth:{breadth_component.get('source', 'unavailable')}"
+        )
     if limit_activity_stats:
         sources.append("limit_activity:eastmoney_public_pools")
+    if medium_term_index_background.get("panel"):
+        sources.append(
+            "medium_term_index_background:representative_completed_index_history"
+        )
 
     primary_indices = [
         index for index in indices if index.get("symbol") in PRIMARY_INDEX_SYMBOLS
@@ -9563,13 +11741,11 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "limit_down_count",
         "open_board_count",
     )
-    unavailable_breadth_detail_fields = (
-        [
-            key
-            for key in breadth_detail_fields
-            if not all_market_breadth or all_market_breadth.get(key) is None
-        ]
-    )
+    unavailable_breadth_detail_fields = [
+        key
+        for key in breadth_detail_fields
+        if not all_market_breadth or all_market_breadth.get(key) is None
+    ]
     limit_stats = limit_activity_stats or (
         {
             key: all_market_breadth.get(key)
@@ -9618,6 +11794,35 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         breadth,
         board_component.get("board_universe_current_summary"),
     )
+    current_market_structure["medium_term_index_background_status"] = {
+        "coverage_status": medium_term_index_background.get("coverage_status"),
+        "mechanical_path_pattern": medium_term_index_background.get(
+            "mechanical_path_pattern"
+        ),
+        "historical_breadth_status": (
+            medium_term_index_background.get("data_quality") or {}
+        ).get("historical_breadth_status"),
+    }
+    structure_time_alignment = current_snapshot_time_alignment(
+        latest_market_time(primary_indices),
+        {
+            "market_breadth": {"market_time": breadth_component.get("market_time")},
+            "industry_boards": {"market_time": latest_market_time(boards)},
+        },
+    )
+    current_market_structure["temporal_alignment"] = structure_time_alignment
+    if structure_time_alignment["status"] != "aligned":
+        current_market_structure["snapshot_pattern"] = (
+            classify_current_market_snapshot_pattern(
+                current_market_structure["breadth_participation"],
+                current_market_structure["primary_index_participation"],
+                current_market_structure["style_index_participation"],
+                None,
+            )
+        )
+        current_market_structure["snapshot_pattern"]["quality_hold_reason"] = (
+            "industry_board_or_breadth_snapshot_time_is_not_aligned_with_indices"
+        )
 
     return {
         "market_status": market_status_at(),
@@ -9639,7 +11844,9 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "industry_board_source": board_source,
         "industry_board_universe_count": board_component.get("board_universe_count"),
         "industry_board_universe_scope": board_component.get("board_universe_scope"),
-        "industry_board_errors": board_component.get("source_errors", []) if not boards else [],
+        "industry_board_errors": board_component.get("source_errors", [])
+        if not boards
+        else [],
         "market_breadth": breadth,
         "market_breadth_source": breadth_component.get("source", "unavailable"),
         "market_breadth_coverage_status": breadth_component.get("coverage_status"),
@@ -9658,6 +11865,7 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
         "market_activity_facts": market_activity_facts,
         "market_cross_checks": market_cross_checks,
         "current_market_structure": current_market_structure,
+        "medium_term_index_background": medium_term_index_background,
         "component_status": component_status,
         "response_budget_ms": int(response_budget_seconds * 1000),
         "source": sources,
@@ -9671,7 +11879,9 @@ def get_market_overview_data(limit: int) -> dict[str, Any]:
             and turnover
             and boards
             and limit_activity_stats
-            and str(breadth_component.get("coverage_status") or "").startswith("complete")
+            and str(breadth_component.get("coverage_status") or "").startswith(
+                "complete"
+            )
             else "partial_data"
         ),
         "note": "Facts and mechanical calculations only; slow components use recent successful cache or return as unavailable within a nine-second budget. Limit activity comes from separate public pools. Prior-day same-minute turnover remains unavailable intraday because no reliable historical market-wide minute series was found.",
@@ -9757,7 +11967,8 @@ def get_market_snapshot_data(
             requested_identifiers.append(normalized_identifier)
     if len(requested_identifiers) > 10:
         raise HTTPException(
-            status_code=400, detail="A synchronized snapshot supports at most 10 target and peer identifiers."
+            status_code=400,
+            detail="A synchronized snapshot supports at most 10 target and peer identifiers.",
         )
 
     loaders: dict[str, Any] = {
@@ -9822,7 +12033,9 @@ def get_market_snapshot_data(
             if value
         }
         still_missing = [
-            identifier for identifier in requested_identifiers if identifier not in merged_keys
+            identifier
+            for identifier in requested_identifiers
+            if identifier not in merged_keys
         ]
         if merged_rows:
             merged_batch = deepcopy(recovery_batch or initial_batch)
@@ -9866,18 +12079,25 @@ def get_market_snapshot_data(
                 merged_source_updates[-1] if merged_source_updates else None
             )
             merged_batch["source_updated_at_range"] = (
-                {"earliest": merged_source_updates[0], "latest": merged_source_updates[-1]}
+                {
+                    "earliest": merged_source_updates[0],
+                    "latest": merged_source_updates[-1],
+                }
                 if merged_source_updates
                 else None
             )
-            merged_batch["data_status"] = "full_data" if not still_missing else "partial_data"
+            merged_batch["data_status"] = (
+                "full_data" if not still_missing else "partial_data"
+            )
             results["batch_quotes"] = merged_batch
         elif recovery_batch:
             results["batch_quotes"] = recovery_batch
 
         if not still_missing:
             source_errors = [
-                error for error in source_errors if error.get("source") != "batch_quotes"
+                error
+                for error in source_errors
+                if error.get("source") != "batch_quotes"
             ]
             component_status["batch_quotes"] = {
                 **recovery_status.get("batch_quotes", {}),
@@ -9889,7 +12109,10 @@ def get_market_snapshot_data(
             component_status["batch_quotes"] = {
                 **recovery_status.get(
                     "batch_quotes",
-                    {"status": "unavailable_within_response_budget", "latency_ms": None},
+                    {
+                        "status": "unavailable_within_response_budget",
+                        "latency_ms": None,
+                    },
                 ),
                 "status": (
                     "partial_after_compensation"
@@ -9902,7 +12125,9 @@ def get_market_snapshot_data(
             }
             source_errors.extend(recovery_errors)
     if not results:
-        raise HTTPException(status_code=502, detail="All synchronized snapshot components failed.")
+        raise HTTPException(
+            status_code=502, detail="All synchronized snapshot components failed."
+        )
 
     overview = results.get("market_overview") or {}
     batch = results.get("batch_quotes") or {}
@@ -9943,9 +12168,13 @@ def get_market_snapshot_data(
     earliest_time = sorted_times[0]["market_time"] if sorted_times else None
     latest_time = sorted_times[-1]["market_time"] if sorted_times else None
     time_difference_seconds = (
-        round((sorted_times[-1]["parsed"] - sorted_times[0]["parsed"]).total_seconds(), 3)
+        round(
+            (sorted_times[-1]["parsed"] - sorted_times[0]["parsed"]).total_seconds(), 3
+        )
         if len(sorted_times) >= 2
-        else 0.0 if sorted_times else None
+        else 0.0
+        if sorted_times
+        else None
     )
 
     direct_price = to_number((target_quote or {}).get("price"))
@@ -10003,9 +12232,9 @@ def get_market_snapshot_data(
             for source in normalize_sources(payload.get("source"))
         }
     )
-    recommended_source = normalize_sources(target_payload.get("source")) or normalize_sources(
-        batch.get("source")
-    )
+    recommended_source = normalize_sources(
+        target_payload.get("source")
+    ) or normalize_sources(batch.get("source"))
     component_source_errors = [
         error
         for payload in results.values()
@@ -10031,7 +12260,10 @@ def get_market_snapshot_data(
         "effective_market_time": latest_time,
         "market_time_range": {"earliest": earliest_time, "latest": latest_time},
         "component_effective_market_times": [
-            {"component": item["component"], "effective_market_time": item["market_time"]}
+            {
+                "component": item["component"],
+                "effective_market_time": item["market_time"],
+            }
             for item in sorted_times
         ],
         "source_time_difference_seconds": time_difference_seconds,
@@ -10051,7 +12283,9 @@ def get_market_snapshot_data(
             item for item in batch_results if str(item.get("symbol")) != target_symbol
         ],
         "market_overview": (
-            overview if detail_level == "raw" else compact_market_overview_for_snapshot(overview)
+            overview
+            if detail_level == "raw"
+            else compact_market_overview_for_snapshot(overview)
         ),
         "component_status": component_status,
         "source": sources,
@@ -10108,7 +12342,9 @@ def get_market_data_health_data() -> dict[str, Any]:
                 "source": source,
                 "status": status,
                 "attempt_count": attempts,
-                "success_rate": round(success_rate, 3) if success_rate is not None else None,
+                "success_rate": round(success_rate, 3)
+                if success_rate is not None
+                else None,
                 "average_latency_ms": state["average_latency_ms"],
                 "last_success_at": state["last_success_at"],
                 "last_error": state["last_error"],
@@ -10133,9 +12369,15 @@ def get_market_data_health_data() -> dict[str, Any]:
         return "operational_on_observed_requests"
 
     core_states = [observed.get(source) for source in core_source_names]
-    total_attempts = sum(state.get("attempt_count", 0) for state in core_states if state)
-    total_successes = sum(state.get("success_count", 0) for state in core_states if state)
-    total_failures = sum(state.get("failure_count", 0) for state in core_states if state)
+    total_attempts = sum(
+        state.get("attempt_count", 0) for state in core_states if state
+    )
+    total_successes = sum(
+        state.get("success_count", 0) for state in core_states if state
+    )
+    total_failures = sum(
+        state.get("failure_count", 0) for state in core_states if state
+    )
     active_failures = sum(
         state.get("consecutive_failures", 0) for state in core_states if state
     )
@@ -10316,7 +12558,9 @@ def run_cached_tool(
 def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
     keyword = keyword.strip()
     if not keyword:
-        return mcp_error(None, HTTPException(status_code=400, detail="keyword is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="keyword is required.")
+        )
     normalized_limit = max(1, min(limit, 5))
     return run_cached_tool(
         "search_a_share",
@@ -10335,7 +12579,9 @@ def search_a_share(keyword: str, limit: int = 5) -> dict[str, Any]:
 def get_a_share_quote(symbol: str) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
 
     def quote_response() -> dict[str, Any]:
         payload = get_quote_data(symbol=symbol)
@@ -10353,7 +12599,11 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
         }
 
     return run_cached_tool(
-        "get_a_share_quote", {"symbol": symbol}, 2, quote_response, symbol,
+        "get_a_share_quote",
+        {"symbol": symbol},
+        2,
+        quote_response,
+        symbol,
         max_stale_age_seconds=15,
     )
 
@@ -10369,7 +12619,9 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
 )
 def get_a_share_batch_quotes(symbols: list[str]) -> dict[str, Any]:
     return run_cached_tool(
-        "get_a_share_batch_quotes", {"symbols": symbols}, 2,
+        "get_a_share_batch_quotes",
+        {"symbols": symbols},
+        2,
         lambda: get_batch_quote_data(symbols),
         max_stale_age_seconds=15,
     )
@@ -10396,12 +12648,16 @@ def get_a_share_kline(
 ) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_limit = max(1, min(limit, 500))
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             symbol,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
 
     def kline_response() -> dict[str, Any]:
@@ -10415,7 +12671,9 @@ def get_a_share_kline(
             page_token=page_token,
         )
         response_fields = (
-            KLINE_RAW_RESPONSE_FIELDS if detail_level == "raw" else KLINE_RESPONSE_FIELDS
+            KLINE_RAW_RESPONSE_FIELDS
+            if detail_level == "raw"
+            else KLINE_RESPONSE_FIELDS
         )
         return {
             "symbol": payload["symbol"],
@@ -10423,9 +12681,7 @@ def get_a_share_kline(
             "exchange": payload.get("exchange"),
             "period": payload["period"],
             "adjustment": payload.get("adjustment"),
-            "adjustment_source_parameter": payload.get(
-                "adjustment_source_parameter"
-            ),
+            "adjustment_source_parameter": payload.get("adjustment_source_parameter"),
             "requested_start_date": payload.get("requested_start_date"),
             "requested_end_date": payload.get("requested_end_date"),
             "available_start": payload.get("available_start"),
@@ -10480,7 +12736,9 @@ def get_a_share_kline(
 def get_a_share_intraday(symbol: str, limit: int = 240) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_limit = max(1, min(limit, 240))
     return run_cached_tool(
         "get_a_share_intraday",
@@ -10504,10 +12762,15 @@ def get_a_share_intraday(symbol: str, limit: int = 240) -> dict[str, Any]:
 def get_a_share_auction(symbol: str) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     return run_cached_tool(
-        "get_a_share_auction", {"symbol": symbol}, 3,
-        lambda: get_auction_data(symbol), symbol,
+        "get_a_share_auction",
+        {"symbol": symbol},
+        3,
+        lambda: get_auction_data(symbol),
+        symbol,
     )
 
 
@@ -10523,39 +12786,59 @@ def get_a_share_auction(symbol: str) -> dict[str, Any]:
 def filter_a_share_securities(
     security_type: Annotated[
         Literal["stock", "a_share"],
-        Field(description="Security universe. Both accepted values mean ordinary exchange-listed A-share stocks; ETFs, funds and B shares are excluded."),
+        Field(
+            description="Security universe. Both accepted values mean ordinary exchange-listed A-share stocks; ETFs, funds and B shares are excluded."
+        ),
     ] = "stock",
     exclude_st: Annotated[
         bool,
-        Field(description="When true, exclude ST and *ST securities. Defaults to true."),
+        Field(
+            description="When true, exclude ST and *ST securities. Defaults to true."
+        ),
     ] = True,
     change_pct_min: Annotated[
         float | None,
-        Field(description="Minimum current-day price change in percentage points; for example, 1.5 means +1.5%. Null disables this lower bound."),
+        Field(
+            description="Minimum current-day price change in percentage points; for example, 1.5 means +1.5%. Null disables this lower bound."
+        ),
     ] = None,
     change_pct_max: Annotated[
         float | None,
-        Field(description="Maximum current-day price change in percentage points; for example, 6 means +6%. Null disables this upper bound."),
+        Field(
+            description="Maximum current-day price change in percentage points; for example, 6 means +6%. Null disables this upper bound."
+        ),
     ] = None,
     turnover_min: Annotated[
         float | None,
-        Field(description="Minimum current-day turnover amount in CNY yuan; for example, 500000000 means CNY 500 million. Null disables this filter."),
+        Field(
+            description="Minimum current-day turnover amount in CNY yuan; for example, 500000000 means CNY 500 million. Null disables this filter."
+        ),
     ] = None,
     turnover_rate_min: Annotated[
         float | None,
-        Field(description="Minimum current-day turnover rate in percentage points; for example, 2 means 2%. Null disables this filter."),
+        Field(
+            description="Minimum current-day turnover rate in percentage points; for example, 2 means 2%. Null disables this filter."
+        ),
     ] = None,
     above_average_price: Annotated[
         bool | None,
-        Field(description="When true, require the latest price to be above the current-day volume-weighted average transaction price. False or null disables this filter."),
+        Field(
+            description="When true, require the latest price to be above the current-day volume-weighted average transaction price. False or null disables this filter."
+        ),
     ] = None,
     market_cap_max: Annotated[
         float | None,
-        Field(description="Maximum total market capitalization in CNY yuan; for example, 100000000000 means CNY 100 billion. Null disables this filter."),
+        Field(
+            description="Maximum total market capitalization in CNY yuan; for example, 100000000000 means CNY 100 billion. Null disables this filter."
+        ),
     ] = None,
     limit: Annotated[
         int,
-        Field(ge=1, le=200, description="Maximum number of matching securities to return, from 1 to 200."),
+        Field(
+            ge=1,
+            le=200,
+            description="Maximum number of matching securities to return, from 1 to 200.",
+        ),
     ] = 50,
 ) -> dict[str, Any]:
     normalized_limit = max(1, min(limit, 200))
@@ -10571,7 +12854,9 @@ def filter_a_share_securities(
         "limit": normalized_limit,
     }
     return run_cached_tool(
-        "filter_a_share_securities", parameters, 3,
+        "filter_a_share_securities",
+        parameters,
+        3,
         lambda: filter_a_share_securities_data(**parameters),
     )
 
@@ -10627,10 +12912,14 @@ def screen_a_share_research_candidates(
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             None,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
     windows = required_positive_history_windows or [20, 60]
-    if not windows or any(window not in HISTORICAL_CONTEXT_WINDOWS for window in windows):
+    if not windows or any(
+        window not in HISTORICAL_CONTEXT_WINDOWS for window in windows
+    ):
         return mcp_error(
             None,
             HTTPException(
@@ -10651,9 +12940,13 @@ def screen_a_share_research_candidates(
         "minimum_history_return_pct": minimum_history_return_pct,
         "detail_level": detail_level,
     }
+    cache_parameters = {
+        **parameters,
+        "_history_cache_scope": historical_context_cache_scope(),
+    }
     return run_cached_tool(
         "screen_a_share_research_candidates",
-        parameters,
+        cache_parameters,
         30,
         lambda: screen_a_share_research_candidates_data(**parameters),
         max_stale_age_seconds=300,
@@ -10669,11 +12962,16 @@ def screen_a_share_research_candidates(
 def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_limit = max(1, min(limit, 10))
     return run_cached_tool(
-        "get_a_share_fund_flow", {"symbol": symbol, "limit": normalized_limit}, 30,
-        lambda: get_fund_flow_data(symbol, normalized_limit), symbol,
+        "get_a_share_fund_flow",
+        {"symbol": symbol, "limit": normalized_limit},
+        30,
+        lambda: get_fund_flow_data(symbol, normalized_limit),
+        symbol,
         max_stale_age_seconds=3600,
     )
 
@@ -10687,11 +12985,16 @@ def get_a_share_fund_flow(symbol: str, limit: int = 5) -> dict[str, Any]:
 def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_limit = max(1, min(limit, 4))
     return run_cached_tool(
-        "get_a_share_financials", {"symbol": symbol, "limit": normalized_limit}, 21600,
-        lambda: get_financial_data(symbol, normalized_limit), symbol,
+        "get_a_share_financials",
+        {"symbol": symbol, "limit": normalized_limit},
+        21600,
+        lambda: get_financial_data(symbol, normalized_limit),
+        symbol,
     )
 
 
@@ -10701,15 +13004,33 @@ def get_a_share_financials(symbol: str, limit: int = 4) -> dict[str, Any]:
     description=(
         "Return exchange trading-day, weekend, official holiday-closure, and session facts for a bounded range. "
         "The embedded official schedule supports 2026; unsupported years remain unknown."
-    ), annotations=READ_ONLY_TOOL,
+    ),
+    annotations=READ_ONLY_TOOL,
 )
-def get_a_share_trading_calendar(start_date: str | None = None, end_date: str | None = None,
-                                 detail_level: str = "summary") -> dict[str, Any]:
+def get_a_share_trading_calendar(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    detail_level: str = "summary",
+) -> dict[str, Any]:
     if detail_level not in {"summary", "raw"}:
-        return mcp_error(None, HTTPException(status_code=400, detail="detail_level must be summary or raw."))
-    params = {"start_date": start_date, "end_date": end_date, "detail_level": detail_level}
-    return run_cached_tool("get_a_share_trading_calendar", params, 86400,
-                           lambda: get_a_share_trading_calendar_data(**params), max_stale_age_seconds=604800)
+        return mcp_error(
+            None,
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
+        )
+    params = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "detail_level": detail_level,
+    }
+    return run_cached_tool(
+        "get_a_share_trading_calendar",
+        params,
+        86400,
+        lambda: get_a_share_trading_calendar_data(**params),
+        max_stale_age_seconds=604800,
+    )
 
 
 @mcp.tool(
@@ -10719,19 +13040,38 @@ def get_a_share_trading_calendar(start_date: str | None = None, end_date: str | 
         "Return disclosed Dragon-Tiger institution seats, institution-labelled block trades, institutional research, "
         "margin balances, shareholder-count changes, and category-specific historical comparisons. Categories stay "
         "separate; no main-force or trading conclusion is inferred."
-    ), annotations=READ_ONLY_TOOL,
+    ),
+    annotations=READ_ONLY_TOOL,
 )
-def get_a_share_capital_activity(symbol: str, lookback_days: int = 90, limit: int = 10,
-                                 detail_level: str = "summary") -> dict[str, Any]:
+def get_a_share_capital_activity(
+    symbol: str, lookback_days: int = 90, limit: int = 10, detail_level: str = "summary"
+) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     if detail_level not in {"summary", "raw"}:
-        return mcp_error(symbol, HTTPException(status_code=400, detail="detail_level must be summary or raw."))
-    params = {"symbol": symbol, "lookback_days": max(7, min(lookback_days, 365)),
-              "limit": max(1, min(limit, 20)), "detail_level": detail_level}
-    return run_cached_tool("get_a_share_capital_activity", params, 300,
-                           lambda: get_a_share_capital_activity_data(**params), symbol, max_stale_age_seconds=86400)
+        return mcp_error(
+            symbol,
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
+        )
+    params = {
+        "symbol": symbol,
+        "lookback_days": max(7, min(lookback_days, 365)),
+        "limit": max(1, min(limit, 20)),
+        "detail_level": detail_level,
+    }
+    return run_cached_tool(
+        "get_a_share_capital_activity",
+        params,
+        300,
+        lambda: get_a_share_capital_activity_data(**params),
+        symbol,
+        max_stale_age_seconds=86400,
+    )
 
 
 @mcp.tool(
@@ -10759,7 +13099,9 @@ def get_ipo_subscription_status(
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             None,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
     normalized_ahead = max(0, min(days_ahead, 90))
     normalized_back = max(0, min(days_back, 90))
@@ -10800,7 +13142,9 @@ def get_fund_exposure(
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             fund_code,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
     normalized_limit = max(1, min(holdings_limit, 10))
     return run_cached_tool(
@@ -10839,7 +13183,9 @@ def get_portfolio_exposure(
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             None,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
     normalized_limit = max(1, min(holdings_limit, 10))
     parameters = {
@@ -10877,7 +13223,9 @@ def get_a_share_news(
 ) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_limit = max(1, min(limit, 10))
     normalized_days = max(1, min(days, 90))
     return run_cached_tool(
@@ -10946,7 +13294,9 @@ def get_a_share_event_timeline(
 ) -> dict[str, Any]:
     symbol = symbol.strip()
     if not symbol:
-        return mcp_error(None, HTTPException(status_code=400, detail="symbol is required."))
+        return mcp_error(
+            None, HTTPException(status_code=400, detail="symbol is required.")
+        )
     normalized_days = max(1, min(days, 90))
     normalized_limit = max(1, min(limit, 20))
     return run_cached_tool(
@@ -10975,9 +13325,13 @@ def get_a_share_historical_context(symbol: str) -> dict[str, Any]:
             None,
             HTTPException(status_code=400, detail="symbol is required."),
         )
+    cache_parameters = {
+        "symbol": symbol,
+        "_history_cache_scope": historical_context_cache_scope(),
+    }
     return run_cached_tool(
         "get_a_share_historical_context",
-        {"symbol": symbol},
+        cache_parameters,
         300,
         lambda: get_cached_historical_context_data(symbol),
         symbol,
@@ -11147,7 +13501,10 @@ def get_a_share_sector_rankings(
         },
         10,
         lambda: get_sector_rankings_data(
-            sector_type, level, sort_by, normalized_limit,
+            sector_type,
+            level,
+            sort_by,
+            normalized_limit,
         ),
         max_stale_age_seconds=300,
     )
@@ -11201,7 +13558,9 @@ def get_overnight_risk_packet(detail_level: str = "summary") -> dict[str, Any]:
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             None,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
         )
     return run_cached_tool(
         "get_overnight_risk_packet",
@@ -11254,7 +13613,9 @@ def get_a_share_market_snapshot(
     if detail_level not in {"summary", "raw"}:
         return mcp_error(
             symbol,
-            HTTPException(status_code=400, detail="detail_level must be summary or raw."),
+            HTTPException(
+                status_code=400, detail="detail_level must be summary or raw."
+            ),
             started_at,
         )
     normalized_symbol = symbol.strip() if symbol else None
@@ -11294,7 +13655,9 @@ def get_a_share_market_snapshot(
 def get_a_share_market_overview(limit: int = 10) -> dict[str, Any]:
     normalized_limit = max(1, min(limit, 20))
     return run_cached_tool(
-        "get_a_share_market_overview", {"limit": normalized_limit}, 5,
+        "get_a_share_market_overview",
+        {"limit": normalized_limit},
+        5,
         lambda: get_market_overview_data(normalized_limit),
         max_stale_age_seconds=120,
     )
@@ -11311,7 +13674,10 @@ def get_a_share_market_overview(limit: int = 10) -> dict[str, Any]:
 )
 def get_market_data_health() -> dict[str, Any]:
     return run_cached_tool(
-        "get_market_data_health", {}, 1, get_market_data_health_data,
+        "get_market_data_health",
+        {},
+        1,
+        get_market_data_health_data,
     )
 
 
