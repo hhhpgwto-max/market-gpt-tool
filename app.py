@@ -3394,6 +3394,20 @@ def candidate_research_lane_evidence(
         (windows.get("20") or {}).get("distance_from_high_pct")
     )
     history_gate_reasons = list(dict.fromkeys(persistence_rejections))
+    shared_evidence_reasons = [
+        reason
+        for reason in history_gate_reasons
+        if reason
+        in {
+            "historical_context_unavailable",
+            "alignment_unavailable",
+            "history_after_market_snapshot",
+            "history_stale_after_session_close",
+            "history_stale_for_market_snapshot",
+            "current_snapshot_time_alignment_failed",
+            "candidate_quote_time_alignment_failed",
+        }
+    ]
 
     def lane(status: bool, reasons: list[str], facts: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -3411,7 +3425,7 @@ def candidate_research_lane_evidence(
     if not market_gate_passed:
         continuation_reasons.append("market_breadth_gate_failed")
 
-    pullback_reasons = list(history_gate_reasons)
+    pullback_reasons = list(shared_evidence_reasons)
     if return_20 is None or return_20 <= 0:
         pullback_reasons.append("positive_20_session_path_not_observed")
     if current_change is None or not (-3.0 <= current_change <= 1.0):
@@ -3421,7 +3435,7 @@ def candidate_research_lane_evidence(
             "distance_from_20_session_high_outside_observation_band"
         )
 
-    repair_reasons = list(history_gate_reasons)
+    repair_reasons = list(shared_evidence_reasons)
     if return_20 is None or return_20 >= 0:
         repair_reasons.append("negative_20_session_path_not_observed")
     if not short_returns or max(short_returns) <= 0:
@@ -3429,7 +3443,7 @@ def candidate_research_lane_evidence(
     if current_change is None or current_change <= 0:
         repair_reasons.append("positive_current_snapshot_not_observed")
 
-    resilience_reasons = list(history_gate_reasons)
+    resilience_reasons = list(shared_evidence_reasons)
     if not market_breadth_quality_passed:
         resilience_reasons.append("market_breadth_time_quality_hold")
     elif market_gate_passed:

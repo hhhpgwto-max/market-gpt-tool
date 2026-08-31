@@ -2946,17 +2946,58 @@ def test_dynamic_candidate_lanes_and_history_alignment_are_no_lookahead() -> Non
     assert lanes["controlled_pullback"]["observed"] is True
     assert lanes["continuation"]["observed"] is False
 
-    caller_gate_blocked_lanes = market_app.candidate_research_lane_evidence(
+    continuation_specific_gate = market_app.candidate_research_lane_evidence(
         candidate,
         context,
         ["history_return_below_minimum:60"],
         True,
     )
-    assert caller_gate_blocked_lanes["controlled_pullback"]["observed"] is False
+    assert continuation_specific_gate["continuation"]["observed"] is False
     assert (
         "history_return_below_minimum:60"
-        in caller_gate_blocked_lanes["controlled_pullback"]["failed_conditions"]
+        in continuation_specific_gate["continuation"]["failed_conditions"]
     )
+    assert continuation_specific_gate["controlled_pullback"]["observed"] is True
+
+    repair_context = {
+        **context,
+        "windows": {
+            **context["windows"],
+            "20": {
+                **context["windows"]["20"],
+                "return_pct": -8.0,
+                "distance_from_high_pct": -12.0,
+            },
+            "60": {"window_complete": True, "return_pct": -12.0},
+        },
+        "path_facts": {
+            "windows": {
+                "1": {"window_complete": True, "return_pct": 1.0},
+                "3": {"window_complete": True, "return_pct": 2.0},
+                "5": {"window_complete": True, "return_pct": -1.0},
+            }
+        },
+    }
+    _, legacy_positive_gate_rejections = market_app.candidate_history_gate(
+        repair_context,
+        [20, 60],
+        0.0,
+        "2026-07-10T10:00:00+08:00",
+    )
+    assert "history_return_below_minimum:20" in legacy_positive_gate_rejections
+    repair_lanes = market_app.candidate_research_lane_evidence(
+        {
+            "symbol": "600003",
+            "change_pct": 1.0,
+            "price_above_average_pct": 0.5,
+            "preselection_lanes": ["early_repair"],
+        },
+        repair_context,
+        legacy_positive_gate_rejections,
+        True,
+    )
+    assert repair_lanes["early_repair"]["observed"] is True
+    assert repair_lanes["continuation"]["observed"] is False
 
     breadth_quality_hold = market_app.market_breadth_promotion_quality(
         {
