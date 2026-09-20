@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import ssl
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from html import unescape
 from math import ceil, sqrt
-from threading import Event, Lock
+from threading import BoundedSemaphore, Event, Lock
 from time import perf_counter, perf_counter_ns
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "dynamic_market_evidence_v13"
+ROUTING_REVISION = "bounded_shared_research_v14"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -101,7 +101,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.16.0",
+    version="0.16.1",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -394,7 +394,35 @@ SOURCE_HEALTH: dict[str, dict[str, Any]] = {}
 SOURCE_HEALTH_LOCK = Lock()
 PREFERRED_ROUTE_HEALTH: dict[str, dict[str, Any]] = {}
 PREFERRED_ROUTE_HEALTH_LOCK = Lock()
-PUBLIC_SOURCE_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+
+
+class BoundedResearchExecutor(ThreadPoolExecutor):
+    """Bound running plus queued work; reject overload without blocking callers."""
+
+    def __init__(self, max_workers: int, max_pending: int):
+        super().__init__(max_workers=max_workers)
+        self.slots = BoundedSemaphore(max_pending)
+
+    def submit(self, fn, /, *args, **kwargs):
+        if not self.slots.acquire(blocking=False):
+            rejected = Future()
+            rejected.set_exception(
+                HTTPException(
+                    status_code=503,
+                    detail="Research capacity busy; retry only missing components in a smaller batch.",
+                )
+            )
+            return rejected
+        try:
+            future = super().submit(fn, *args, **kwargs)
+        except BaseException:
+            self.slots.release()
+            raise
+        future.add_done_callback(lambda _: self.slots.release())
+        return future
+
+
+PUBLIC_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=16, max_pending=32)
 PUBLIC_MARKET_HTTP_CLIENT = httpx.Client(
     headers={
         "User-Agent": "Mozilla/5.0",
@@ -411,6 +439,8 @@ TENCENT_KLINE_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 COMPOSITE_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 FUND_COMPONENT_EXECUTOR = ThreadPoolExecutor(max_workers=12)
 SECURITY_REFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=6)
+# Keep packet orchestration separate from the pools used by nested components.
+DECISION_COMPONENT_EXECUTOR = BoundedResearchExecutor(max_workers=12, max_pending=24)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -540,7 +570,7 @@ def get_cached_tool_data(
     ttl_seconds: int,
     loader: Any,
     *,
-    inflight_wait_timeout_seconds: float | None = None,
+    inflight_wait_timeout_seconds: float | None = 12,
     partial_ttl_seconds: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     while True:
@@ -650,7 +680,7 @@ def get_cached_component_with_stale(
     max_stale_age_seconds: int,
     loader: Any,
     *,
-    inflight_wait_timeout_seconds: float | None = None,
+    inflight_wait_timeout_seconds: float | None = 12,
 ) -> dict[str, Any]:
     """Share component refreshes and preserve a recent honest fallback on transient failure."""
     try:
@@ -831,7 +861,10 @@ def race_public_sources(
         for future in sorted(completed, key=lambda item: source_order[futures[item]]):
             source = futures[future]
             try:
-                return future.result(), source, errors
+                result = future.result()
+                for unused in pending:
+                    unused.cancel()
+                return result, source, errors
             except HTTPException as exc:
                 errors.append(f"{source}: {exc.detail}")
                 status_codes.append(exc.status_code)
@@ -6043,6 +6076,20 @@ def decision_context_follow_up_tools(
     return recommendations
 
 
+def cached_research_component(
+    tool_name: str, parameters: dict[str, Any], ttl_seconds: int, loader: Any
+) -> dict[str, Any]:
+    # Use public-tool cache keys so exact follow-ups reuse successful work.
+    data, _ = get_cached_tool_data(
+        cache_key(tool_name, parameters),
+        ttl_seconds,
+        loader,
+        inflight_wait_timeout_seconds=4,
+        partial_ttl_seconds=min(ttl_seconds, 2),
+    )
+    return data
+
+
 def get_decision_context_data(
     symbol: str, benchmark_symbol: str | None
 ) -> dict[str, Any]:
@@ -6052,22 +6099,40 @@ def get_decision_context_data(
     security = security_metadata(symbol)
     benchmark = benchmark_symbol or default_benchmark_identifier(symbol)
     loaders: dict[str, Any] = {
-        "quote": lambda: get_quote_data(symbol),
-        "intraday": lambda: get_intraday_data(symbol, 60),
+        "quote": lambda: cached_research_component(
+            "get_a_share_quote", {"symbol": symbol}, 2, lambda: get_quote_data(symbol)
+        ),
+        "intraday": lambda: cached_research_component(
+            "get_a_share_intraday", {"symbol": symbol, "limit": 60}, 15,
+            lambda: get_intraday_data(symbol, 60),
+        ),
         "historical_context": lambda: get_cached_historical_context_data(symbol),
         "security_reference": lambda: get_resilient_security_reference_data(symbol),
-        "relative_strength": lambda: get_relative_strength_data(
-            symbol, benchmark, None
+        "relative_strength": lambda: cached_research_component(
+            "get_a_share_relative_strength",
+            {"symbol": symbol, "benchmark_symbol": benchmark, "peer_symbols": []},
+            2, lambda: get_relative_strength_data(symbol, benchmark, None),
         ),
-        "market_overview": lambda: get_market_overview_data(5),
-        "news": lambda: get_news_data(symbol, 8, 30, False),
+        "market_overview": lambda: cached_research_component(
+            "get_a_share_market_overview", {"limit": 5}, 5,
+            lambda: get_market_overview_data(5),
+        ),
+        "news": lambda: cached_research_component(
+            "get_a_share_news",
+            {"symbol": symbol, "limit": 8, "days": 30, "include_industry_context": False},
+            300, lambda: get_news_data(symbol, 8, 30, False),
+        ),
     }
     if security["security_type"] not in {"etf", "lof"}:
-        loaders["official_announcements"] = lambda: get_announcement_data(
-            symbol, 180, 10
+        loaders["official_announcements"] = lambda: cached_research_component(
+            "get_a_share_announcements", {"symbol": symbol, "days": 180, "limit": 10},
+            300, lambda: get_announcement_data(symbol, 180, 10),
         )
-        loaders["financials"] = lambda: get_financial_data(symbol, 4)
-    results, statuses, errors = collect_components(loaders, 12)
+        loaders["financials"] = lambda: cached_research_component(
+            "get_a_share_financials", {"symbol": symbol, "limit": 4}, 21600,
+            lambda: get_financial_data(symbol, 4),
+        )
+    results, statuses, errors = collect_components(loaders, 12, DECISION_COMPONENT_EXECUTOR)
     if security["security_type"] in {"etf", "lof"}:
         statuses["official_announcements"] = {
             "status": "not_applicable_to_exchange_listed_fund",
