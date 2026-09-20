@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+import asyncio
 
 import pytest
 
@@ -125,6 +126,62 @@ def test_saturated_packet_returns_explicit_missing_components(monkeypatch):
         assert all("capacity busy" in e["message"] for e in result["source_errors"])
         release.set()
         blocked.result(timeout=1)
+    finally:
+        release.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def test_registered_mcp_requests_overlap_without_blocking_event_loop(monkeypatch):
+    pool = app.BoundedResearchExecutor(max_workers=2, max_pending=2)
+    monkeypatch.setattr(app, "MCP_REQUEST_EXECUTOR", pool)
+    both_started = Event()
+    release = Event()
+    lock = Lock()
+    started = []
+
+    def packet(symbol, _benchmark):
+        with lock:
+            started.append(symbol)
+            if len(started) == 2:
+                both_started.set()
+        assert release.wait(2), "protocol event loop was blocked by synchronous work"
+        return {"symbol": symbol, "source": "test"}
+
+    monkeypatch.setattr(app, "get_decision_context_data", packet)
+
+    async def exercise():
+        tasks = [asyncio.create_task(app.mcp.call_tool(
+            "get_a_share_decision_context", {"symbol": symbol}
+        )) for symbol in ("600176", "600519")]
+        try:
+            # This await must run while both provider calls are still blocked.
+            assert await asyncio.to_thread(both_started.wait, 1)
+            assert not any(task.done() for task in tasks)
+        finally:
+            release.set()
+        await asyncio.gather(*tasks)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def test_registered_mcp_overload_is_explicit_and_recoverable(monkeypatch):
+    pool = app.BoundedResearchExecutor(max_workers=1, max_pending=1)
+    monkeypatch.setattr(app, "MCP_REQUEST_EXECUTOR", pool)
+    release = Event()
+    blocked = pool.submit(release.wait, 2)
+    try:
+        result = asyncio.run(app.mcp.call_tool(
+            "get_a_share_decision_context", {"symbol": "600176"}
+        ))
+        # SDK may return content plus structured output; inspect either representation.
+        assert "Research capacity busy" in str(result)
+        release.set()
+        blocked.result(timeout=1)
+        assert pool.submit(lambda: "recovered").result(timeout=1) == "recovered"
     finally:
         release.set()
         pool.shutdown(wait=True, cancel_futures=True)

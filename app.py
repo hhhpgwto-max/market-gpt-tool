@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import json
 import logging
@@ -6,11 +7,14 @@ import re
 import ssl
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from html import unescape
+from functools import wraps
+from inspect import iscoroutinefunction
 from math import ceil, sqrt
 from threading import BoundedSemaphore, Event, Lock
 from time import perf_counter, perf_counter_ns
@@ -33,7 +37,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "bounded_shared_research_v14"
+ROUTING_REVISION = "nonblocking_bounded_research_v15"
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -78,7 +82,35 @@ READ_ONLY_TOOL = ToolAnnotations(
     openWorldHint=False,
 )
 
-mcp = FastMCP(
+class NonBlockingFastMCP(FastMCP):
+    """Keep synchronous provider work off the MCP protocol event loop."""
+
+    def tool(self, *args, **kwargs):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            if iscoroutinefunction(fn):
+                register(fn)
+            else:
+                @wraps(fn)
+                async def nonblocking(*call_args, **call_kwargs):
+                    context = copy_context()
+                    future = MCP_REQUEST_EXECUTOR.submit(
+                        context.run, fn, *call_args, **call_kwargs
+                    )
+                    try:
+                        return await asyncio.wrap_future(future)
+                    except HTTPException as exc:
+                        return mcp_error(None, exc)
+
+                register(nonblocking)
+            # Local composition and tests retain the original synchronous API.
+            return fn
+
+        return decorator
+
+
+mcp = NonBlockingFastMCP(
     "Market Sentinel",
     instructions=MCP_INSTRUCTIONS,
     stateless_http=True,
@@ -101,7 +133,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.16.1",
+    version="0.16.2",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -441,6 +473,8 @@ FUND_COMPONENT_EXECUTOR = ThreadPoolExecutor(max_workers=12)
 SECURITY_REFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 # Keep packet orchestration separate from the pools used by nested components.
 DECISION_COMPONENT_EXECUTOR = BoundedResearchExecutor(max_workers=12, max_pending=24)
+# Reject excess requests rather than queueing another full packet budget.
+MCP_REQUEST_EXECUTOR = BoundedResearchExecutor(max_workers=4, max_pending=4)
 
 
 def normalize_symbol(symbol: str) -> str:
