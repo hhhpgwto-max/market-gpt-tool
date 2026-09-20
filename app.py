@@ -37,7 +37,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "nonblocking_bounded_research_v15"
+ROUTING_REVISION = "shared_tls_research_cache_v16"
+# urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
+# The immutable shared context keeps certificate and hostname verification enabled.
+PUBLIC_TLS_CONTEXT = ssl.create_default_context()
 
 MCP_INSTRUCTIONS = (
     "Use these read-only tools for current A-share stock and exchange-traded fund market data, intraday prices, news, "
@@ -133,7 +136,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.16.2",
+    version="0.16.3",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -456,6 +459,7 @@ class BoundedResearchExecutor(ThreadPoolExecutor):
 
 PUBLIC_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=16, max_pending=32)
 PUBLIC_MARKET_HTTP_CLIENT = httpx.Client(
+    verify=PUBLIC_TLS_CONTEXT,
     headers={
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json, text/plain, */*",
@@ -1298,7 +1302,7 @@ def read_market_text(url: str, referer: str, timeout: int = 3) -> str:
     source = source_name_from_url(url)
     try:
         # Callers construct URLs from a fixed quote-provider host list.
-        with urlopen(request, timeout=timeout) as response:  # nosec B310
+        with urlopen(request, timeout=timeout, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
             text = response.read().decode("gbk", errors="replace")
         record_source_health(source, True, int((perf_counter() - started_at) * 1000))
         return text
@@ -1328,7 +1332,7 @@ def read_public_json(
     for _ in range(attempts):
         started_at = perf_counter()
         try:
-            with urlopen(request, timeout=timeout) as response:  # nosec B310
+            with urlopen(request, timeout=timeout, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
                 payload = json.loads(response.read().decode("utf-8"))
             record_source_health(
                 source, True, int((perf_counter() - started_at) * 1000)
@@ -1388,7 +1392,7 @@ def read_public_json_post(
     started_at = perf_counter()
     source = source_name_from_url(url)
     try:
-        with urlopen(request, timeout=timeout) as response:  # nosec B310
+        with urlopen(request, timeout=timeout, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
             result = json.loads(response.read().decode("utf-8"))
         record_source_health(source, True, int((perf_counter() - started_at) * 1000))
         return result
@@ -1417,7 +1421,7 @@ def read_public_jsonp(url: str, referer: str) -> dict[str, Any]:
     started_at = perf_counter()
     source = source_name_from_url(url)
     try:
-        with urlopen(request, timeout=3) as response:  # nosec B310
+        with urlopen(request, timeout=3, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
             text = response.read().decode("utf-8")
         start = text.find("(")
         end = text.rfind(")")
@@ -4477,7 +4481,7 @@ def get_google_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
     started_at = perf_counter()
     try:
         # The URL host is fixed and is not derived from user input.
-        with urlopen(request, timeout=5) as response:  # nosec B310
+        with urlopen(request, timeout=5, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
             payload = response.read()
         unsafe_xml_declaration = (
             b"<!DOCTYPE" in payload.upper() or b"<!ENTITY" in payload.upper()
@@ -6113,9 +6117,13 @@ def decision_context_follow_up_tools(
 def cached_research_component(
     tool_name: str, parameters: dict[str, Any], ttl_seconds: int, loader: Any
 ) -> dict[str, Any]:
-    # Use public-tool cache keys so exact follow-ups reuse successful work.
+    # Only identical payload shapes may share public-tool cache keys. The public
+    # quote tool flattens its response; packets require the nested provider payload.
+    cache_namespace = (
+        "research_quote_payload" if tool_name == "get_a_share_quote" else tool_name
+    )
     data, _ = get_cached_tool_data(
-        cache_key(tool_name, parameters),
+        cache_key(cache_namespace, parameters),
         ttl_seconds,
         loader,
         inflight_wait_timeout_seconds=4,

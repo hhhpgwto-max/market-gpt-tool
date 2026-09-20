@@ -3,10 +3,13 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 import asyncio
+import io
+import ssl
 
 import pytest
 
 from test_mcp import market_app as app
+from test_mcp import fake_get_quote_data
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +188,45 @@ def test_registered_mcp_overload_is_explicit_and_recoverable(monkeypatch):
     finally:
         release.set()
         pool.shutdown(wait=True, cancel_futures=True)
+
+
+@pytest.mark.parametrize("public_first", [True, False])
+def test_quote_cache_shapes_remain_isolated_in_both_call_orders(monkeypatch, public_first):
+    monkeypatch.setattr(app, "get_quote_data", fake_get_quote_data)
+
+    def packet_quote():
+        return app.cached_research_component(
+            "get_a_share_quote", {"symbol": "600176"}, 2,
+            lambda: app.get_quote_data("600176"),
+        )
+
+    if public_first:
+        public = app.get_a_share_quote("600176")
+        nested = packet_quote()
+    else:
+        nested = packet_quote()
+        public = app.get_a_share_quote("600176")
+    assert public["ok"] is True
+    assert public["price"] == 123.45
+    assert "quote" not in public["data"]
+    assert nested["quote"]["price"] == 123.45
+    assert "price" not in nested
+    assert app.get_a_share_quote("600176")["cache_hit"] is True
+    assert packet_quote()["quote"]["price"] == 123.45
+
+
+def test_public_readers_reuse_verified_tls_context(monkeypatch):
+    contexts = []
+
+    def open_response(_request, *, timeout, context):
+        contexts.append(context)
+        return io.BytesIO(b'{"ok":true}')
+
+    monkeypatch.setattr(app, "urlopen", open_response)
+    assert app.read_public_json("https://example.com/a", "https://example.com")["ok"]
+    assert app.read_public_json_post("https://example.com/b", "https://example.com", {})["ok"]
+    assert app.read_market_text("https://example.com/c", "https://example.com")
+    assert len(contexts) == 3
+    assert all(context is app.PUBLIC_TLS_CONTEXT for context in contexts)
+    assert app.PUBLIC_TLS_CONTEXT.check_hostname is True
+    assert app.PUBLIC_TLS_CONTEXT.verify_mode == ssl.CERT_REQUIRED
