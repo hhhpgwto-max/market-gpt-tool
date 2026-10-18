@@ -72,23 +72,30 @@ def test_packet_components_share_cache_and_exact_followups(monkeypatch):
     def market(_limit):
         with lock:
             counts["market"] += 1
-        return {"source": "test", "effective_market_time": "2026-09-18T15:00:00+08:00"}
+        return {
+            "source": "test",
+            "indices": [{"price": 3000}],
+            "effective_market_time": "2026-09-18T15:00:00+08:00",
+        }
 
     def financials(_symbol, _limit):
         with lock:
             counts["financials"] += 1
-        return {"source": "test", "reports": []}
+        return {"source": "test", "items": [{"basic_eps": 1.5}]}
 
-    for name in (
-        "get_quote_data",
-        "get_intraday_data",
-        "get_cached_historical_context_data",
-        "get_resilient_security_reference_data",
-        "get_relative_strength_data",
-        "get_news_data",
-        "get_announcement_data",
-    ):
-        monkeypatch.setattr(app, name, lambda *_args: {"source": "test"})
+    evidence = {
+        "get_quote_data": {"quote": {"price": 10}},
+        "get_intraday_data": {"items": [{"price": 10}]},
+        "get_cached_historical_context_data": {"latest_complete_close": 10},
+        "get_resilient_security_reference_data": {"name": "Test"},
+        "get_relative_strength_data": {"relative_to_benchmark_pct_points": 0},
+        "get_news_data": {"items": [{"title": "Test news"}]},
+        "get_announcement_data": {"items": [{"title": "Test announcement"}]},
+    }
+    for name, payload in evidence.items():
+        monkeypatch.setattr(
+            app, name, lambda *_args, value=payload: {"source": "test", **value}
+        )
     monkeypatch.setattr(app, "get_market_overview_data", market)
     monkeypatch.setattr(app, "get_financial_data", financials)
     monkeypatch.setattr(app, "build_security_status_data", lambda *_args: {})
@@ -124,8 +131,11 @@ def test_saturated_packet_returns_explicit_missing_components(monkeypatch):
         assert result["data_status"] == "partial_data"
         assert len(result["recommended_follow_up_tools"]) == 9
         assert all(
-            s["status"] == "unavailable" for s in result["component_status"].values()
+            s["status"] == "unavailable"
+            for name, s in result["component_status"].items()
+            if name != "security_status"
         )
+        assert result["component_status"]["security_status"]["status"] == "no_data"
         assert all("capacity busy" in e["message"] for e in result["source_errors"])
         release.set()
         blocked.result(timeout=1)

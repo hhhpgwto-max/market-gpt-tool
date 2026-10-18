@@ -15,7 +15,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from functools import wraps
 from inspect import iscoroutinefunction
-from math import ceil, sqrt
+from math import ceil, isfinite, sqrt
 from threading import BoundedSemaphore, Event, Lock
 from time import perf_counter, perf_counter_ns
 from typing import Annotated, Any, Literal
@@ -37,7 +37,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "shared_tls_research_cache_v16"
+ROUTING_REVISION = "evidence_quality_context_v17"
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
 PUBLIC_TLS_CONTEXT = ssl.create_default_context()
@@ -136,7 +136,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.16.3",
+    version="0.17.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -5442,39 +5442,104 @@ def historical_window_metrics(
     items: list[dict[str, Any]], window: int
 ) -> dict[str, Any]:
     window_items = items[-window:]
+    path_items = items[-(window + 1) :]
+
+    def valid_price(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        number = to_number(value)
+        return (
+            number if number is not None and isfinite(number) and number > 0 else None
+        )
+
+    parsed_dates = []
+    for item in path_items:
+        try:
+            parsed_dates.append(date.fromisoformat(str(item.get("date"))))
+        except (TypeError, ValueError):
+            parsed_dates.append(None)
+    dates_valid = all(value is not None for value in parsed_dates)
+    dates_unique = dates_valid and len(set(parsed_dates)) == len(parsed_dates)
+    dates_ordered = dates_valid and all(
+        previous < current for previous, current in zip(parsed_dates, parsed_dates[1:])
+    )
+    path_closes = [valid_price(item.get("close")) for item in path_items]
+    quality_reasons = []
+    if len(items) < window + 1:
+        quality_reasons.append("insufficient_sessions")
+    if not dates_valid:
+        quality_reasons.append("invalid_session_date")
+    elif not dates_unique:
+        quality_reasons.append("duplicate_session_date")
+    if dates_valid and not dates_ordered:
+        quality_reasons.append("session_dates_not_strictly_increasing")
+    if any(value is None for value in path_closes):
+        quality_reasons.append("missing_or_invalid_close")
+    window_complete = not quality_reasons
     closes = [
         value
         for item in window_items
-        if (value := to_number(item.get("close"))) is not None
+        if (value := valid_price(item.get("close"))) is not None
     ]
     highs = [
         value
         for item in window_items
-        if (value := to_number(item.get("high"))) is not None
+        if (value := valid_price(item.get("high"))) is not None
     ]
     lows = [
         value
         for item in window_items
-        if (value := to_number(item.get("low"))) is not None
+        if (value := valid_price(item.get("low"))) is not None
     ]
     latest = window_items[-1] if window_items else {}
-    latest_close = to_number(latest.get("close"))
+    latest_close = valid_price(latest.get("close"))
     comparison_close = (
-        to_number(items[-(window + 1)].get("close"))
+        valid_price(items[-(window + 1)].get("close"))
         if len(items) >= window + 1
         else None
     )
     metrics: dict[str, Any] = {
         "requested_sessions": window,
         "available_sessions": len(window_items),
-        "window_complete": len(items) >= window + 1,
+        "window_complete": window_complete,
+        "valid_close_observations": len(closes),
+        "data_quality": {
+            "reasons": quality_reasons,
+            "session_dates_valid": dates_valid,
+            "session_dates_unique": dates_unique,
+            "session_dates_strictly_increasing": dates_ordered,
+            "valid_path_close_observations": sum(
+                value is not None for value in path_closes
+            ),
+            "required_path_close_observations": window + 1,
+            "field_observations": {
+                "close": len(closes),
+                "high": len(highs),
+                "low": len(lows),
+            },
+            "continuity_scope": "Consecutive valid source rows with unique increasing dates; exchange-calendar gaps and suspensions are not inferred.",
+        },
         "start_date": clean_value(window_items[0].get("date"))
         if window_items
         else None,
         "end_date": clean_value(latest.get("date")),
-        "return_pct": percentage_change(latest_close, comparison_close),
-        "annualized_volatility_pct": annualized_volatility_pct(closes),
-        "maximum_drawdown_pct": maximum_drawdown_pct(closes),
+        "return_pct": percentage_change(latest_close, comparison_close)
+        if window_complete
+        else None,
+        "annualized_volatility_pct": annualized_volatility_pct(closes)
+        if window_complete
+        else None,
+        "maximum_drawdown_pct": maximum_drawdown_pct(closes)
+        if window_complete
+        else None,
+        "range_complete": window_complete
+        and len(highs) == window
+        and len(lows) == window,
+        "range_scope": (
+            "complete_requested_window"
+            if window_complete and len(highs) == window and len(lows) == window
+            else "observed_valid_prices_only"
+        ),
         "high": max(highs) if highs else None,
         "low": min(lows) if lows else None,
         "distance_from_high_pct": percentage_change(
@@ -5491,7 +5556,11 @@ def historical_window_metrics(
             if (value := to_number(item.get(field))) is not None
         ]
         latest_value = to_number(latest.get(field))
-        prior_values = values[:-1] if len(values) > 1 else []
+        prior_values = [
+            value
+            for item in window_items[:-1]
+            if (value := to_number(item.get(field))) is not None
+        ]
         prior_average = mean_or_none(prior_values)
         metrics[field] = {
             "latest": latest_value,
@@ -5504,6 +5573,7 @@ def historical_window_metrics(
             "percentile_rank_in_window": percentile_rank(latest_value, values),
             "available_observations": len(values),
         }
+        metrics["data_quality"]["field_observations"][field] = len(values)
     return metrics
 
 
@@ -6053,8 +6123,150 @@ def compact_intraday_context(payload: dict[str, Any]) -> dict[str, Any]:
             "mechanical_indicators",
             "source",
             "source_errors",
+            "data_status",
+            "served_from_stale_cache",
+            "cache_hit",
+            "cache_created_at",
+            "cache_age_seconds",
         )
     } | {"latest_minutes": (payload.get("items") or [])[-10:]}
+
+
+def decision_component_quality(component: str, payload: Any) -> dict[str, Any]:
+    """Separate evidence availability, completeness and reported cache freshness."""
+    data = payload if isinstance(payload, dict) else {}
+
+    def numeric(value: Any, *, positive: bool = False) -> bool:
+        if isinstance(value, bool):
+            return False
+        number = to_number(value)
+        return number is not None and isfinite(number) and (not positive or number > 0)
+
+    rows = data.get("items") or []
+    windows = list((data.get("windows") or {}).values())
+    has_data = {
+        "quote": lambda: numeric((data.get("quote") or {}).get("price"), positive=True),
+        "intraday": lambda: any(
+            numeric(row.get("price"), positive=True) for row in rows
+        ),
+        "historical_context": lambda: (
+            numeric(
+                data.get("latest_complete_close", data.get("latest_close")),
+                positive=True,
+            )
+            or any(numeric(row.get("return_pct")) for row in windows)
+        ),
+        "security_reference": lambda: (
+            any(
+                data.get(key) not in (None, "")
+                for key in ("name", "listing_date", "industry", "region")
+            )
+            or numeric(data.get("total_shares"), positive=True)
+        ),
+        "relative_strength": lambda: any(
+            numeric(data.get(key))
+            for key in (
+                "target_change_pct",
+                "benchmark_change_pct",
+                "relative_to_benchmark_pct_points",
+            )
+        ),
+        "market_overview": lambda: (
+            any(
+                numeric(row.get("price"), positive=True)
+                for row in data.get("indices") or []
+            )
+            or any(
+                numeric(value) for value in (data.get("market_breadth") or {}).values()
+            )
+        ),
+        "news": lambda: any(row.get("title") for row in rows),
+        "official_announcements": lambda: any(row.get("title") for row in rows),
+        "financials": lambda: any(
+            numeric(value)
+            for row in rows
+            for key, value in row.items()
+            if key
+            not in {"symbol", "code", "report_period", "report_date", "published_at"}
+        ),
+    }[component]()
+    reported_status = str(data.get("data_status") or "")
+    reasons = []
+    # A successful search with no records is not a failed source or a retry target.
+    successful_empty = (
+        component in {"news", "official_announcements"}
+        and data.get("items") == []
+        and data.get("count") == 0
+        and not data.get("source_errors")
+        and reported_status not in {"partial_data", "unavailable"}
+        and (
+            bool(data.get("source") and data.get("period"))
+            if component == "official_announcements"
+            else bool(data.get("provider_status"))
+            and all(
+                value.get("status") == "available"
+                for value in data["provider_status"].values()
+            )
+        )
+    )
+    if reported_status in {"no_data", "unavailable"}:
+        has_data = False
+        if not successful_empty:
+            reasons.append(f"reported_{reported_status}")
+    elif reported_status == "partial_data":
+        reasons.append("reported_partial_data")
+    if component == "news" and any(
+        value.get("status") == "unavailable"
+        for value in (data.get("provider_status") or {}).values()
+    ):
+        reasons.append("news_provider_unavailable")
+    if not has_data and not successful_empty:
+        reasons.append("no_valid_component_evidence")
+    if component == "historical_context" and any(
+        row.get("window_complete") is False for row in windows
+    ):
+        reasons.append("incomplete_history_window")
+    if component == "relative_strength" and has_data:
+        if data.get("relative_to_benchmark_pct_points") is None:
+            reasons.append("benchmark_comparison_unavailable")
+    is_stale = bool(
+        data.get("served_from_stale_cache")
+        or data.get("is_stale")
+        or data.get("reference_stale_reason")
+    )
+    is_complete = (has_data or successful_empty) and not reasons
+    if is_stale:
+        reasons.append("reported_stale_data")
+    status = (
+        "empty_result"
+        if successful_empty and not is_stale
+        else "no_data"
+        if not has_data and not successful_empty
+        else "stale_cache"
+        if is_stale
+        else "partial_data"
+        if not is_complete
+        else "available"
+    )
+    return {
+        "status": status,
+        "data_status": reported_status or ("full_data" if is_complete else status),
+        "has_data": has_data,
+        "no_records": successful_empty,
+        "is_complete": is_complete,
+        "is_fresh": (has_data or successful_empty) and not is_stale,
+        "quality_reasons": reasons,
+        **{
+            key: data[key]
+            for key in (
+                "cache_hit",
+                "cache_created_at",
+                "cache_age_seconds",
+                "stale_cache_age_seconds",
+            )
+            if key in data
+        },
+    }
 
 
 def decision_context_follow_up_tools(
@@ -6101,7 +6313,13 @@ def decision_context_follow_up_tools(
     recommendations = []
     for component, tool, arguments in specifications:
         status = str((component_status.get(component) or {}).get("status") or "")
-        if status not in {"unavailable", "unavailable_within_response_budget"}:
+        if status not in {
+            "unavailable",
+            "unavailable_within_response_budget",
+            "partial_data",
+            "no_data",
+            "stale_cache",
+        }:
             continue
         recommendations.append(
             {
@@ -6122,14 +6340,14 @@ def cached_research_component(
     cache_namespace = (
         "research_quote_payload" if tool_name == "get_a_share_quote" else tool_name
     )
-    data, _ = get_cached_tool_data(
+    data, cache = get_cached_tool_data(
         cache_key(cache_namespace, parameters),
         ttl_seconds,
         loader,
         inflight_wait_timeout_seconds=4,
         partial_ttl_seconds=min(ttl_seconds, 2),
     )
-    return data
+    return {**data, **cache}
 
 
 def get_decision_context_data(
@@ -6145,7 +6363,9 @@ def get_decision_context_data(
             "get_a_share_quote", {"symbol": symbol}, 2, lambda: get_quote_data(symbol)
         ),
         "intraday": lambda: cached_research_component(
-            "get_a_share_intraday", {"symbol": symbol, "limit": 60}, 15,
+            "get_a_share_intraday",
+            {"symbol": symbol, "limit": 60},
+            15,
             lambda: get_intraday_data(symbol, 60),
         ),
         "historical_context": lambda: get_cached_historical_context_data(symbol),
@@ -6153,28 +6373,45 @@ def get_decision_context_data(
         "relative_strength": lambda: cached_research_component(
             "get_a_share_relative_strength",
             {"symbol": symbol, "benchmark_symbol": benchmark, "peer_symbols": []},
-            2, lambda: get_relative_strength_data(symbol, benchmark, None),
+            2,
+            lambda: get_relative_strength_data(symbol, benchmark, None),
         ),
         "market_overview": lambda: cached_research_component(
-            "get_a_share_market_overview", {"limit": 5}, 5,
+            "get_a_share_market_overview",
+            {"limit": 5},
+            5,
             lambda: get_market_overview_data(5),
         ),
         "news": lambda: cached_research_component(
             "get_a_share_news",
-            {"symbol": symbol, "limit": 8, "days": 30, "include_industry_context": False},
-            300, lambda: get_news_data(symbol, 8, 30, False),
+            {
+                "symbol": symbol,
+                "limit": 8,
+                "days": 30,
+                "include_industry_context": False,
+            },
+            300,
+            lambda: get_news_data(symbol, 8, 30, False),
         ),
     }
     if security["security_type"] not in {"etf", "lof"}:
         loaders["official_announcements"] = lambda: cached_research_component(
-            "get_a_share_announcements", {"symbol": symbol, "days": 180, "limit": 10},
-            300, lambda: get_announcement_data(symbol, 180, 10),
+            "get_a_share_announcements",
+            {"symbol": symbol, "days": 180, "limit": 10},
+            300,
+            lambda: get_announcement_data(symbol, 180, 10),
         )
         loaders["financials"] = lambda: cached_research_component(
-            "get_a_share_financials", {"symbol": symbol, "limit": 4}, 21600,
+            "get_a_share_financials",
+            {"symbol": symbol, "limit": 4},
+            21600,
             lambda: get_financial_data(symbol, 4),
         )
-    results, statuses, errors = collect_components(loaders, 12, DECISION_COMPONENT_EXECUTOR)
+    results, statuses, errors = collect_components(
+        loaders, 12, DECISION_COMPONENT_EXECUTOR
+    )
+    for name, payload in results.items():
+        statuses[name].update(decision_component_quality(name, payload))
     if security["security_type"] in {"etf", "lof"}:
         statuses["official_announcements"] = {
             "status": "not_applicable_to_exchange_listed_fund",
@@ -6202,6 +6439,29 @@ def get_decision_context_data(
             in {"quote", "security_reference", "official_announcements"}
         ],
     )
+    security_dependencies = [
+        statuses.get(key, {}) for key in ("quote", "security_reference")
+    ]
+    security_has_data = any(value.get("has_data") for value in security_dependencies)
+    security_complete = all(value.get("is_complete") for value in security_dependencies)
+    security_fresh = all(value.get("is_fresh") for value in security_dependencies)
+    statuses["security_status"] = {
+        "status": "no_data"
+        if not security_has_data
+        else "partial_data"
+        if not security_complete
+        else "stale_cache"
+        if not security_fresh
+        else "available",
+        "has_data": security_has_data,
+        "is_complete": security_complete,
+        "is_fresh": security_fresh,
+        "depends_on": ["quote", "security_reference"],
+    }
+    if isinstance(security_status, dict):
+        security_status["data_status"] = (
+            "full_data" if security_complete and security_fresh else "partial_data"
+        )
     completed_iso = now_iso()
     snapshot_id = f"{symbol}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
     decision_inputs = {
@@ -6222,8 +6482,23 @@ def get_decision_context_data(
     applicable_component_names = set(decision_inputs)
     if security["security_type"] in {"etf", "lof"}:
         applicable_component_names -= {"official_announcements", "financials"}
+    component_names = {name: name for name in applicable_component_names}
     available_count = sum(
-        decision_inputs[name] is not None for name in applicable_component_names
+        bool(statuses.get(name, {}).get("has_data"))
+        for name in component_names.values()
+    )
+    complete_count = sum(
+        bool(statuses.get(name, {}).get("is_complete"))
+        for name in component_names.values()
+    )
+    fresh_count = sum(
+        bool(statuses.get(name, {}).get("is_fresh"))
+        for name in component_names.values()
+    )
+    complete_fresh_count = sum(
+        bool(statuses.get(name, {}).get("is_complete"))
+        and bool(statuses.get(name, {}).get("is_fresh"))
+        for name in component_names.values()
     )
     requested_count = len(applicable_component_names)
     recommended_follow_ups = decision_context_follow_up_tools(
@@ -6244,12 +6519,24 @@ def get_decision_context_data(
         "snapshot_span_ms": int((perf_counter() - started_at) * 1000),
         "component_status": statuses,
         "available_component_count": available_count,
+        "returned_component_count": sum(
+            (name in results)
+            or (
+                name == "security_status"
+                and any(key in results for key in ("quote", "security_reference"))
+            )
+            for name in component_names.values()
+        ),
+        "complete_component_count": complete_count,
+        "fresh_component_count": fresh_count,
+        "complete_fresh_component_count": complete_fresh_count,
+        "component_count_scope": "Available means nonempty usable evidence, not completeness. A confirmed successful empty search is complete but has no records. Fresh means no reported stale cache/data flag, not proof of real-time source delivery; report publication age is not cache age.",
         "requested_component_count": requested_count,
         "applicable_components": sorted(applicable_component_names),
         "recommended_follow_up_tools": recommended_follow_ups,
         "follow_up_note": (
-            "Call only the listed read-only tools to refill components that were unavailable in this packet. "
-            "An unavailable packet component means not returned within this request, not that the underlying data does not exist."
+            "Call only the listed read-only tools to refresh unavailable, partial, no-data or stale evidence. "
+            "Unavailable means not returned within this request; empty results can be legitimate, and a retry is not guaranteed to supply new data."
             if recommended_follow_ups
             else None
         ),
@@ -6269,7 +6556,7 @@ def get_decision_context_data(
         "queried_at": completed_iso,
         "data_status": (
             "full_data"
-            if available_count == requested_count and not errors
+            if complete_fresh_count == requested_count and not errors
             else "partial_data"
         ),
         "note": "Evidence packet only. It contains facts, comparisons, timestamps, provenance, and missing-data reasons; GPT remains responsible for interpretation and judgement.",

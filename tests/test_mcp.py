@@ -2371,7 +2371,7 @@ def test_reliability_envelope_cache_and_health() -> None:
     )
     assert health["overall_status"] == "operational_on_observed_requests"
     assert health["observation_coverage"]["is_exhaustive_component_probe"] is False
-    assert health["routing_revision"] == "shared_tls_research_cache_v16"
+    assert health["routing_revision"] == "evidence_quality_context_v17"
     assert health["cache"]["max_entries"] == market_app.TOOL_CACHE_MAX_ENTRIES
 
     market_app.PREFERRED_ROUTE_HEALTH.clear()
@@ -3874,17 +3874,18 @@ def test_decision_context_follow_up_recommendations() -> None:
         },
     )
     assert [item["missing_component"] for item in recommendations] == [
+        "intraday",
         "historical_context",
         "news",
         "official_announcements",
     ]
-    assert recommendations[0] == {
+    assert recommendations[1] == {
         "missing_component": "historical_context",
         "tool": "get_a_share_historical_context",
         "arguments": {"symbol": "600519"},
         "reason": "unavailable_within_response_budget",
     }
-    assert recommendations[1]["arguments"] == {
+    assert recommendations[2]["arguments"] == {
         "symbol": "600519",
         "limit": 8,
         "days": 30,
@@ -4348,7 +4349,7 @@ def main() -> None:
     with TestClient(market_app.app, base_url="http://127.0.0.1:8000") as client:
         health = client.get("/health")
         assert health.status_code == 200, health.text
-        assert health.json()["routing_revision"] == "shared_tls_research_cache_v16"
+        assert health.json()["routing_revision"] == "evidence_quality_context_v17"
 
         for legacy_path in (
             "/search?keyword=600000",
