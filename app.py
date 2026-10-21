@@ -41,7 +41,7 @@ REQUEST_LOGGER = logging.getLogger("market_sentinel.requests")
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "bounded_request_recovery_v18"
+ROUTING_REVISION = "recorded_evidence_snapshot_v19"
 MCP_RESPONSE_BUDGET_SECONDS = 20.0
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
@@ -242,7 +242,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.18.0",
+    version="0.19.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -6509,6 +6509,255 @@ def cached_research_component(
     return {**data, **cache}
 
 
+def build_evidence_snapshot(
+    decision_inputs: dict[str, Any],
+    component_status: dict[str, dict[str, Any]],
+    *,
+    snapshot_id: str,
+    symbol: str,
+    benchmark: str,
+    captured_at: str,
+) -> dict[str, Any]:
+    """Project already-collected facts; never fetch, infer a trade, or store state."""
+    facts: dict[str, Any] = {}
+
+    def mapping(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def effective_time(value: Any) -> tuple[str | None, str]:
+        if not isinstance(value, str):
+            return None, "unavailable"
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                return date.fromisoformat(value).isoformat(), "trading_date"
+            if "T" not in value and " " not in value:
+                return None, "unavailable"
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                return None, "unavailable"
+            return timestamp.astimezone(MARKET_TIMEZONE).isoformat(), "market_timestamp"
+        except ValueError:
+            return None, "unavailable"
+
+    def sources(value: Any) -> list[str]:
+        # Provider labels only: no raw exceptions, URLs, query strings or tokens.
+        return sorted(
+            {
+                item
+                for item in normalize_sources(value)
+                if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_.:-]{0,95}", item)
+            }
+        )[:3]
+
+    def add(
+        key: str,
+        value: Any,
+        component: str,
+        source: Any,
+        as_of: Any,
+        unit: str,
+        period: str,
+        adjustment: str | None = "not_applicable",
+        *,
+        window: int | None = None,
+        complete: bool | None = None,
+        extra_reasons: tuple[str, ...] = (),
+        categorical: bool = False,
+        positive: bool = False,
+        basis: dict[str, Any] | None = None,
+    ) -> None:
+        status = mapping(component_status.get(component))
+        if categorical:
+            normalized = value if isinstance(value, str) and len(value) <= 96 else None
+        else:
+            normalized = None if isinstance(value, bool) else to_number(value)
+            if normalized is not None and (
+                not isfinite(normalized) or (positive and normalized <= 0)
+                or (unit == "security_count" and (normalized < 0 or normalized != int(normalized)))
+            ):
+                normalized = None
+        if status.get("status") in {"timeout", "error", "unavailable", "no_data", "data_unavailable"}:
+            normalized = None
+        timestamp, timestamp_kind = effective_time(as_of)
+        provider_labels = sources(source)
+        reasons = list(extra_reasons)
+        if normalized is None:
+            reasons.append("missing_or_invalid_fact")
+        if timestamp is None:
+            reasons.append("effective_time_unavailable")
+        if not provider_labels:
+            reasons.append("source_unavailable")
+        if status.get("is_complete") is not True:
+            reasons.append("component_not_complete")
+        if status.get("is_fresh") is not True:
+            reasons.append("component_freshness_not_confirmed")
+        if complete is False:
+            reasons.append("requested_window_incomplete")
+        if adjustment is None:
+            reasons.append("adjustment_unavailable")
+        reasons = list(dict.fromkeys(reasons))
+        quality = (
+            "no_data"
+            if normalized is None
+            else "stale_cache"
+            if status.get("status") == "stale_cache"
+            else "partial_data"
+            if reasons
+            else "available"
+        )
+        comparison_basis = {
+            "unit": unit,
+            "period": period,
+            "adjustment": adjustment,
+            **({"window_sessions": window} if window is not None else {}),
+            **(basis or {}),
+        }
+        facts[key] = {
+            "value": normalized,
+            "component": component,
+            "source": provider_labels,
+            "as_of": timestamp,
+            "effective_at_kind": timestamp_kind,
+            "unit": unit,
+            "period": period,
+            "adjustment": adjustment,
+            "comparison_basis": comparison_basis,
+            "quality": {
+                "status": quality,
+                "has_data": normalized is not None,
+                "is_complete": not reasons,
+                "is_fresh": status.get("is_fresh") is True,
+                "quality_reasons": reasons,
+            },
+        }
+
+    quote_payload = mapping(decision_inputs.get("quote"))
+    quote = mapping(quote_payload.get("quote"))
+    quote_time = quote.get("quote_time")
+    for name, unit in (
+        ("price", "CNY_per_share"),
+        ("previous_close", "CNY_per_share"),
+        ("high", "CNY_per_share"),
+        ("low", "CNY_per_share"),
+        ("change_pct", "percent"),
+    ):
+        add(
+            f"quote.{name}", quote.get(name), "quote", quote_payload.get("source"),
+            quote_time, unit, "current_session", "unadjusted_quote",
+            positive=unit == "CNY_per_share",
+            basis={"instrument_identifier": symbol},
+        )
+
+    history = mapping(decision_inputs.get("historical_context"))
+    history_time = history.get("latest_complete_trade_date")
+    history_adjustment = history.get("adjustment")
+    if history_adjustment not in {"forward_adjusted", "backward_adjusted", "unadjusted"}:
+        history_adjustment = None
+    add(
+        "history.latest_complete_close", history.get("latest_complete_close"),
+        "historical_context", history.get("source"), history_time,
+        "CNY_per_share", "completed_daily_session", history_adjustment, positive=True,
+        basis={"instrument_identifier": symbol},
+    )
+    for prefix, windows, requested in (
+        ("history", mapping(history.get("windows")), HISTORICAL_CONTEXT_WINDOWS),
+        ("path", mapping(mapping(history.get("path_facts")).get("windows")), HISTORICAL_PATH_WINDOWS),
+    ):
+        for window in requested:
+            metrics = mapping(windows.get(str(window)))
+            fields = ("return_pct", "high", "low") if prefix == "path" else (
+                "return_pct", "high", "low", "distance_from_high_pct",
+                "distance_from_low_pct", "annualized_volatility_pct", "maximum_drawdown_pct",
+            )
+            for name in fields:
+                range_metric = name in {"high", "low", "distance_from_high_pct", "distance_from_low_pct"}
+                complete = metrics.get("window_complete") is True and (
+                    not range_metric or metrics.get("range_complete") is True
+                )
+                add(
+                    f"{prefix}.{window}.{name}", metrics.get(name), "historical_context",
+                    history.get("source"), metrics.get("end_date") or history_time,
+                    "CNY_per_share" if name in {"high", "low"} else "percent",
+                    "completed_daily_sessions", history_adjustment,
+                    window=window, complete=complete, positive=name in {"high", "low"},
+                    basis={"instrument_identifier": symbol},
+                )
+
+    relative = mapping(decision_inputs.get("relative_strength"))
+    target = mapping(relative.get("target"))
+    benchmark_quote = mapping(relative.get("benchmark"))
+    relative_time = target.get("market_time") or target.get("quote_time")
+    benchmark_time = benchmark_quote.get("market_time") or benchmark_quote.get("quote_time")
+    alignment = current_snapshot_time_alignment(
+        relative_time, {"benchmark": {"market_time": benchmark_time}},
+    )
+    for name in ("target_change_pct", "benchmark_change_pct", "relative_to_benchmark_pct_points"):
+        add(
+            f"relative.{name}", relative.get(name), "relative_strength", relative.get("source"),
+            relative_time, "percentage_points" if name.endswith("pct_points") else "percent",
+            "current_session", "unadjusted_quote",
+            extra_reasons=() if alignment["status"] == "aligned" else ("relative_times_not_aligned",),
+            basis={"benchmark_identifier": relative.get("benchmark_identifier") or benchmark},
+        )
+
+    overview = mapping(decision_inputs.get("market_overview"))
+    structure = mapping(overview.get("current_market_structure"))
+    temporal_alignment = mapping(structure.get("temporal_alignment"))
+    component_times = mapping(temporal_alignment.get("component_market_times"))
+    breadth = mapping(mapping(overview.get("market_breadth")).get("all_market"))
+    for name in ("rise_count", "fall_count", "flat_count", "limit_up_count", "limit_down_count"):
+        add(
+            f"market.breadth.{name}", breadth.get(name), "market_overview",
+            overview.get("market_breadth_source"), component_times.get("market_breadth"),
+            "security_count", "current_session", basis={"universe": "ordinary_a_shares"},
+        )
+    indices = overview.get("indices")
+    for index in (indices if isinstance(indices, list) else [])[:3]:
+        index = mapping(index)
+        code = str(index.get("symbol") or "")
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        add(
+            f"market.index.{code}.change_pct", index.get("change_pct"), "market_overview",
+            index.get("source") or overview.get("index_source"), index.get("market_time"),
+            "percent", "current_session", basis={"index_identifier": f"index:{code}"},
+        )
+
+    gaps = sorted(key for key, fact in facts.items() if fact["quality"]["status"] != "available")
+    # Intern repeated provenance/quality metadata rather than repeating it for every metric.
+    contexts: dict[str, Any] = {}
+    context_keys: dict[str, str] = {}
+    compact_facts = {}
+    for key, fact in facts.items():
+        metadata = {name: value for name, value in fact.items() if name != "value"}
+        signature = json.dumps(metadata, sort_keys=True, ensure_ascii=False)
+        context_id = context_keys.get(signature)
+        if context_id is None:
+            context_id = f"c{len(contexts) + 1}"
+            context_keys[signature] = context_id
+            contexts[context_id] = metadata
+        compact_facts[key] = {"value": fact["value"], "context_id": context_id}
+    return {
+        "schema_version": "sentinel_evidence_snapshot_v1",
+        "snapshot_id": snapshot_id,
+        "symbol": symbol,
+        "benchmark_identifier": benchmark,
+        "as_of": effective_time(quote_time)[0],
+        "captured_at": captured_at,
+        "facts": compact_facts,
+        "contexts": contexts,
+        "ledger_storage_format": "When recording authorized evidence, copy this whole object to record_trading_snapshot.candidates[].evidence_snapshot beside code=symbol, then explicitly link the returned Ledger snapshot_id to the decision. This response itself saves nothing.",
+        "coverage": {
+            "status": "complete" if not gaps else "partial",
+            "fact_count": len(facts),
+            "comparable_fact_count": len(facts) - len(gaps),
+            "quality_gap_fields": gaps,
+            "scope": "Whitelisted price, completed-session paths, benchmark-relative and market participation facts only; not all research inputs.",
+        },
+        "boundary": "Facts only, no decision or trade. Resolve each fact.context_id in contexts for its source, effective time, comparison basis and quality. captured_at is not market time. No new source request or ledger write is performed.",
+    }
+
+
 def get_decision_context_data(
     symbol: str, benchmark_symbol: str | None
 ) -> dict[str, Any]:
@@ -6702,6 +6951,14 @@ def get_decision_context_data(
         "market_cross_checks": market_cross_checks,
         "current_market_structure": current_market_structure,
         "decision_inputs": decision_inputs,
+        "evidence_snapshot": build_evidence_snapshot(
+            decision_inputs,
+            statuses,
+            snapshot_id=snapshot_id,
+            symbol=symbol,
+            benchmark=benchmark,
+            captured_at=completed_iso,
+        ),
         "excluded_components": {},
         "source": sorted(
             {
