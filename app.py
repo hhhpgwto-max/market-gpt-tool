@@ -1,10 +1,12 @@
 import os
 import asyncio
 import base64
+import errno
 import json
 import logging
 import re
 import ssl
+import socket
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import asynccontextmanager
 from contextvars import copy_context
@@ -20,8 +22,9 @@ from threading import BoundedSemaphore, Event, Lock
 from time import perf_counter, perf_counter_ns
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 from xml.etree import ElementTree  # nosec B405
 
 import httpx
@@ -34,10 +37,12 @@ from pydantic import Field
 
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
+REQUEST_LOGGER = logging.getLogger("market_sentinel.requests")
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "evidence_quality_context_v17"
+ROUTING_REVISION = "bounded_request_recovery_v18"
+MCP_RESPONSE_BUDGET_SECONDS = 20.0
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
 PUBLIC_TLS_CONTEXT = ssl.create_default_context()
@@ -85,6 +90,24 @@ READ_ONLY_TOOL = ToolAnnotations(
     openWorldHint=False,
 )
 
+
+def log_request_outcome(
+    request_id: str, tool: str, stage: str, error_type: str | None, started_at: float
+) -> None:
+    """Log a fixed, non-sensitive diagnostic allowlist, never arguments or errors."""
+    record = {
+        "request_id": request_id,
+        "tool": tool,
+        "stage": stage,
+        "error_type": error_type,
+        "elapsed_ms": int((perf_counter() - started_at) * 1000),
+    }
+    REQUEST_LOGGER.log(
+        logging.WARNING if error_type else logging.INFO,
+        json.dumps(record, separators=(",", ":")),
+    )
+
+
 class NonBlockingFastMCP(FastMCP):
     """Keep synchronous provider work off the MCP protocol event loop."""
 
@@ -97,14 +120,97 @@ class NonBlockingFastMCP(FastMCP):
             else:
                 @wraps(fn)
                 async def nonblocking(*call_args, **call_kwargs):
+                    request_id = uuid4().hex
+                    started_at = perf_counter()
                     context = copy_context()
                     future = MCP_REQUEST_EXECUTOR.submit(
                         context.run, fn, *call_args, **call_kwargs
                     )
                     try:
-                        return await asyncio.wrap_future(future)
+                        result = await asyncio.wait_for(
+                            asyncio.wrap_future(future),
+                            timeout=MCP_RESPONSE_BUDGET_SECONDS,
+                        )
+                        error_type = (
+                            result.get("error_type")
+                            if isinstance(result, dict) and result.get("ok") is False
+                            else None
+                        )
+                        stage = (
+                            "completed_partial"
+                            if result.get("data_status") in {"partial_data", "no_data"}
+                            else "completed"
+                        )
+                        if error_type is None:
+                            error_type = next(
+                                (
+                                    error["error_type"]
+                                    for error in normalize_source_errors(
+                                        result.get("source_errors")
+                                    )
+                                    if error["error_type"] in {
+                                        "timeout", "service_capacity", "rate_limited",
+                                        "network_error", "upstream_5xx", "parse_error",
+                                    }
+                                ),
+                                None,
+                            )
+                        log_request_outcome(
+                            request_id, fn.__name__, stage, error_type, started_at
+                        )
+                        return {**result, "request_id": request_id}
+                    except TimeoutError:
+                        tool_raised_timeout = (
+                            future.done()
+                            and not future.cancelled()
+                            and isinstance(future.exception(), TimeoutError)
+                        )
+                        # Cancellation only stops queued work. A running thread
+                        # retains its executor slot until it really completes.
+                        future.cancel()
+                        result = mcp_error(
+                            None,
+                            HTTPException(
+                                status_code=504,
+                                detail=(
+                                    "Tool execution reported a timeout; no market data available."
+                                    if tool_raised_timeout
+                                    else "MCP request exceeded its bounded response deadline."
+                                ),
+                            ),
+                            started_at,
+                            failure_layer=(
+                                "tool_execution"
+                                if tool_raised_timeout
+                                else "mcp_request_deadline"
+                            ),
+                        )
                     except HTTPException as exc:
-                        return mcp_error(None, exc)
+                        result = mcp_error(None, exc, started_at)
+                    except asyncio.CancelledError:
+                        future.cancel()
+                        log_request_outcome(
+                            request_id, fn.__name__, "client_cancelled", None, started_at
+                        )
+                        raise
+                    except Exception:
+                        # Provider exception text can include URLs or query
+                        # values, so keep both protocol and log boundary generic.
+                        result = mcp_error(
+                            None,
+                            HTTPException(
+                                status_code=502,
+                                detail="Unexpected tool execution failure; no market data available.",
+                            ),
+                            started_at,
+                            failure_layer="mcp_tool_execution",
+                        )
+                        result["error_type"] = "unexpected_error"
+                        result["source_errors"][0]["error_type"] = "unexpected_error"
+                    log_request_outcome(
+                        request_id, fn.__name__, "failed", result["error_type"], started_at
+                    )
+                    return {**result, "request_id": request_id}
 
                 register(nonblocking)
             # Local composition and tests retain the original synchronous API.
@@ -136,7 +242,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.17.0",
+    version="0.18.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -479,6 +585,7 @@ SECURITY_REFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 DECISION_COMPONENT_EXECUTOR = BoundedResearchExecutor(max_workers=12, max_pending=24)
 # Reject excess requests rather than queueing another full packet budget.
 MCP_REQUEST_EXECUTOR = BoundedResearchExecutor(max_workers=4, max_pending=4)
+QUOTE_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=8, max_pending=16)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -854,6 +961,12 @@ def preferred_route_is_temporarily_degraded(
 
 def classify_error_type(message: Any, status_code: int | None = None) -> str:
     text = str(message).lower()
+    if "capacity busy" in text:
+        return "service_capacity"
+    if status_code == 504 or "timeout" in text or "timed out" in text or "exceeded" in text:
+        return "timeout"
+    if "quote_missing_essential_price" in text:
+        return "missing_data"
     if status_code == 404 or "not found" in text or "not_found" in text:
         return "not_found"
     if (
@@ -863,13 +976,19 @@ def classify_error_type(message: Any, status_code: int | None = None) -> str:
         or "required" in text
     ):
         return "invalid_symbol"
-    if "timeout" in text or "timed out" in text or "exceeded" in text:
-        return "timeout"
-    if "429" in text or "rate limit" in text or "rate_limited" in text:
+    if status_code == 429 or "429" in text or "rate limit" in text or "rate_limited" in text:
         return "rate_limited"
+    if any(
+        token in text
+        for token in (
+            "remote end closed", "connection reset", "connection refused",
+            "name resolution", "getaddrinfo", "network is unreachable",
+        )
+    ):
+        return "network_error"
     if "json" in text or "unexpected" in text or "format" in text or "parse" in text:
         return "parse_error"
-    if "502" in text or "503" in text or "504" in text or "upstream" in text:
+    if status_code in {502, 503} or "502" in text or "503" in text or "upstream" in text:
         return "upstream_5xx"
     return "network_error"
 
@@ -1313,6 +1432,30 @@ def read_market_text(url: str, referer: str, timeout: int = 3) -> str:
         raise
 
 
+def is_transient_public_read_error(exc: Exception) -> bool:
+    """Only retry a small allowlist of transient read-only transport failures."""
+    if isinstance(exc, HTTPError):
+        return exc.code in {502, 503, 504}
+    reason = exc.reason if isinstance(exc, URLError) else exc
+    # Retrying cannot repair certificate trust/hostname failures. Keep all TLS
+    # errors fail-closed rather than silently attempting an insecure fallback.
+    if isinstance(reason, ssl.SSLError):
+        return False
+    if isinstance(reason, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    return isinstance(reason, OSError) and reason.errno in {
+        errno.ETIMEDOUT,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.ECONNABORTED,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+    }
+
+
 def read_public_json(
     url: str,
     referer: str,
@@ -1329,7 +1472,8 @@ def read_public_json(
     )
     errors = []
     source = source_name_from_url(url)
-    for _ in range(attempts):
+    effective_attempts = max(1, min(attempts, 2))
+    for _ in range(effective_attempts):
         started_at = perf_counter()
         try:
             with urlopen(request, timeout=timeout, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
@@ -1338,11 +1482,13 @@ def read_public_json(
                 source, True, int((perf_counter() - started_at) * 1000)
             )
             return payload
-        except (OSError, URLError, json.JSONDecodeError) as exc:
+        except (OSError, URLError, json.JSONDecodeError, UnicodeError) as exc:
             errors.append(str(exc))
             record_source_health(
                 source, False, int((perf_counter() - started_at) * 1000), str(exc)
             )
+            if not is_transient_public_read_error(exc):
+                break
     raise HTTPException(
         status_code=502,
         detail=f"Failed to fetch public market data: {'; '.join(errors)}",
@@ -1456,7 +1602,7 @@ def read_sina_object(url: str, referer: str) -> dict[str, Any]:
 
 
 def get_tencent_quote(symbol: str) -> dict[str, Any]:
-    url = f"http://qt.gtimg.cn/q={market_symbol(symbol)}"
+    url = f"https://qt.gtimg.cn/q={market_symbol(symbol)}"
     try:
         text = read_market_text(url, "https://stockapp.finance.qq.com/")
     except OSError as exc:
@@ -1495,7 +1641,7 @@ def get_tencent_quote(symbol: str) -> dict[str, Any]:
 
 
 def get_sina_quote(symbol: str) -> dict[str, Any]:
-    url = f"http://hq.sinajs.cn/list={market_symbol(symbol)}"
+    url = f"https://hq.sinajs.cn/list={market_symbol(symbol)}"
     try:
         text = read_market_text(url, "https://finance.sina.com.cn/")
     except OSError as exc:
@@ -1851,6 +1997,18 @@ def get_eastmoney_batch_quote_rows(
     return rows, host
 
 
+def validate_quote_price(quote: Any) -> dict[str, Any]:
+    """An HTTP/parser success without a usable price is not a successful quote."""
+    value = quote.get("price") if isinstance(quote, dict) else None
+    price = None if isinstance(value, bool) else to_number(value)
+    if price is None or not isfinite(price) or price <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail="quote_missing_essential_price: source returned no finite positive price.",
+        )
+    return {**quote, "price": price}
+
+
 def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str]]:
     """Race independent public quote sources and retain failures for partial diagnostics."""
     source_getters = (
@@ -1859,9 +2017,9 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
         ("sina", get_sina_quote),
     )
     errors: list[str] = []
-    executor = ThreadPoolExecutor(max_workers=len(source_getters))
     futures = {
-        executor.submit(getter, symbol): source for source, getter in source_getters
+        QUOTE_SOURCE_EXECUTOR.submit(getter, symbol): source
+        for source, getter in source_getters
     }
     pending = set(futures)
     try:
@@ -1880,7 +2038,7 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
             for future in completed:
                 source = futures[future]
                 try:
-                    return future.result(), source, errors
+                    return validate_quote_price(future.result()), source, errors
                 except HTTPException as exc:
                     errors.append(f"{source}: {exc.detail}")
                 except Exception as exc:  # pragma: no cover - defensive source boundary
@@ -1889,7 +2047,8 @@ def get_fastest_public_quote(symbol: str) -> tuple[dict[str, Any], str, list[str
             future.cancel()
             errors.append(f"{futures[future]}: request timeout after 6 seconds")
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        for future in pending:
+            future.cancel()
     raise HTTPException(
         status_code=502,
         detail="; ".join(errors) or "All public quote sources are unavailable.",
@@ -12890,6 +13049,16 @@ def get_market_data_health_data() -> dict[str, Any]:
             "max_entries": TOOL_CACHE_MAX_ENTRIES,
             "policy": "bounded_short_TTL_success_only_with_singleflight",
         },
+        "request_policy": {
+            "response_deadline_seconds": MCP_RESPONSE_BUDGET_SECONDS,
+            "max_concurrent_mcp_requests": 4,
+            "overload_behavior": "explicit_service_capacity_no_queue",
+            "timeout_behavior": "unavailable_without_fabricated_market_data",
+            "running_work_after_timeout": "retains_capacity_until_completed",
+            "quote_provider_workers": 8,
+            "quote_provider_max_pending": 16,
+            "automatic_request_retries": 0,
+        },
         "routing_revision": ROUTING_REVISION,
         "degraded_mode": degraded,
         "note": "Service availability, configured routes, and request observations are separate. Success rates cover only requests seen by this process and do not prove that every composite subcomponent is healthy. This endpoint does not fabricate a live probe or investment conclusion.",
@@ -12898,10 +13067,25 @@ def get_market_data_health_data() -> dict[str, Any]:
 
 
 def mcp_error(
-    symbol: str | None, exc: HTTPException, started_at: float | None = None
+    symbol: str | None,
+    exc: HTTPException,
+    started_at: float | None = None,
+    *,
+    failure_layer: str | None = None,
 ) -> dict[str, Any]:
     tool_queried_at = now_iso()
     message = str(exc.detail)
+    error_type = classify_error_type(message, exc.status_code)
+    failure_layer = failure_layer or (
+        "service_capacity"
+        if error_type == "service_capacity"
+        else "component_cache_wait"
+        if "in-flight cache refresh" in message.lower()
+        else "upstream_data_source"
+    )
+    retryable = error_type in {
+        "timeout", "service_capacity", "rate_limited", "network_error", "upstream_5xx"
+    }
     result: dict[str, Any] = {
         "ok": False,
         "market_status": market_status_at(),
@@ -12915,7 +13099,8 @@ def mcp_error(
         "source_errors": [
             {
                 "source": "public_market_source",
-                "error_type": classify_error_type(message, exc.status_code),
+                "error_type": error_type,
+                "failure_layer": failure_layer,
                 "message": message,
             }
         ],
@@ -12932,11 +13117,23 @@ def mcp_error(
             f"-{perf_counter_ns()}"
         ),
         "source_updated_at": None,
-        "missing_fields": [],
+        "missing_fields": ["price"] if error_type == "missing_data" else [],
         "conflicts": [],
         "data_status": "unavailable",
         "detail_level": "summary",
-        "error_type": classify_error_type(message, exc.status_code),
+        "error_type": error_type,
+        "failure_layer": failure_layer,
+        "retryable": retryable,
+        "recovery": {
+            "action": (
+                "wait_then_retry_failed_component_only_in_smaller_batch"
+                if retryable
+                else "inspect_source_or_input_before_retry"
+            ),
+            "max_additional_attempts": 1 if retryable else 0,
+            "automatic_retry_performed": False,
+            "running_work_may_still_complete": failure_layer == "mcp_request_deadline",
+        },
         "error": message,
         "data": {},
     }
@@ -13022,7 +13219,12 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
 
     def quote_response() -> dict[str, Any]:
         payload = get_quote_data(symbol=symbol)
-        quote = payload["quote"]
+        quote = validate_quote_price(payload.get("quote"))
+        missing_fields = [
+            field for field in QUOTE_RESPONSE_FIELDS if quote.get(field) is None
+        ]
+        if not quote.get("quote_time"):
+            missing_fields.append("quote_time")
         return {
             **{field: clean_value(quote.get(field)) for field in QUOTE_RESPONSE_FIELDS},
             "security_type": quote.get("security_type"),
@@ -13032,6 +13234,8 @@ def get_a_share_quote(symbol: str) -> dict[str, Any]:
             "trade_date": quote.get("trade_date"),
             "quote_time": quote.get("quote_time"),
             "source_updated_at": quote.get("source_updated_at"),
+            "missing_fields": missing_fields,
+            "data_status": "partial_data" if missing_fields else "full_data",
             "note": payload["note"],
         }
 
