@@ -41,7 +41,7 @@ REQUEST_LOGGER = logging.getLogger("market_sentinel.requests")
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "recorded_evidence_snapshot_v19"
+ROUTING_REVISION = "independent_batch_history_recovery_v20"
 MCP_RESPONSE_BUDGET_SECONDS = 20.0
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
@@ -242,7 +242,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.19.0",
+    version="0.20.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -2094,11 +2094,107 @@ def batch_quote_from_eastmoney_row(
     }
 
 
+def batch_quote_error(security: dict[str, str], code: str, message: str) -> dict[str, Any]:
+    return {
+        "identifier": security["identifier"],
+        "symbol": security["symbol"],
+        "code": code,
+        "error": message,
+    }
+
+
+def validate_batch_quote(quote: dict[str, Any]) -> dict[str, Any]:
+    quote = validate_quote_price(quote)
+    for field in (
+        "change", "change_pct", "open", "high", "low", "previous_close",
+        "volume", "turnover", "amplitude", "turnover_rate", "volume_ratio",
+        "total_market_value", "circulating_market_value",
+    ):
+        value = quote.get(field)
+        number = None if isinstance(value, bool) else to_number(value)
+        quote[field] = number if number is not None and isfinite(number) else None
+    return quote
+
+
+def get_tencent_batch_quotes(
+    securities: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch one independent batch; never assemble a snapshot from per-stock calls."""
+    identifiers = {
+        security["identifier"]: (
+            {"SSE": "sh", "SZSE": "sz", "BSE": "bj"}[security["exchange"]]
+            + security["symbol"]
+        )
+        for security in securities
+    }
+    text = read_market_text(
+        "https://qt.gtimg.cn/q=" + ",".join(dict.fromkeys(identifiers.values())),
+        "https://stockapp.finance.qq.com/",
+        3,
+    )
+    rows = {
+        match.group(1): match.group(2).split("~")
+        for match in re.finditer(r'v_((?:sh|sz|bj)\d{6})="([^"]*)"', text)
+    }
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for security in securities:
+        parts = rows.get(identifiers[security["identifier"]])
+        if not parts or len(parts) < 35 or not parts[1] or parts[2] != security["symbol"]:
+            errors.append(batch_quote_error(
+                security, "no_data", "Tencent batch returned no valid matching security row.",
+            ))
+            continue
+
+        def number(index: int) -> Any:
+            return to_number(parts[index]) if len(parts) > index else None
+
+        source_updated_at = format_market_time(parts[30])
+        quote = normalize_quote_units({
+            "identifier": security["identifier"],
+            "symbol": security["symbol"],
+            "name": clean_value(parts[1]),
+            "security_type": security["security_type"],
+            "exchange": security["exchange"],
+            "price": number(3),
+            "previous_close": number(4),
+            "open": number(5),
+            "change": number(31),
+            "change_pct": number(32),
+            "high": number(33),
+            "low": number(34),
+            "volume": number(36),
+            "turnover": number(37),
+            "turnover_rate": number(38),
+            "amplitude": number(43),
+            "total_market_value": number(44),
+            "circulating_market_value": number(45),
+            "volume_ratio": None,
+            "source_updated_at": source_updated_at,
+            "source": "tencent_batch",
+        }, "tencent")
+        quote.update(derive_quote_timestamps(source_updated_at))
+        quote["market_time"] = quote.get("quote_time")
+        quote["effective_market_time"] = quote.get("quote_time")
+        try:
+            results.append(validate_batch_quote(quote))
+        except HTTPException:
+            errors.append(batch_quote_error(
+                security, "invalid_price", "Tencent batch returned no finite positive price.",
+            ))
+    record_preferred_route_health(
+        "tencent_batch_quote", not errors,
+        "missing_or_invalid_batch_items" if errors else None,
+    )
+    return results, errors
+
+
 def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
     securities, errors = normalize_batch_symbols(symbols)
     results: list[dict[str, Any]] = []
     source_errors: list[str] = []
     source = []
+    item_errors: list[dict[str, Any]] = []
     if securities:
         try:
             rows, host = get_eastmoney_batch_quote_rows(securities)
@@ -2106,11 +2202,12 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
             rows_by_secid = {
                 f"{row.get('f13')}.{str(row.get('f12') or '').zfill(6)}": row
                 for row in rows
+                if isinstance(row, dict)
             }
             for security in securities:
                 row = rows_by_secid.get(security["eastmoney_secid"])
                 if row is None:
-                    errors.append(
+                    item_errors.append(
                         {
                             "identifier": security["identifier"],
                             "symbol": security["symbol"],
@@ -2119,11 +2216,18 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
                         }
                     )
                     continue
-                results.append(batch_quote_from_eastmoney_row(row, security))
+                try:
+                    # Validate raw f2 too: bool must not silently become 1.0.
+                    validate_quote_price({"price": row.get("f2")})
+                    results.append(validate_batch_quote(batch_quote_from_eastmoney_row(row, security)))
+                except HTTPException:
+                    item_errors.append(batch_quote_error(
+                        security, "invalid_price", "Eastmoney batch returned no finite positive price.",
+                    ))
         except HTTPException as exc:
-            source_errors.append(str(exc.detail))
+            source_errors.append(f"eastmoney_batch: {exc.detail}")
             for security in securities:
-                errors.append(
+                item_errors.append(
                     {
                         "identifier": security["identifier"],
                         "symbol": security["symbol"],
@@ -2131,7 +2235,38 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
                         "error": "The public batch quote source is temporarily unavailable.",
                     }
                 )
+        record_preferred_route_health(
+            "eastmoney_batch_quote", not item_errors,
+            "missing_or_invalid_batch_items" if item_errors else None,
+        )
+        if item_errors:
+            source_errors.append("eastmoney_batch: incomplete usable batch; independent batch fallback attempted")
+            try:
+                fallback_results, fallback_errors = get_tencent_batch_quotes(securities)
+                # Prefer more coverage, but never merge different source batches.
+                if len(fallback_results) >= len(results) and fallback_results:
+                    results = fallback_results
+                    item_errors = fallback_errors
+                    source = ["tencent_batch"]
+                elif fallback_errors:
+                    source_errors.append("tencent_batch: incomplete usable batch; retained the more complete original batch")
+            except (HTTPException, OSError) as exc:
+                message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                source_errors.append(f"tencent_batch: {message}")
+                record_preferred_route_health("tencent_batch_quote", False, message)
+        errors.extend(item_errors)
 
+    missing_fields = []
+    for item in results:
+        for field in ("change_pct", "market_time"):
+            if item.get(field) is None or (field == "market_time" and parse_market_datetime(item[field]) is None):
+                missing_fields.append(f"{item['identifier']}.{field}")
+    time_alignment = current_snapshot_time_alignment(
+        results[0].get("market_time") if results else None,
+        {item["identifier"]: {"market_time": item.get("market_time")} for item in results},
+    )
+    if results and time_alignment["status"] != "aligned":
+        missing_fields.append("aligned_batch_market_times")
     market_times = sorted(
         item["market_time"] for item in results if item.get("market_time")
     )
@@ -2144,6 +2279,8 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         "count": len(results),
         "results": results,
         "errors": errors,
+        "missing_fields": missing_fields,
+        "time_alignment": time_alignment,
         "source": source,
         "source_errors": source_errors,
         "market_time": market_times[-1] if market_times else None,
@@ -2163,7 +2300,7 @@ def get_batch_quote_data(symbols: Any) -> dict[str, Any]:
         "tool_queried_at": completed_at,
         "queried_at": completed_at,
         "data_status": "full_data"
-        if results and not errors
+        if results and not errors and not missing_fields
         else "partial_data"
         if results
         else "no_data",
@@ -2609,6 +2746,48 @@ def get_tencent_minute_kline(
     }
 
 
+def read_tencent_adjusted_history(
+    symbol: str, tencent_period: str, query: str,
+) -> tuple[list[Any], str, list[str]]:
+    """Try two fixed HTTPS endpoints once each, without changing adjustment basis."""
+    errors: list[str] = []
+    for host in ("web.ifzq.gtimg.cn", "ifzq.gtimg.cn"):
+        try:
+            payload = read_public_json(
+                f"https://{host}/appstock/app/fqkline/get?{query}",
+                "https://gu.qq.com/", 2,
+            )
+            data = (payload.get("data") or {}).get(market_symbol(symbol)) or {}
+            # A raw 'day' response must not be relabelled forward-adjusted.
+            rows = data.get(f"qfq{tencent_period}")
+            if not isinstance(rows, list) or not rows:
+                raise HTTPException(status_code=502, detail="missing forward-adjusted history rows")
+            dates: list[str] = []
+            for row in rows:
+                if not isinstance(row, list) or len(row) < 6:
+                    raise HTTPException(status_code=502, detail="malformed adjusted history row")
+                day = str(row[0])
+                if date.fromisoformat(day).isoformat() != day:
+                    raise ValueError("invalid adjusted history date")
+                prices = [None if isinstance(value, bool) else to_number(value) for value in row[1:5]]
+                if any(value is None or not isfinite(value) or value <= 0 for value in prices):
+                    raise ValueError("invalid adjusted history price")
+                volume = None if isinstance(row[5], bool) else to_number(row[5])
+                if volume is None or not isfinite(volume) or volume < 0:
+                    raise ValueError("invalid adjusted history volume")
+                open_price, close, high, low = prices
+                if not low <= min(open_price, close) <= max(open_price, close) <= high:
+                    raise ValueError("inconsistent adjusted history OHLC")
+                dates.append(day)
+            if dates != sorted(set(dates)):
+                raise ValueError("non-increasing adjusted history dates")
+            return rows, host, errors
+        except (HTTPException, ValueError, TypeError, AttributeError) as exc:
+            detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+            errors.append(f"{host}: {detail}")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
 def get_tencent_kline(
     symbol: str,
     period: str,
@@ -2645,16 +2824,9 @@ def get_tencent_kline(
             "param": f"{market_symbol(symbol)},{tencent_period},,,{requested_source_limit},qfq",
         }
     )
-    payload = read_public_json(
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{query}",
-        "https://gu.qq.com/",
+    rows, source_endpoint, source_errors = read_tencent_adjusted_history(
+        symbol, tencent_period, query,
     )
-    data = (payload.get("data") or {}).get(market_symbol(symbol)) or {}
-    rows = data.get(f"qfq{tencent_period}") or data.get(tencent_period) or []
-    if not rows:
-        raise HTTPException(
-            status_code=404, detail=f"Kline data not found from Tencent: {symbol}"
-        )
 
     items = []
     previous_close = None
@@ -2710,6 +2882,8 @@ def get_tencent_kline(
         "count": len(items),
         "items": items,
         "source": "tencent",
+        "source_endpoint": source_endpoint,
+        "source_errors": source_errors,
         "latest_trade_date": items[-1]["date"],
         "queried_at": now_iso(),
         "note": "For information only. Not investment advice.",
@@ -2766,7 +2940,10 @@ def get_fallback_kline(
         7.0 if period in {"1m", "5m", "15m", "30m", "60m"} else 3.5,
         "kline:eastmoney",
     )
-    payload["source_errors"] = errors
+    payload["source_errors"] = [
+        *normalize_source_errors(payload.get("source_errors")),
+        *normalize_source_errors(errors),
+    ]
     return payload
 
 
@@ -7024,15 +7201,31 @@ def get_relative_strength_data(
             detail="The target quote was unavailable in the batch snapshot.",
         )
     benchmark_quote = quotes.get(benchmark)
-    target_change = to_number(target.get("change_pct"))
-    benchmark_change = (
-        to_number(benchmark_quote.get("change_pct")) if benchmark_quote else None
+    def finite_change(quote: dict[str, Any] | None) -> float | None:
+        value = (quote or {}).get("change_pct")
+        value = None if isinstance(value, bool) else to_number(value)
+        return value if value is not None and isfinite(value) else None
+
+    target_change = finite_change(target)
+    benchmark_change = finite_change(benchmark_quote)
+    target_time = target.get("market_time") or target.get("quote_time")
+    benchmark_alignment = current_snapshot_time_alignment(
+        target_time,
+        {"benchmark": {"market_time": (benchmark_quote or {}).get("market_time") or (benchmark_quote or {}).get("quote_time")}},
     )
     peer_quotes = [quotes[peer] for peer in peers if peer in quotes]
+    peer_alignment = {
+        peer: current_snapshot_time_alignment(
+            target_time,
+            {"peer": {"market_time": quotes.get(peer, {}).get("market_time") or quotes.get(peer, {}).get("quote_time")}},
+        )
+        for peer in peers
+    }
     peer_changes = [
         value
-        for item in peer_quotes
-        if (value := to_number(item.get("change_pct"))) is not None
+        for peer in dict.fromkeys(peers)
+        if peer_alignment[peer]["status"] == "aligned"
+        and (value := finite_change(quotes.get(peer))) is not None
     ]
     peer_average = (
         round(sum(peer_changes) / len(peer_changes), 3) if peer_changes else None
@@ -7040,6 +7233,7 @@ def get_relative_strength_data(
     relative_to_benchmark = (
         round(target_change - benchmark_change, 3)
         if target_change is not None and benchmark_change is not None
+        and benchmark_alignment["status"] == "aligned"
         else None
     )
     relative_to_peers = (
@@ -7047,12 +7241,19 @@ def get_relative_strength_data(
         if target_change is not None and peer_average is not None
         else None
     )
+    missing_fields = list(payload.get("missing_fields") or [])
+    if relative_to_benchmark is None:
+        missing_fields.append("aligned_target_benchmark_change")
+    if len(peer_changes) != len(set(peers)):
+        missing_fields.append("aligned_peer_changes")
+    errors = payload.get("errors", [])
     return {
         "symbol": symbol,
         "target": target,
         "benchmark_identifier": benchmark,
         "benchmark": benchmark_quote,
         "peer_count": len(peer_quotes),
+        "comparable_peer_count": len(peer_changes),
         "peers": peer_quotes,
         "target_change_pct": target_change,
         "benchmark_change_pct": benchmark_change,
@@ -7068,6 +7269,10 @@ def get_relative_strength_data(
             else "matching_or_unavailable"
         ),
         "market_time": payload.get("market_time"),
+        "time_alignment": {"benchmark": benchmark_alignment, "peers": peer_alignment},
+        "errors": errors,
+        "missing_fields": list(dict.fromkeys(missing_fields)),
+        "data_status": "partial_data" if missing_fields or errors or payload.get("data_status") in {"partial_data", "no_data"} else "full_data",
         "source": payload.get("source", []),
         "source_errors": payload.get("source_errors", []),
         "queried_at": now_iso(),
