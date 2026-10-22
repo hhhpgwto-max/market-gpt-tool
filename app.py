@@ -41,7 +41,7 @@ REQUEST_LOGGER = logging.getLogger("market_sentinel.requests")
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "independent_batch_history_recovery_v20"
+ROUTING_REVISION = "verified_disclosure_news_identity_v21"
 MCP_RESPONSE_BUDGET_SECONDS = 20.0
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
@@ -242,7 +242,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.20.0",
+    version="0.21.0",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -586,6 +586,9 @@ DECISION_COMPONENT_EXECUTOR = BoundedResearchExecutor(max_workers=12, max_pendin
 # Reject excess requests rather than queueing another full packet budget.
 MCP_REQUEST_EXECUTOR = BoundedResearchExecutor(max_workers=4, max_pending=4)
 QUOTE_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=8, max_pending=16)
+NEWS_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=4, max_pending=12)
+SECURITY_REFERENCE_SOURCE_EXECUTOR = BoundedResearchExecutor(max_workers=6, max_pending=18)
+NEWS_SOURCE_BUDGET_SECONDS = 5.5
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -4777,7 +4780,10 @@ def get_eastmoney_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
         f"https://search-api-web.eastmoney.com/search/jsonp?{query}",
         f"https://so.eastmoney.com/news/s?{urlencode({'keyword': keyword})}",
     )
-    articles = (payload.get("result") or {}).get("cmsArticleWebOld") or []
+    result = payload.get("result") if isinstance(payload, dict) else None
+    articles = result.get("cmsArticleWebOld") if isinstance(result, dict) else None
+    if not isinstance(articles, list) or any(not isinstance(row, dict) for row in articles):
+        raise HTTPException(status_code=502, detail="Invalid Eastmoney news result shape")
     return [
         {
             "published_at": format_market_time(article.get("date")),
@@ -4826,6 +4832,8 @@ def get_google_news_items(keyword: str, limit: int) -> list[dict[str, Any]]:
             raise ValueError("Google News RSS XML exceeded safety limits.")
         # DTD/entity declarations are rejected above before parsing the fixed-host RSS.
         root = ElementTree.fromstring(payload)  # nosec B314
+        if root.tag != "rss" or root.find("channel") is None:
+            raise ValueError("Unexpected Google News RSS document shape.")
         record_source_health(
             "google_news", True, int((perf_counter() - started_at) * 1000)
         )
@@ -4966,7 +4974,7 @@ def news_datetime(value: Any) -> datetime | None:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=MARKET_TIMEZONE)
         return parsed.astimezone(timezone.utc)
-    except ValueError:
+    except (ValueError, OverflowError, TypeError):
         return None
 
 
@@ -4981,8 +4989,8 @@ def get_news_data(
     source_errors = []
     try:
         reference = get_resilient_security_reference_data(symbol)
-    except HTTPException as exc:
-        source_errors.append(f"security_reference: {exc.detail}")
+    except Exception as exc:
+        source_errors.append(f"security_reference: {exc.detail if isinstance(exc, HTTPException) else type(exc).__name__}")
         reference = {}
     company_name = clean_value(reference.get("name"))
     industry = normalized_industry_news_term(reference.get("industry"))
@@ -4992,8 +5000,8 @@ def get_news_data(
             company_name = clean_value(quote.get("name"))
             source_errors.extend(quote_errors)
             reference["source"] = quote_source
-        except HTTPException as exc:
-            source_errors.append(f"company_name_fallback: {exc.detail}")
+        except Exception as exc:
+            source_errors.append(f"company_name_fallback: {exc.detail if isinstance(exc, HTTPException) else type(exc).__name__}")
 
     jobs: list[tuple[str, Any]] = [(symbol, get_eastmoney_news_items)]
     if company_name:
@@ -5009,34 +5017,44 @@ def get_news_data(
     candidates: list[dict[str, Any]] = []
     provider_status: dict[str, dict[str, Any]] = {}
     per_query_limit = min(max(limit * 3, 12), 30)
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-        futures = {
-            executor.submit(loader, keyword, per_query_limit): (
-                keyword,
-                loader.__name__,
-            )
-            for keyword, loader in jobs
-        }
-        for future in as_completed(futures):
-            keyword, loader_name = futures[future]
-            status_key = f"{loader_name}:{keyword}"
-            try:
-                rows = future.result()
-                candidates.extend(rows)
-                provider_status[status_key] = {
-                    "status": "available",
-                    "count": len(rows),
-                }
-            except HTTPException as exc:
-                provider_status[status_key] = {"status": "unavailable", "count": 0}
-                source_errors.append(f"{status_key}: {exc.detail}")
+    futures = {
+        NEWS_SOURCE_EXECUTOR.submit(loader, keyword, per_query_limit): f"{loader.__name__}:{keyword}"
+        for keyword, loader in jobs
+    }
+    done, pending = wait(futures, timeout=NEWS_SOURCE_BUDGET_SECONDS)
+    for future in done:
+        status_key = futures[future]
+        try:
+            rows = future.result()
+            if not isinstance(rows, list):
+                raise HTTPException(502, "News provider result is not a list")
+            valid = [dict(row) for row in rows if isinstance(row, dict)
+                     and isinstance(row.get("title"), str) and row["title"].strip()
+                     and isinstance(row.get("url"), str) and row["url"].strip()]
+            invalid_count = len(rows) - len(valid)
+            candidates.extend(valid)
+            provider_status[status_key] = {"status": "partial_data" if invalid_count else "available", "count": len(valid), "invalid_row_count": invalid_count}
+            if invalid_count:
+                source_errors.append(f"{status_key}: rejected {invalid_count} invalid news rows")
+        except Exception as exc:
+            provider_status[status_key] = {"status": "unavailable", "count": 0}
+            source_errors.append(f"{status_key}: {exc.detail if isinstance(exc, HTTPException) else type(exc).__name__}")
+    for future in pending:
+        provider_status[futures[future]] = {"status": "unavailable", "count": 0, "error_type": "timeout"}
+        source_errors.append(f"{futures[future]}: news source exceeded {NEWS_SOURCE_BUDGET_SECONDS:g} second budget")
+        future.add_done_callback(consume_background_future)
+        future.cancel()
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    evaluated_at = datetime.now(timezone.utc)
+    cutoff = evaluated_at - timedelta(days=days)
+    time_rejections = {"missing_or_invalid": 0, "future": 0, "outside_window": 0}
     relevant = []
     excluded_count = 0
     for item in candidates:
         published = news_datetime(item.get("published_at"))
-        if published is not None and published < cutoff:
+        if published is None or published > evaluated_at or published < cutoff:
+            reason = "missing_or_invalid" if published is None else "future" if published > evaluated_at else "outside_window"
+            time_rejections[reason] += 1
             excluded_count += 1
             continue
         scope, score, reasons = news_relevance(
@@ -5053,6 +5071,7 @@ def get_news_data(
         item["relevance_score"] = score
         item["relevance_reasons"] = reasons
         item["source_tier"] = news_source_tier(item)
+        item["publication_time_status"] = "verified_within_requested_window"
         relevant.append(item)
 
     tier_rank = {
@@ -5113,6 +5132,13 @@ def get_news_data(
             if item.get("retrieval_provider")
         }
     )
+    unverified_time_count = time_rejections["missing_or_invalid"] + time_rejections["future"]
+    all_failed = bool(provider_status) and all(status["status"] == "unavailable" for status in provider_status.values())
+    missing_fields = []
+    if unverified_time_count:
+        missing_fields.append("news_publication_time_unverified")
+    if not company_name:
+        missing_fields.append("company_name_search_coverage")
     return {
         "symbol": symbol,
         "name": company_name,
@@ -5127,6 +5153,9 @@ def get_news_data(
         "excluded_count": excluded_count,
         "duplicate_count": duplicate_count,
         "provider_status": provider_status,
+        "data_status": "unavailable" if all_failed else "partial_data" if source_errors or missing_fields else "full_data" if selected_items else "no_data",
+        "missing_fields": missing_fields,
+        "publication_time_quality": {"evaluated_at": evaluated_at.isoformat(), "window_start": cutoff.isoformat(), "rejected_counts": time_rejections, "unverified_items_excluded": unverified_time_count},
         "source": providers,
         "source_errors": source_errors,
         "queried_at": now_iso(),
@@ -5137,7 +5166,7 @@ def get_news_data(
         ),
         "time_scope": (
             "published_at is the article publication time. event_date remains null unless it can be "
-            "verified separately; publication time must not be treated as event time."
+            "verified separately; publication time must not be treated as event time. Missing, invalid, future, and outside-window publication times are excluded, never assigned the query time."
         ),
         "note": "Evidence retrieval only. Source tier and relevance fields are mechanical metadata, not truth, importance, sentiment, or trading judgements.",
     }
@@ -5167,6 +5196,44 @@ def announcement_event_tags(title: Any) -> list[str]:
     ] or ["other"]
 
 
+def validate_announcement_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        raise HTTPException(status_code=502, detail="Invalid official announcement payload")
+    if payload.get("error") or payload.get("errorCode") not in (None, 0, "0"):
+        raise HTTPException(status_code=502, detail="Official announcement source returned an error")
+    if "code" in payload and payload["code"] not in (0, "0", 200, "200"):
+        raise HTTPException(status_code=502, detail="Official announcement business status failed")
+    return payload
+
+
+def official_announcement_url(path: Any, host: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise HTTPException(status_code=502, detail="Official announcement document URL is missing")
+    path = path.strip()
+    if path.startswith(f"https://{host}/"):
+        return path
+    if ":" in path or path.startswith("//") or "\\" in path or ".." in path.split("/"):
+        raise HTTPException(status_code=502, detail="Unexpected official announcement document host/path")
+    return f"https://{host}/{path.lstrip('/')}"
+
+
+def validate_announcement_identity_date(
+    code: Any, title: Any, published: Any, symbol: str, start_date: str, end_date: str
+) -> None:
+    if str(code or "").strip() != symbol or not isinstance(title, str) or not title.strip():
+        raise HTTPException(status_code=502, detail="Official announcement identity/title mismatch")
+    parsed = news_datetime(published)
+    if parsed is None or not start_date <= parsed.astimezone(MARKET_TIMEZONE).date().isoformat() <= end_date:
+        raise HTTPException(status_code=502, detail="Official announcement publication date is invalid/outside requested range")
+
+
+def validate_announcement_page_count(total: Any, returned: int, limit: int) -> None:
+    if total is None:
+        return  # Legacy exchange payloads may omit the optional count field.
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0 or returned != min(total, limit):
+        raise HTTPException(status_code=502, detail="Official announcement count/list inconsistency")
+
+
 def get_sse_announcements(
     symbol: str, start_date: str, end_date: str, limit: int
 ) -> list[dict[str, Any]]:
@@ -5189,23 +5256,33 @@ def get_sse_announcements(
     payload = read_public_json(
         f"https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?{query}",
         "https://www.sse.com.cn/disclosure/listedinfo/announcement/",
-        timeout=5,
+        timeout=3,
         attempts=1,
     )
-    groups = (
-        payload.get("result") or ((payload.get("pageHelp") or {}).get("data")) or []
-    )
+    payload = validate_announcement_payload(payload)
+    groups = payload.get("result")
+    page_help = payload.get("pageHelp") if isinstance(payload.get("pageHelp"), dict) else {}
+    if groups is None:
+        groups = page_help.get("data")
+    if groups == [] and page_help.get("data"):
+        raise HTTPException(status_code=502, detail="Official SSE result/pageHelp contradiction")
+    if not isinstance(groups, list):
+        raise HTTPException(status_code=502, detail="Official SSE announcement list is missing/invalid")
+    validate_announcement_page_count(page_help.get("total"), len(groups), limit)
     items: list[dict[str, Any]] = []
     for group in groups:
         rows = group if isinstance(group, list) else [group]
+        if not rows or any(not isinstance(row, dict) for row in rows):
+            raise HTTPException(status_code=502, detail="Invalid official SSE announcement row")
         main_rows = [row for row in rows if row.get("ORG_FILE_TYPE") in (0, "0", None)]
         for row in (main_rows or rows)[:1]:
             title = clean_value(row.get("TITLE"))
             path = clean_value(row.get("URL"))
+            validate_announcement_identity_date(row.get("SECURITY_CODE"), title, row.get("SSEDATE"), symbol, start_date, end_date)
             items.append(
                 {
                     "announcement_id": clean_value(row.get("ORG_BULLETIN_ID")),
-                    "symbol": clean_value(row.get("SECURITY_CODE")) or symbol,
+                    "symbol": symbol,
                     "name": clean_value(row.get("SECURITY_NAME")),
                     "published_at": clean_value(row.get("SSEDATE")),
                     "title": title,
@@ -5213,7 +5290,7 @@ def get_sse_announcements(
                     "event_tags": announcement_event_tags(title),
                     "event_date": clean_value(row.get("SSEDATE")),
                     "event_date_type": "announcement_publication_date",
-                    "url": f"https://static.sse.com.cn{path}" if path else None,
+                    "url": official_announcement_url(path, "static.sse.com.cn"),
                     "official_source": "Shanghai Stock Exchange",
                 }
             )
@@ -5233,29 +5310,126 @@ def get_szse_announcements(
             "pageSize": limit,
             "pageNum": 1,
         },
+        timeout=3,
     )
+    payload = validate_announcement_payload(payload)
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=502, detail="Official SZSE announcement list is missing/invalid")
+    validate_announcement_page_count(payload.get("announceCount"), len(rows), limit)
     items = []
-    for row in (payload.get("data") or [])[:limit]:
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=502, detail="Invalid official SZSE announcement row")
         title = clean_value(row.get("title"))
         path = clean_value(row.get("attachPath"))
         codes = row.get("secCode") or []
         names = row.get("secName") or []
         published_at = clean_value(row.get("publishTime"))
+        if not isinstance(codes, list) or symbol not in codes or not isinstance(names, list):
+            raise HTTPException(status_code=502, detail="Official SZSE announcement security mismatch")
+        validate_announcement_identity_date(symbol, title, published_at, symbol, start_date, end_date)
+        name_index = codes.index(symbol)
         items.append(
             {
                 "announcement_id": clean_value(row.get("annId") or row.get("id")),
-                "symbol": str(codes[0]) if codes else symbol,
-                "name": clean_value(names[0]) if names else None,
+                "symbol": symbol,
+                "name": clean_value(names[name_index]) if name_index < len(names) else None,
                 "published_at": published_at,
                 "title": title,
                 "category": None,
                 "event_tags": announcement_event_tags(title),
                 "event_date": published_at.split(" ", 1)[0] if published_at else None,
                 "event_date_type": "announcement_publication_date",
-                "url": f"https://disc.static.szse.cn{path}" if path else None,
+                "url": official_announcement_url(path, "disc.static.szse.cn"),
                 "official_source": "Shenzhen Stock Exchange",
             }
         )
+    return items
+
+
+def read_cninfo_announcement_query(payload: dict[str, Any]) -> Any:
+    """One bounded public form query to SZSE's official disclosure platform."""
+    url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+    request = Request(url, data=urlencode(payload).encode("utf-8"), headers={
+        "User-Agent": "Mozilla/5.0", "Referer": "https://www.cninfo.com.cn/",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }, method="POST")
+    started = perf_counter()
+    try:
+        with urlopen(request, timeout=3, context=PUBLIC_TLS_CONTEXT) as response:  # nosec B310
+            result = json.loads(response.read().decode("utf-8"))
+        record_source_health("www.cninfo.com.cn", True, int((perf_counter() - started) * 1000))
+        return result
+    except (OSError, URLError, ValueError) as exc:
+        record_source_health("www.cninfo.com.cn", False, int((perf_counter() - started) * 1000), str(exc))
+        raise HTTPException(status_code=502, detail=f"Official CNINFO disclosure query failed: {exc}") from exc
+
+
+def get_cninfo_announcements(symbol: str, start_date: str, end_date: str, limit: int) -> list[dict[str, Any]]:
+    # This public issuer map contains Shanghai and Shenzhen A shares. Never use a
+    # loose keyword search: issuer code plus orgId constrain the filing query.
+    def load_issuers() -> dict[str, str]:
+        payload = read_public_json("https://www.cninfo.com.cn/new/data/szse_stock.json", "https://www.cninfo.com.cn/", timeout=2, attempts=1)
+        rows = payload.get("stockList") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows:
+            raise HTTPException(status_code=502, detail="Official CNINFO issuer map unavailable")
+        result = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code, org_id = row.get("code"), row.get("orgId")
+            if isinstance(code, str) and re.fullmatch(r"\d{6}", code) and isinstance(org_id, str) and re.fullmatch(r"[A-Za-z0-9]+", org_id):
+                if code in result and result[code] != org_id:
+                    raise HTTPException(status_code=502, detail="Conflicting official CNINFO issuer identities")
+                result[code] = org_id
+        if not result:
+            raise HTTPException(status_code=502, detail="Official CNINFO issuer map invalid")
+        return result
+
+    issuers, _ = get_cached_tool_data(
+        cache_key("cninfo_issuer_map", {}), 21600, load_issuers,
+        inflight_wait_timeout_seconds=2,
+    )
+    org_id = issuers.get(symbol)
+    if not org_id:
+        raise HTTPException(status_code=502, detail="Requested security missing from official CNINFO issuer map")
+    payload = validate_announcement_payload(read_cninfo_announcement_query({
+        "pageNum": 1, "pageSize": limit, "column": "szse", "tabName": "fulltext",
+        "stock": f"{symbol},{org_id}", "seDate": f"{start_date}~{end_date}",
+        "sortName": "time", "sortType": "desc", "isHLtitle": "false",
+    }))
+    total = payload.get("totalAnnouncement")
+    rows = payload.get("announcements")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise HTTPException(status_code=502, detail="Official CNINFO result count invalid")
+    if total == 0 and rows in (None, []):
+        return []
+    if not isinstance(rows, list) or not rows or total < len(rows):
+        raise HTTPException(status_code=502, detail="Official CNINFO announcement list incomplete/invalid")
+    validate_announcement_page_count(total, len(rows), limit)
+    items = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict) or row.get("orgId") != org_id:
+            raise HTTPException(status_code=502, detail="Official CNINFO issuer mismatch")
+        timestamp = row.get("announcementTime")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not isfinite(timestamp):
+            raise HTTPException(status_code=502, detail="Official CNINFO publication timestamp invalid")
+        try:
+            published = datetime.fromtimestamp(timestamp / 1000, MARKET_TIMEZONE).isoformat()
+        except (ValueError, OverflowError, OSError) as exc:
+            raise HTTPException(status_code=502, detail="Official CNINFO publication timestamp invalid") from exc
+        title = row.get("announcementTitle")
+        validate_announcement_identity_date(row.get("secCode"), title, published, symbol, start_date, end_date)
+        items.append({
+            "announcement_id": clean_value(row.get("announcementId")), "symbol": symbol,
+            "name": clean_value(row.get("secName")), "published_at": published,
+            "title": title, "category": clean_value(row.get("announcementTypeName")),
+            "event_tags": announcement_event_tags(title), "event_date": published[:10],
+            "event_date_type": "announcement_publication_date",
+            "url": official_announcement_url(row.get("adjunctUrl"), "static.cninfo.com.cn"),
+            "official_source": "CNINFO (Shenzhen Stock Exchange official disclosure platform)",
+        })
     return items
 
 
@@ -5293,18 +5467,30 @@ def get_announcement_data(symbol: str, days: int, limit: int) -> dict[str, Any]:
         if security["exchange"] == "SSE"
         else get_szse_announcements
     )
-    items = loader(symbol, start.isoformat(), end.isoformat(), limit)
+    errors = []
+    source = f"official_{security['exchange'].lower()}_announcements"
+    try:
+        items = loader(symbol, start.isoformat(), end.isoformat(), limit)
+    except Exception as exc:
+        errors.append({"source": source, "error_type": "official_source_failed", "message": str(exc.detail if isinstance(exc, HTTPException) else type(exc).__name__)})
+        try:
+            items = get_cninfo_announcements(symbol, start.isoformat(), end.isoformat(), limit)
+            source = "official_cninfo_announcements"
+        except Exception as fallback_exc:
+            detail = fallback_exc.detail if isinstance(fallback_exc, HTTPException) else type(fallback_exc).__name__
+            raise HTTPException(status_code=502, detail=f"Official announcement routes unavailable: {errors[0]['message']}; CNINFO: {detail}") from fallback_exc
     return {
         "symbol": symbol,
         "exchange": security["exchange"],
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "count": len(items),
         "items": items,
-        "data_status": "full_data" if items else "no_data",
-        "source": [f"official_{security['exchange'].lower()}_announcements"],
-        "source_errors": [],
+        "data_status": "partial_data" if errors else "full_data" if items else "no_data",
+        "source": [source],
+        "source_errors": errors,
+        "recovery_status": "official_fallback_used" if errors else "primary_source",
         "queried_at": now_iso(),
-        "note": "Event tags are mechanical title matches. Event dates are publication dates unless explicitly stated otherwise.",
+        "note": "Event tags are mechanical title matches. Event dates are publication dates unless explicitly stated otherwise. CNINFO is SZSE's official disclosure platform; fallback provenance is explicit and failed primary coverage remains partial.",
     }
 
 
@@ -6157,7 +6343,7 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
         "push2delay.eastmoney.com",
         "82.push2.eastmoney.com",
     )
-    executor = ThreadPoolExecutor(max_workers=len(hosts))
+    executor = SECURITY_REFERENCE_SOURCE_EXECUTOR
     futures = {
         executor.submit(
             read_public_json,
@@ -6188,11 +6374,12 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
             for future in completed:
                 host = futures[future]
                 try:
-                    candidate = future.result().get("data") or {}
-                    if not candidate.get("f57"):
+                    payload = future.result()
+                    candidate = payload.get("data") if isinstance(payload, dict) else None
+                    if not isinstance(candidate, dict) or candidate.get("f57") != symbol:
                         raise HTTPException(
                             status_code=502,
-                            detail="security reference response contained no symbol",
+                            detail="security reference response identity/shape mismatch",
                         )
                     data = candidate
                     selected_host = host
@@ -6202,13 +6389,15 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
                 except Exception as exc:  # pragma: no cover - defensive source boundary
                     errors.append(f"{host}: {exc}")
         for future in pending:
-            errors.append(
-                f"{futures[future]}: security reference request exceeded the 6 second budget"
-            )
+            if not data:
+                errors.append(
+                    f"{futures[future]}: security reference request exceeded the 6 second budget"
+                )
             future.add_done_callback(consume_background_future)
             future.cancel()
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        for future in pending:
+            future.cancel()
     if not data or not selected_host:
         raise HTTPException(
             status_code=502,
@@ -6216,7 +6405,7 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
             + "; ".join(errors),
         )
     return {
-        "symbol": clean_value(data.get("f57")) or symbol,
+        "symbol": symbol,
         "name": clean_value(data.get("f58")),
         "listing_date": parse_yyyymmdd(data.get("f189")),
         "source_security_status_code": clean_value(data.get("f292")),
@@ -6233,18 +6422,38 @@ def get_security_reference_data(symbol: str) -> dict[str, Any]:
 def get_resilient_security_reference_data(symbol: str) -> dict[str, Any]:
     symbol = normalize_symbol(symbol)
     key = cache_key("security_reference_internal", {"symbol": symbol})
+
+    def valid_identity(data: Any) -> bool:
+        return isinstance(data, dict) and data.get("symbol") == symbol
+
+    def load_verified() -> dict[str, Any]:
+        data = get_security_reference_data(symbol)
+        if not valid_identity(data):
+            raise HTTPException(502, "Security reference identity mismatch; not cached")
+        return data
+
+    # Retire only this in-memory invalid cache entry; no historical ledger is touched.
+    with TOOL_CACHE_LOCK:
+        cached = TOOL_CACHE.get(key)
+        if cached is not None and not valid_identity(cached.get("data")):
+            TOOL_CACHE.pop(key, None)
     try:
         data, _ = get_cached_tool_data(
             key,
             21600,
-            lambda: get_security_reference_data(symbol),
+            load_verified,
+            inflight_wait_timeout_seconds=6,
         )
+        if not valid_identity(data):
+            raise HTTPException(502, "Cached security reference identity mismatch")
         return data
     except HTTPException as exc:
         stale = get_cached_tool_snapshot(key, 604800)
         if stale is None:
             raise
         data, cache = stale
+        if not valid_identity(data):
+            raise HTTPException(502, "Stale security reference identity mismatch; unavailable") from exc
         data.setdefault("source_errors", []).append(
             f"live_refresh: {exc.detail}; using cached slow-changing security reference"
         )
