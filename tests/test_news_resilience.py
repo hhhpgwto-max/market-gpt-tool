@@ -84,6 +84,8 @@ def test_all_provider_failures_are_unavailable_not_no_news(monkeypatch):
     monkeypatch.setattr(app, "get_google_news_items", fail)
     result = app.get_news_data("000001", 5, 1)
     assert result["count"] == 0 and result["data_status"] == "unavailable"
+    assert app.decision_component_quality("news", result)["status"] == "unavailable"
+    assert {error["error_type"] for error in app.normalize_source_errors(result["source_errors"])} == {"source_contract_error"}
 
 
 @pytest.mark.parametrize("payload", [{}, {"result": {}}, {"result": {"cmsArticleWebOld": None}}, {"result": {"cmsArticleWebOld": [None]}}])
@@ -91,3 +93,15 @@ def test_eastmoney_invalid_payload_is_not_empty_success(monkeypatch, payload):
     monkeypatch.setattr(app, "read_public_jsonp", lambda *_: payload)
     with pytest.raises(app.HTTPException):
         app.get_eastmoney_news_items("000001", 5)
+
+
+@pytest.mark.parametrize("status", ["unavailable", "partial_data", "no_data"])
+def test_short_failure_cache_allows_next_call_to_recover(status):
+    key = f"synthetic-news-cache-{status}"
+    app.TOOL_CACHE[key] = {"created_at": datetime.now(timezone.utc) - timedelta(seconds=21),
+                          "data": {"data_status": status, "items": []}}
+    try:
+        data, cache = app.get_cached_tool_data(key, 300, lambda: {"data_status": "full_data", "items": [item()]}, partial_ttl_seconds=20)
+        assert data["data_status"] == "full_data" and cache["cache_hit"] is False
+    finally:
+        app.TOOL_CACHE.pop(key, None)

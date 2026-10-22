@@ -41,7 +41,7 @@ REQUEST_LOGGER = logging.getLogger("market_sentinel.requests")
 
 
 APP_NAME = os.getenv("MARKET_TOOL_NAME", "market-gpt-tool")
-ROUTING_REVISION = "verified_disclosure_news_identity_v21"
+ROUTING_REVISION = "verified_disclosure_news_identity_v21_1"
 MCP_RESPONSE_BUDGET_SECONDS = 20.0
 # urllib otherwise rebuilds the trusted certificate store for every HTTPS request.
 # The immutable shared context keeps certificate and hostname verification enabled.
@@ -242,7 +242,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Market GPT Tool",
-    version="0.21.0",
+    version="0.21.1",
     description="A read-only A-share market data MCP service for ChatGPT.",
     lifespan=lifespan,
 )
@@ -730,7 +730,7 @@ def get_cached_tool_data(
                 effective_ttl_seconds = (
                     partial_ttl_seconds
                     if partial_ttl_seconds is not None
-                    and cached["data"].get("data_status") in {"partial_data", "no_data"}
+                    and cached["data"].get("data_status") in {"partial_data", "no_data", "unavailable"}
                     else ttl_seconds
                 )
                 if age_seconds <= effective_ttl_seconds:
@@ -5035,10 +5035,12 @@ def get_news_data(
             candidates.extend(valid)
             provider_status[status_key] = {"status": "partial_data" if invalid_count else "available", "count": len(valid), "invalid_row_count": invalid_count}
             if invalid_count:
-                source_errors.append(f"{status_key}: rejected {invalid_count} invalid news rows")
+                source_errors.append({"source": status_key, "error_type": "source_contract_error", "message": f"Rejected {invalid_count} malformed news rows"})
         except Exception as exc:
             provider_status[status_key] = {"status": "unavailable", "count": 0}
-            source_errors.append(f"{status_key}: {exc.detail if isinstance(exc, HTTPException) else type(exc).__name__}")
+            message = str(exc.detail if isinstance(exc, HTTPException) else type(exc).__name__)
+            contract_error = not isinstance(exc, HTTPException) or "result shape" in message or "not a list" in message
+            source_errors.append({"source": status_key, "error_type": "source_contract_error" if contract_error else classify_error_type(message, exc.status_code), "message": message})
     for future in pending:
         provider_status[futures[future]] = {"status": "unavailable", "count": 0, "error_type": "timeout"}
         source_errors.append(f"{futures[future]}: news source exceeded {NEWS_SOURCE_BUDGET_SECONDS:g} second budget")
@@ -6785,6 +6787,8 @@ def decision_component_quality(component: str, payload: Any) -> dict[str, Any]:
     status = (
         "empty_result"
         if successful_empty and not is_stale
+        else "unavailable"
+        if reported_status == "unavailable" and not has_data
         else "no_data"
         if not has_data and not successful_empty
         else "stale_cache"
@@ -14554,6 +14558,7 @@ def get_a_share_news(
         ),
         symbol,
         max_stale_age_seconds=3600,
+        partial_ttl_seconds=20,
     )
 
 
